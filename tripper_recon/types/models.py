@@ -10,7 +10,7 @@ class ApiKeys(BaseModel):
     vt_api_key: Optional[str] = Field(default=None)
     shodan_api_key: Optional[str] = Field(default=None)
     abuseipdb_api_key: Optional[str] = Field(default=None)
-    ipinfo_token: Optional[str] = Field(default=None)
+    ipapi_is_api_key: Optional[str] = Field(default=None)
     otx_api_key: Optional[str] = Field(default=None)
 
 
