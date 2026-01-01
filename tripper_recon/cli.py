@@ -139,15 +139,7 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
     if output == "json":
         _print(res.model_dump_json(indent=2) + "\n")
     else:
-        line = f"| IP lookup for {ip} |"
-        top = "+" + ("-" * (len(line) - 2)) + "+"
-        bottom = "+" + ("-" * (len(line) - 2)) + "+"
-        _print(top + "\n" + line + "\n" + bottom + "\n\n")
-        _print("ip_intelligence:\n")
-        block = render_ip_analysis(ip, res.data, ports_limit=ports_limit).strip().splitlines()
-        for entry in block:
-            _print(f"  {entry}\n")
-        _print("\n")
+        _print(render_ip_analysis(ip, res.data, ports_limit=ports_limit).rstrip() + "\n")
     return 0
 
 
@@ -286,21 +278,11 @@ async def _cmd_asn(
     else:
         meta = res.data.get("meta", {})
         from tripper_recon.reporting.console import render_asn_header, render_asn_bgp_panels
-        # Print a boxed header matching the BGP panel style
         name = meta.get("name") or ""
-        _print("╭───────────────────────────────────────────╮\n")
-        _print((f"│ ASN lookup for AS{asn} ({name}) │\n") if name else (f"│ ASN lookup for AS{asn} │\n"))
-        # Exactly one blank line after the boxed heading
-        _print("╰───────────────────────────────────────────╯\n\n")
-        # Then print details from renderer, skipping its internal header lines
+        header = f"ASN lookup for AS{asn} ({name})" if name else f"ASN lookup for AS{asn}"
+        _print(header + "\n\n")
         hdr = render_asn_header(asn, meta, use_color=(not monochrome))
-        hdr_lines = hdr.splitlines()
-        # Defensive: skip first two lines if they are the internal header; otherwise print all
-        if len(hdr_lines) >= 3 and (hdr_lines[0].strip().startswith("ASN lookup") or ("AS Number" in (hdr_lines[2] if len(hdr_lines) > 2 else ""))):
-            _print("\n".join(hdr_lines[2:]) + "\n")
-        else:
-            _print(hdr)
-        # Ensure Peering @IXPs line is present
+        _print(hdr)
         if "Peering @IXPs" not in hdr:
             ixps = meta.get("ixps") or []
             ixp_names = []
@@ -309,9 +291,9 @@ async def _cmd_asn(
                     if isinstance(i, dict) and i.get("name"):
                         ixp_names.append(str(i.get("name")))
             if ixp_names:
-                _print(f" Peering @IXPs ──> {' • '.join(ixp_names)}\n")
+                _print(f"Peering @IXPs: {', '.join(ixp_names)}\n")
             else:
-                _print(" Peering @IXPs ──> NONE\n")
+                _print("Peering @IXPs: NONE\n")
         if not meta:
             _print("Note: Cloudflare Radar API token missing or request failed. Set CLOUDFLARE_API_TOKEN in .env for full ASN details.\n")
         bgp = res.data.get("bgp", {})
@@ -330,13 +312,11 @@ async def _cmd_asn(
             v6_full = (res.data.get("bgp", {}) or {}).get("ripe_prefixes_v6") or []
             name = meta.get("name") or ""
             out_lines: list[str] = []
-            out_lines.append("╭──────────────────────────────────────────────────╮")
-            title = f"│ Aggregated IP resources for AS{asn} ({name}) │" if name else f"│ Aggregated IP resources for AS{asn} │"
+            title = f"Aggregated IP resources for AS{asn} ({name})" if name else f"Aggregated IP resources for AS{asn}"
             out_lines.append(title)
-            out_lines.append("╰──────────────────────────────────────────────────╯")
             out_lines.append("")
             if prefixes in ("v4", "both"):
-                out_lines.append("───── IPv4 ─────")
+                out_lines.append("IPv4")
                 if v4_full:
                     out_lines.extend([str(p) for p in v4_full])
                 else:
@@ -344,7 +324,7 @@ async def _cmd_asn(
                 if prefixes == "both":
                     out_lines.append("")
             if prefixes in ("v6", "both"):
-                out_lines.append("───── IPv6 ─────")
+                out_lines.append("IPv6")
                 if v6_full:
                     out_lines.extend([str(p) for p in v6_full])
                 else:
