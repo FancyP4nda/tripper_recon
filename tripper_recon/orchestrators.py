@@ -290,11 +290,22 @@ async def investigate_domain(domain: str) -> InvestigationResult:
             asn_meta: Dict[str, Any] = {}
             if ipi.get("ok") and ipi["data"].get("asn"):
                 asn = int(ipi["data"]["asn"])  # type: ignore[arg-type]
-                cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
+                try:
+                    cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
+                except Exception as e:  # noqa: BLE001
+                    cf = _error_payload(e)
                 if cf.get("ok"):
                     asn_meta = cf["data"]
                 else:
-                    bgp = await bgpview_asn(client=client, asn=asn)
+                    if not _should_suppress("cloudflare_asn", cf):
+                        details = _error_details(cf)
+                        if details:
+                            provider_errors["cloudflare_asn"] = details
+                        result_errors.append(f"{ip} :: {_error_summary('cloudflare_asn', cf)}")
+                    try:
+                        bgp = await bgpview_asn(client=client, asn=asn)
+                    except Exception as e:  # noqa: BLE001
+                        bgp = _error_payload(e)
                     if bgp.get("ok"):
                         bv = bgp.get("data", {})
                         asn_meta = {
@@ -303,6 +314,11 @@ async def investigate_domain(domain: str) -> InvestigationResult:
                             "organization": bv.get("organization"),
                             "ixps": bv.get("ixps", []),
                         }
+                    elif not _should_suppress("bgpview", bgp):
+                        details = _error_details(bgp)
+                        if details:
+                            provider_errors["bgpview"] = details
+                        result_errors.append(f"{ip} :: {_error_summary('bgpview', bgp)}")
 
             entry = {
                 "ip": ip,

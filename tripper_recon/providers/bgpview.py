@@ -19,7 +19,16 @@ async def _bgpview_get(client: httpx.AsyncClient, path: str) -> Dict[str, Any]:
             return {"ok": False, "error": "http_error", "status": r.status_code}
         return {"ok": True, "data": r.json().get("data", {})}
 
-    return await with_exponential_backoff(_call)
+    try:
+        return await with_exponential_backoff(_call)
+    except httpx.RequestError as err:
+        req = getattr(err, "request", None)
+        return {
+            "ok": False,
+            "error": "network_error",
+            "url": str(req.url) if req else f"{BGPVIEW_BASE}{path}",
+            "message": str(err),
+        }
 
 
 async def bgpview_asn(*, client: httpx.AsyncClient, asn: int) -> Dict[str, Any]:
