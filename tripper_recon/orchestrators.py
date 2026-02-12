@@ -17,7 +17,6 @@ from tripper_recon.types.models import ApiKeys, InvestigationResult
 from tripper_recon.utils.http import RateLimiter, create_client
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
-from tripper_recon.providers.bgpview import bgpview_asn
 from tripper_recon.providers.ripestat import as_overview, abuse_contact, routing_status, asn_neighbours, announced_prefixes
 from tripper_recon.providers.caida import caida_asrank
 from tripper_recon.providers.peeringdb import peeringdb_ixps_for_asn
@@ -296,29 +295,11 @@ async def investigate_domain(domain: str) -> InvestigationResult:
                     cf = _error_payload(e)
                 if cf.get("ok"):
                     asn_meta = cf["data"]
-                else:
-                    if not _should_suppress("cloudflare_asn", cf):
-                        details = _error_details(cf)
-                        if details:
-                            provider_errors["cloudflare_asn"] = details
-                        result_errors.append(f"{ip} :: {_error_summary('cloudflare_asn', cf)}")
-                    try:
-                        bgp = await bgpview_asn(client=client, asn=asn)
-                    except Exception as e:  # noqa: BLE001
-                        bgp = _error_payload(e)
-                    if bgp.get("ok"):
-                        bv = bgp.get("data", {})
-                        asn_meta = {
-                            "asn": asn,
-                            "name": bv.get("name"),
-                            "organization": bv.get("organization"),
-                            "ixps": bv.get("ixps", []),
-                        }
-                    elif not _should_suppress("bgpview", bgp):
-                        details = _error_details(bgp)
-                        if details:
-                            provider_errors["bgpview"] = details
-                        result_errors.append(f"{ip} :: {_error_summary('bgpview', bgp)}")
+                elif not _should_suppress("cloudflare_asn", cf):
+                    details = _error_details(cf)
+                    if details:
+                        provider_errors["cloudflare_asn"] = details
+                    result_errors.append(f"{ip} :: {_error_summary('cloudflare_asn', cf)}")
 
             entry = {
                 "ip": ip,
@@ -353,7 +334,6 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
     async with create_client() as client:
         # Kick off IPinfo ASN in parallel with Cloudflare when possible
         ipi_task = asyncio.create_task(ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int))
-        bgp_task = asyncio.create_task(bgpview_asn(client=client, asn=asn_int))
         ripe_overview_task = asyncio.create_task(as_overview(client=client, asn=asn_int))
         ripe_abuse_task = asyncio.create_task(abuse_contact(client=client, asn=asn_int))
         caida_task = asyncio.create_task(caida_asrank(client=client, asn=asn_int))
@@ -371,10 +351,6 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             ipi = await ipi_task  # type: ignore[assignment]
         except Exception as e:  # noqa: BLE001
             ipi = _error_payload(e)
-        try:
-            bgp = await bgp_task  # type: ignore[assignment]
-        except Exception as e:  # noqa: BLE001
-            bgp = _error_payload(e)
         try:
             ripe = await ripe_overview_task  # type: ignore[assignment]
         except Exception as e:  # noqa: BLE001
@@ -424,7 +400,6 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
 
         providers = {
             "ipinfo_asn": ipi,
-            "bgpview": bgp,
             "ripe_overview": ripe,
             "ripe_abuse": rp_abuse,
             "caida": caida,
@@ -458,19 +433,6 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             for k, v in ipi["data"].items():  # type: ignore[index]
                 if k not in meta or meta.get(k) in (None, ""):
                     meta[k] = v
-        if bgp.get("ok"):
-            for k, v in bgp["data"].items():  # type: ignore[index]
-                if k == "ixps":
-                    # Merge IXP lists
-                    existing = meta.get("ixps") or []
-                    existing_names = {i.get("name") for i in existing if isinstance(i, dict) and i.get("name")}
-                    new_names = {i.get("name") for i in v if isinstance(i, dict) and i.get("name")} if isinstance(v, list) else set()
-                    names = sorted(existing_names | new_names)
-                    if names:
-                        meta["ixps"] = [{"name": n} for n in names]
-                else:
-                    if k not in meta or meta.get(k) in (None, ""):
-                        meta[k] = v
         if ripe.get("ok"):
             holder = ripe["data"].get("holder")
             name = holder
@@ -575,8 +537,6 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             warnings.append("cloudflare_query_failed_or_missing")
         if not ipi.get("ok") and not ipinfo_suppressed:
             warnings.append("ipinfo_query_failed_or_missing")
-        if not bgp.get("ok"):
-            warnings.append("bgpview_query_failed")
         if not ripe.get("ok"):
             warnings.append("ripestat_overview_failed")
         if not rp_abuse.get("ok"):
