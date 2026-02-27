@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 from typing import Any, Dict, List
 from pathlib import Path
@@ -131,24 +132,98 @@ def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
     _print("\n")
 
 
+def _render_ip_console_block(ip: str, data: Dict[str, Any], *, ports_limit: str) -> None:
+    line = f"| IP lookup for {ip} |"
+    top = "+" + ("-" * (len(line) - 2)) + "+"
+    bottom = "+" + ("-" * (len(line) - 2)) + "+"
+    _print(top + "\n" + line + "\n" + bottom + "\n\n")
+    _print("ip_intelligence:\n")
+    block = render_ip_analysis(ip, data, ports_limit=ports_limit).strip().splitlines()
+    for entry in block:
+        _print(f"  {entry}\n")
+    _print("\n")
+
+
+def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
+    p = Path(value).expanduser()
+    if not p.is_file():
+        return [value], None
+
+    targets: List[str] = []
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        targets.append(line)
+    return targets, str(p)
+
+
 async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") -> int:
-    res = await investigate_ip(ip)
-    if not res.ok:
-        log["error"]("IP investigation failed", ip=ip, errors=res.errors)
+    targets, source_file = _load_ip_targets(ip)
+    if source_file and not targets:
+        log["error"]("IP list file is empty", file=source_file)
         return 1
+
+    is_batch = bool(source_file)
+    if not is_batch:
+        target = targets[0]
+        res = await investigate_ip(target)
+        if not res.ok:
+            log["error"]("IP investigation failed", ip=target, errors=res.errors)
+            return 1
+        if output == "json":
+            _print(res.model_dump_json(indent=2) + "\n")
+        else:
+            _render_ip_console_block(target, res.data, ports_limit=ports_limit)
+        return 0
+
+    results: List[Dict[str, Any]] = []
+    failed = 0
+    succeeded = 0
+
+    if output == "console":
+        _print(f'Processing {len(targets)} targets from "{source_file}"\n\n')
+
+    for target in targets:
+        try:
+            res = await investigate_ip(target)
+        except Exception as e:  # noqa: BLE001
+            msg = f"{type(e).__name__}: {e}"
+            log["error"]("IP investigation crashed", ip=target, error=msg)
+            failed += 1
+            results.append({"target": target, "ok": False, "warnings": [], "errors": [msg], "data": {}})
+            if output == "console":
+                _print(f"IP: {target}\n")
+                _print(f"  error: {msg}\n\n")
+            continue
+
+        payload = res.model_dump()
+        results.append({"target": target, **payload})
+
+        if res.ok:
+            succeeded += 1
+            if output == "console":
+                _render_ip_console_block(target, res.data, ports_limit=ports_limit)
+        else:
+            failed += 1
+            if output == "console":
+                _print(f"IP: {target}\n")
+                _print(f"  error: {'; '.join(res.errors) if res.errors else 'Investigation failed'}\n\n")
+
     if output == "json":
-        _print(res.model_dump_json(indent=2) + "\n")
+        out = {
+            "ok": failed == 0,
+            "source_file": source_file,
+            "total": len(targets),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }
+        _print(json.dumps(out, indent=2) + "\n")
     else:
-        line = f"| IP lookup for {ip} |"
-        top = "+" + ("-" * (len(line) - 2)) + "+"
-        bottom = "+" + ("-" * (len(line) - 2)) + "+"
-        _print(top + "\n" + line + "\n" + bottom + "\n\n")
-        _print("ip_intelligence:\n")
-        block = render_ip_analysis(ip, res.data, ports_limit=ports_limit).strip().splitlines()
-        for entry in block:
-            _print(f"  {entry}\n")
-        _print("\n")
-    return 0
+        _print(f"Summary: total={len(targets)} succeeded={succeeded} failed={failed}\n")
+
+    return 0 if failed == 0 else 1
 
 
 async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str = "25") -> int:
@@ -377,18 +452,18 @@ def main() -> None:
 
     p_ip = sub.add_parser("ip", help="Investigate an IP address")
     p_ip.add_argument("ip", type=str)
-    p_ip.add_argument("-o", "--format", choices=["console", "json"], default=None, help="Output format")
+    p_ip.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
-    p_domain.add_argument("-o", "--format", choices=["console", "json"], default=None, help="Output format")
+    p_domain.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
 
 
     p_asn = sub.add_parser("asn", help="Lookup ASN details")
     p_asn.add_argument("asn", type=str)
-    p_asn.add_argument("-o", "--format", choices=["console", "json"], default=None, help="Output format")
+    p_asn.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_asn.add_argument("--neighbors", type=int, default=8, help="Resolve first N neighbors to names")
     p_asn.add_argument("--enrich", action="store_true", help="Enrich prefix info via whois/pWhois (slower)")
     p_asn.add_argument("--enrich-limit", type=int, default=50, help="Limit inetnum lines during enrichment")

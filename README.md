@@ -17,6 +17,10 @@ tripper-recon --version
 tripper-recon ip 8.8.8.8
 tripper-recon ip 8.8.8.8 --format json
 
+# Batch IP investigation from text file (one IP per line, # comments allowed)
+tripper-recon ip ./path/to/ips.txt
+tripper-recon ip ./path/to/ips.txt --format json
+
 # Domain investigation
 tripper-recon domain www.google.com
 tripper-recon domain www.google.com --format json
