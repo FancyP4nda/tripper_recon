@@ -14,7 +14,7 @@ from rich.panel import Panel
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
-from tripper_recon.utils.http import configure_rate_limit
+from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
 
@@ -381,6 +381,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="tripper-recon", description="Unified OSINT IP/Domain/ASN investigations")
     parser.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     parser.add_argument("--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers")
+    parser.add_argument("--user-agent", type=str, default=None, help="Custom User-Agent string to spoof in HTTP requests")
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -412,6 +413,8 @@ def main() -> None:
         raise SystemExit(2)
 
     configure_rate_limit(args.rate_limit)
+    if getattr(args, "user_agent", None):
+        configure_user_agent(args.user_agent)
 
     match args.cmd:
         case "ip":

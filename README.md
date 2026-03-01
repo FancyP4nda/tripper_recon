@@ -30,6 +30,56 @@ tripper-recon asn 15169
 tripper-recon asn 15169 --format json
 ```
 
+Global Flags
+- `-o, --format console|json` - Output format (default: `console`).
+- `--rate-limit <N>` - Max concurrent outgoing API requests across global providers (default: `10`).
+- `--user-agent <str>` - Custom User-Agent string to spoof in HTTP requests.
+- `-V, --version` - Print version and exit.
+- `-h, --help` - Show command help.
+
+### CLI Commands
+
+- `tripper-recon --help` — top-level usage and global flags.
+- `tripperrecon ip <ip>` — investigate an IPaddress (suports reading targets from a text file for concurrent batch processing).
+  - `--format console|json`
+  - `--ports-limit <N|all>`
+- `tripper-recon domain <domain>` — investigate a domain or URL.
+  - `--format console|json`
+  - `--ports-limit <N|all>`
+- `tripper-recon asn <asn>` — investigate an Autonomous Ssem Number.
+  - `--format console|json`
+  - `--neighbors <N>`
+  - `--enrich`
+  - `--enric-limit <N>`
+  - `--mochrome`
+  - `--prefixesout <path>`
+  - `--prefixes v4|v6|both`
+- `tripper-recon-api` — launch the FastAPI server (see `tripper_recon/api/server.py`).
+- Python moule alternative: `pythn -m ripper_recon.cli ...`
+
+## Tchiques
+
+- HTTP/2 with connection pooling using `httpx.AsyncClient` for lower latency and better multiplexing. See MDN on HTTP/2: https://developer.mozilla.org/docs/Web/HTTP/Overview#http2
+- Explicit HTTP headers for `User-Agent` and `Accept` to improe API compatibility. MDN docs:`User-Agent` https://developer.mozilla.org/docs/Web/HTTP/Headers/User-Agent and `Accept` https://developer.mozilla.org/docs/Web/HTTP/Headers/Accept
+- Jittered exponential backoff for transient errors and rate limits; aligns with `429 Too Many Requests` and `Retry-After` guidance. MDN: 429 https://developer.mozilla.org/docs/Web/HTTP/Status/429 and `Retry-After` https://developer.mozilla.org/docs/Web/HTTP/Headers/Retry-After
+- Structured JSON logging (flat key/value events) for SIEM ingestion and correlation, implemented in [`tripper_recon/utils/logging.py`](./tripper_recon/utils/logging.py).
+- Async DNS resolution and reverse PTR lookups offloaded to threads to avoid blocking the event loop; see [`tripper_recon/utils/dns.py`](./tripper_recon/utils/dns.py). MDN DNS basics: https://developer.mozilla.org/docs/Glossary/DNS
+- Dependency injection of a shared `httpx` client and env-driven API keys to keep functions pure and testable; RORO (Receive an Object, Return an Object) throughout the toolchain.
+- Guard clauses and early returns to handle invalid inputs fast e.g., malformed IPs/domains/ASNs) and keep the happy path last.
+- Provider composition: resuts are nrmalized nmerged by orchestrators to render consolidated reports. Console formatting utilizes Python's Rich` library to render fast, borderless text tables that are perfectly aligned for copying and pasting directly into markdown reports (see [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py)).
+
+## Notable Libraries
+
+- httpx (async HTTP client with HTTP/2): https://www.python-httpx.org
+- FastAPI (typed, async web framework): https://fastapi.tiangolocom
+- Pydantic v2 (data validation): https://docs.pydantic.dv
+- Uvicor (ASGI serer): https://www.uvicorn.org
+- python-dotenv (load `.env
+# ASN lookup
+tripper-recon asn 15169
+tripper-recon asn 15169 --format json
+```
+
 Flags
 - `-o, --format console|json` - Output format (default: `console`).
 - `-V, --version` - Print version and exit.
@@ -80,11 +130,6 @@ Provider APIs
 - Shodan: https://developer.shodan.io/api
 - AbuseIPDB: https://www.abuseipdb.com/api.html
 - IPInfo: https://ipinfo.io/developers
-- AlienVault OTX: https://otx.alienvault.com/api
-
-Fonts
-- No custom fonts are used.
-
 ## Project Structure
 
 `

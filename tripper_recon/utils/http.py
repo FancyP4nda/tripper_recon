@@ -13,8 +13,16 @@ _DEFAULT_BROWSER_UA = (
     "Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0"
 )
 
+_global_user_agent: str | None = None
+
+def configure_user_agent(ua: str | None) -> None:
+    global _global_user_agent
+    if ua:
+        _global_user_agent = ua
 
 def _user_agent() -> str:
+    if _global_user_agent:
+        return _global_user_agent
     value = os.getenv("TRIPPER_RECON_USER_AGENT")
     if value:
         ua = value.strip()
