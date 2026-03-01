@@ -84,6 +84,8 @@ def _should_suppress(provider: str, payload: Dict[str, Any]) -> bool:
             return True
         if err == "http_error" and status == 400:
             return True
+    if provider.startswith("ripe_") and err == "network_error":
+        return True
     return False
 
 

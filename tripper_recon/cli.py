@@ -34,12 +34,15 @@ def _fmt_provider_error(detail: Any) -> str:
         if message:
             parts.append(f"message={message}")
         url = detail.get("url")
-        if url:
+        if url and not status and not reason and not message:
+             # Just an empty URL without a real error gets noisy
+             return "Connection Timeout / Network Error"
+        elif url:
             parts.append(f"url={url}")
         body = detail.get("body")
         if body:
             parts.append(f"body={body}")
-        return " | ".join(parts) if parts else "error"
+        return " | ".join(parts) if parts else "Unknown error"
     return str(detail)
 
 
