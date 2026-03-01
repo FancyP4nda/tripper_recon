@@ -222,7 +222,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
     domain_errors = data.get("domain_errors", {})
     ips = data.get("ips", [])
 
-    console.print(Panel(f"[bold white]Domain lookup for {norm_domain}[/]", border_style="blue", expand=False))
+    console.print(f"\n[bold white]--- Domain lookup for {norm_domain} ---[/]")
     console.print("\n[bold]domain_intelligence:[/]")
     console.print(f"  [cyan]cloudflare_radar_link[/]: https://radar.cloudflare.com/domain/{norm_domain}")
     
@@ -346,10 +346,9 @@ async def _cmd_asn(
             
             out_lines: list[str] = []
             name = meta.get("name") or ""
-            out_lines.append("╭" + "─" * 50 + "╮")
-            title = f"│ Aggregated IP resources for AS{asn} ({name}) │" if name else f"│ Aggregated IP resources for AS{asn} │"
+            title = f"--- Aggregated IP resources for AS{asn} ({name}) ---" if name else f"--- Aggregated IP resources for AS{asn} ---"
             out_lines.append(title)
-            out_lines.append("╰" + "─" * 50 + "╯\n")
+            out_lines.append("")
             
             if prefixes in ("v4", "both"):
                 out_lines.append("───── IPv4 ─────")

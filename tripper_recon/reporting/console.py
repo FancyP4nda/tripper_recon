@@ -160,7 +160,8 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
             error_table.add_row(name, joined)
         table.add_row("provider_errors", error_table)
 
-    return Panel(table, title=f"IP lookup for [bold white]{ip}[/]", border_style="blue", expand=False)
+    title_text = Text(f"--- IP lookup for {ip} ---", style="bold white")
+    return Group(title_text, table, Text(""))
 
 
 def render_asn_header(asn: int, meta: Dict[str, Any], use_color: bool = False) -> RenderableType:
@@ -205,8 +206,8 @@ def render_asn_header(asn: int, meta: Dict[str, Any], use_color: bool = False) -
     else:
         table.add_row("Peering @IXPs", "──>", "NONE")
 
-    title = f"ASN lookup for AS{asn} ({name})" if name else f"ASN lookup for AS{asn}"
-    return Panel(table, title=f"[bold white]{title}[/]", border_style="magenta", expand=False)
+    title_str = f"--- ASN lookup for AS{asn} ({name}) ---" if name else f"--- ASN lookup for AS{asn} ---"
+    return Group(Text(title_str, style="bold white"), table, Text(""))
 
 
 def _join_asns(asns: list[int] | None, limit: int = 60) -> str:
@@ -253,7 +254,9 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
         total_l = leaks.get("total") or 0
         t1.add_row("BGP Route leaks (past 1y)", "None" if total_l == 0 else str(total_l))
     t1.add_row("In-depth BGP info", f"https://radar.cloudflare.com/routing/as{asn}?dateRange=52w")
-    panels.append(Panel(t1, title=f"BGP informations for AS{asn}", border_style="cyan", expand=False))
+    panels.append(Text(f"--- BGP informations for AS{asn} ---", style="bold cyan"))
+    panels.append(t1)
+    panels.append(Text(""))
 
     # Panel 2: Prefix informations
     t2 = Table(show_header=False, box=None, padding=(0, 2))
@@ -264,7 +267,9 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
     if v6c is not None:
         t2.add_row("IPv6 Prefixes announced", str(v6c))
     if v4c is not None or v6c is not None:
-        panels.append(Panel(t2, title=f"Prefix informations for AS{asn}", border_style="cyan", expand=False))
+        panels.append(Text(f"--- Prefix informations for AS{asn} ---", style="bold cyan"))
+        panels.append(t2)
+        panels.append(Text(""))
 
     # Panel 3: Peering informations
     up = bgp.get("ripe_upstream_named") or bgp.get("ripe_upstream_asns") or []
@@ -276,7 +281,9 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
     t3.add_row("Upstream", _join_asns(up))
     t3.add_row("Downstream", _join_asns(dn))
     t3.add_row("Uncertain", _join_asns(un))
-    panels.append(Panel(t3, title=f"Peering informations for AS{asn}", border_style="cyan", expand=False))
+    panels.append(Text(f"--- Peering informations for AS{asn} ---", style="bold cyan"))
+    panels.append(t3)
+    panels.append(Text(""))
 
     # Panel 4: Aggregated IP resources
     v4_list = bgp.get("ripe_prefixes_v4") or []
@@ -299,6 +306,8 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
             if len(v6_list) > 50:
                 v6_str += f"\n… and {len(v6_list)-50} more"
         t4.add_row("IPv6", v6_str)
-        panels.append(Panel(t4, title=f"Aggregated IP resources for AS{asn}", border_style="cyan", expand=False))
+        panels.append(Text(f"--- Aggregated IP resources for AS{asn} ---", style="bold cyan"))
+        panels.append(t4)
+        panels.append(Text(""))
 
     return Group(*panels)
