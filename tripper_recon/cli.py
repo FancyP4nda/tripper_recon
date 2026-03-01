@@ -14,6 +14,7 @@ from rich.panel import Panel
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
+from tripper_recon.utils.http import configure_rate_limit
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
 
@@ -134,13 +135,7 @@ def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
     return list(dict.fromkeys(targets)), str(p)
 
 
-async def _bound_investigate_ip(target: str, sem: asyncio.Semaphore) -> Any:
-    async with sem:
-        try:
-            res = await investigate_ip(target)
-            return target, res, None
-        except Exception as e:
-            return target, None, e
+
 
 
 async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") -> int:
@@ -149,20 +144,19 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
         log["error"]("IP list file is empty", file=source_file)
         return 1
 
-    sem = asyncio.Semaphore(15)  # Max concurrent IPs being investigated
-
     if output == "console" and source_file:
         console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
 
-    tasks = [_bound_investigate_ip(t, sem) for t in targets]
-    gathered = await asyncio.gather(*tasks, return_exceptions=False)
+    tasks = [investigate_ip(t) for t in targets]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: List[Dict[str, Any]] = []
     failed = 0
     succeeded = 0
 
-    for target, res, err in gathered:
-        if err:
+    for target, item in zip(targets, gathered):
+        if isinstance(item, Exception):
+            err = item
             msg = f"{type(err).__name__}: {err}"
             log["error"]("IP investigation crashed", ip=target, error=msg)
             failed += 1
@@ -171,6 +165,8 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
                 console.print(f"[bold red]IP: {target}[/]")
                 console.print(f"  error: {msg}\n")
             continue
+
+        res = item
 
         if not res.ok:
             log["error"]("IP investigation failed", ip=target, errors=res.errors)
@@ -384,6 +380,7 @@ def main() -> None:
     load_env()
     parser = argparse.ArgumentParser(prog="tripper-recon", description="Unified OSINT IP/Domain/ASN investigations")
     parser.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    parser.add_argument("--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers")
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -413,6 +410,8 @@ def main() -> None:
     if args.cmd is None:
         parser.print_help()
         raise SystemExit(2)
+
+    configure_rate_limit(args.rate_limit)
 
     match args.cmd:
         case "ip":
