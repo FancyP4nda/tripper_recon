@@ -43,9 +43,14 @@ def create_client(timeout: float = 15.0) -> httpx.AsyncClient:
     )
 
 
+_global_sem: asyncio.Semaphore | None = None
+
 class RateLimiter:
-    def __init__(self, rate: int = 5):
-        self._sem = asyncio.Semaphore(rate)
+    def __init__(self, rate: int = 10):
+        global _global_sem
+        if _global_sem is None:
+            _global_sem = asyncio.Semaphore(rate)
+        self._sem = _global_sem
 
     async def __aenter__(self) -> "RateLimiter":
         await self._sem.acquire()
