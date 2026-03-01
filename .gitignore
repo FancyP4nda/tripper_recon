@@ -69,6 +69,8 @@ Thumbs.db
 
 # Local environment
 .env
+.env.*
+!.env.example
 *.local
 
 # Logs
@@ -76,3 +78,17 @@ Thumbs.db
 
 # Investigation outputs
 outputs/
+results/
+reports/
+
+# OSINT data dumps (prevents pushing JSON or CSV data)
+*.json
+*.csv
+*.tsv
+*.sqlite
+*.db
+
+# Temporary targets lists
+*.txt
+!requirements.txt
+!LICENSE.txt
