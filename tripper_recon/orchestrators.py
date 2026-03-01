@@ -242,8 +242,11 @@ async def investigate_domain(domain: str) -> InvestigationResult:
                 domain_errors["otx"] = _error_details(otx_domain)
                 domain_error_msgs.append(_error_summary("otx_domain", otx_domain))
 
-        if passive_ips:
-            ips = dedupe_preserve_order(passive_ips)
+        from tripper_recon.utils.dns import resolve_domain
+        active_ips = await resolve_domain(domain)
+        ips = active_ips + passive_ips
+        if ips:
+            ips = dedupe_preserve_order(ips)
 
         for ip in ips:
             ptr = None
