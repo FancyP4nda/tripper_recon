@@ -33,7 +33,7 @@ Tripper Recon requires **Python 3.10+**.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/tripper_recon.git
+git clone https://github.com/FancyP4nda/tripper_recon.git
 cd tripper_recon
 
 # Install using pip (recommended to use a virtual environment)
