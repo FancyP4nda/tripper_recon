@@ -1,100 +1,81 @@
-# tripper-recon
+# Tripper Recon
 
-Unified, async OSINT toolkit for IP, domain, URL, and ASN investigations. It uses a functional design with RORO interfaces, typed models (Pydantic v2), structured JSON logs, and provider clients for Cloudflare Radar, VirusTotal, Shodan, AbuseIPDB, IPInfo, and OTX. It exposes both a CLI (see `tripper-recon` in [`pyproject.toml`](./pyproject.toml)) and a REST API server (see `tripper-recon-api`), with secure defaults, rate limiting, and jittered backoff.
+<div align="center">
+  <p><strong>A unified, async OSINT toolkit for IP, domain, URL, and ASN investigations.</strong></p>
+</div>
 
-- CLI entrypoint: [`tripper_recon/cli.py`](./tripper_recon/cli.py)
-- API server: [`tripper_recon/api/server.py`](./tripper_recon/api/server.py)
-- Orchestrators: [`tripper_recon/orchestrators.py`](./tripper_recon/orchestrators.py)
+## Overview
+
+Tripper Recon utilizes a functional design with RORO (Receive an Object, Return an Object) interfaces, typed models (Pydantic v2), structured JSON logs, and provider clients for Cloudflare Radar, VirusTotal, Shodan, AbuseIPDB, IPInfo, and AlienVault OTX. It exposes both a powerful CLI and a REST API server, featuring secure defaults, rate limiting, and jittered backoff.
+
+- **CLI entrypoint**: [`tripper_recon/cli.py`](./tripper_recon/cli.py)
+- **API server**: [`tripper_recon/api/server.py`](./tripper_recon/api/server.py)
+- **Orchestrators**: [`tripper_recon/orchestrators.py`](./tripper_recon/orchestrators.py)
+
+---
 
 ## Usage
 
-```
-# Help and version
+### General Commands
+
+Help and version information:
+```bash
 tripper-recon --help
 tripper-recon --version
+```
 
-# IP investigation
+### IP Investigation
+
+Investigate a single IP address:
+```bash
 tripper-recon ip 8.8.8.8
 tripper-recon ip 8.8.8.8 --format json
+```
 
-# Batch IP investigation from text file (one IP per line, # comments allowed)
+Batch IP investigation from a text file (one IP per line, `#` comments allowed):
+```bash
 tripper-recon ip ./path/to/ips.txt
 tripper-recon ip ./path/to/ips.txt --format json
+```
 
-# Domain investigation
+### Domain Investigation
+
+Investigate a domain or URL:
+```bash
 tripper-recon domain www.google.com
 tripper-recon domain www.google.com --format json
+```
 
-# ASN lookup
+### ASN Lookup
+
+Investigate an Autonomous System Number:
+```bash
 tripper-recon asn 15169
 tripper-recon asn 15169 --format json
 ```
 
-Global Flags
-- `-o, --format console|json` - Output format (default: `console`).
-- `--rate-limit <N>` - Max concurrent outgoing API requests across global providers (default: `10`).
-- `--user-agent <str>` - Custom User-Agent string to spoof in HTTP requests.
-- `-V, --version` - Print version and exit.
-- `-h, --help` - Show command help.
+---
 
-### CLI Commands
+## Global Flags
 
-- `tripper-recon --help` — top-level usage and global flags.
-- `tripperrecon ip <ip>` — investigate an IPaddress (suports reading targets from a text file for concurrent batch processing).
+- `-o, --format console|json`: Output format (default: `console`).
+- `--rate-limit <N>`: Max concurrent outgoing API requests across global providers (default: `10`).
+- `--user-agent <str>`: Custom User-Agent string to spoof in HTTP requests.
+- `-V, --version`: Print version and exit.
+- `-h, --help`: Show command help.
+
+---
+
+## CLI Commands
+
+- `tripper-recon --help` — Top-level usage and global flags.
+- `tripper-recon ip <ip>` — Investigate an IP address (supports reading targets from a text file for concurrent batch processing).
   - `--format console|json`
   - `--ports-limit <N|all>`
-- `tripper-recon domain <domain>` — investigate a domain or URL.
+- `tripper-recon domain <domain>` — Investigate a domain or URL.
   - `--format console|json`
   - `--ports-limit <N|all>`
-- `tripper-recon asn <asn>` — investigate an Autonomous Ssem Number.
-  - `--format console|json`
-  - `--neighbors <N>`
-  - `--enrich`
-  - `--enric-limit <N>`
-  - `--mochrome`
-  - `--prefixesout <path>`
-  - `--prefixes v4|v6|both`
-- `tripper-recon-api` — launch the FastAPI server (see `tripper_recon/api/server.py`).
-- Python moule alternative: `pythn -m ripper_recon.cli ...`
-
-## Tchiques
-
-- HTTP/2 with connection pooling using `httpx.AsyncClient` for lower latency and better multiplexing. See MDN on HTTP/2: https://developer.mozilla.org/docs/Web/HTTP/Overview#http2
-- Explicit HTTP headers for `User-Agent` and `Accept` to improe API compatibility. MDN docs:`User-Agent` https://developer.mozilla.org/docs/Web/HTTP/Headers/User-Agent and `Accept` https://developer.mozilla.org/docs/Web/HTTP/Headers/Accept
-- Jittered exponential backoff for transient errors and rate limits; aligns with `429 Too Many Requests` and `Retry-After` guidance. MDN: 429 https://developer.mozilla.org/docs/Web/HTTP/Status/429 and `Retry-After` https://developer.mozilla.org/docs/Web/HTTP/Headers/Retry-After
-- Structured JSON logging (flat key/value events) for SIEM ingestion and correlation, implemented in [`tripper_recon/utils/logging.py`](./tripper_recon/utils/logging.py).
-- Async DNS resolution and reverse PTR lookups offloaded to threads to avoid blocking the event loop; see [`tripper_recon/utils/dns.py`](./tripper_recon/utils/dns.py). MDN DNS basics: https://developer.mozilla.org/docs/Glossary/DNS
-- Dependency injection of a shared `httpx` client and env-driven API keys to keep functions pure and testable; RORO (Receive an Object, Return an Object) throughout the toolchain.
-- Guard clauses and early returns to handle invalid inputs fast e.g., malformed IPs/domains/ASNs) and keep the happy path last.
-- Provider composition: resuts are nrmalized nmerged by orchestrators to render consolidated reports. Console formatting utilizes Python's Rich` library to render fast, borderless text tables that are perfectly aligned for copying and pasting directly into markdown reports (see [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py)).
-
-## Notable Libraries
-
-- httpx (async HTTP client with HTTP/2): https://www.python-httpx.org
-- FastAPI (typed, async web framework): https://fastapi.tiangolocom
-- Pydantic v2 (data validation): https://docs.pydantic.dv
-- Uvicor (ASGI serer): https://www.uvicorn.org
-- python-dotenv (load `.env
-# ASN lookup
-tripper-recon asn 15169
-tripper-recon asn 15169 --format json
-```
-
-Flags
-- `-o, --format console|json` - Output format (default: `console`).
-- `-V, --version` - Print version and exit.
-- `-h, --help` - Show command help.
-
-### CLI Commands
-
-- `tripper-recon --help` — top-level usage and global flags.
-- `tripper-recon ip <ip>` — investigate an IP address.
-  - `--format console|json`
-  - `--ports-limit <N|all>`
-- `tripper-recon domain <domain>` — investigate a domain or URL.
-  - `--format console|json`
-  - `--ports-limit <N|all>`
-- `tripper-recon asn <asn>` — investigate an Autonomous System Number.
+- `tripper-recon asn <asn>` — Investigate an Autonomous System Number.
   - `--format console|json`
   - `--neighbors <N>`
   - `--enrich`
@@ -102,64 +83,75 @@ Flags
   - `--monochrome`
   - `--prefixes-out <path>`
   - `--prefixes v4|v6|both`
-- `tripper-recon-api` — launch the FastAPI server (see `tripper_recon/api/server.py`).
-- Python module alternative: `python -m tripper_recon.cli ...`
+- `tripper-recon-api` — Launch the FastAPI server (see `tripper_recon/api/server.py`).
 
-## Techniques
+*Python module alternative:* `python -m tripper_recon.cli ...`
 
-- HTTP/2 with connection pooling using `httpx.AsyncClient` for lower latency and better multiplexing. See MDN on HTTP/2: https://developer.mozilla.org/docs/Web/HTTP/Overview#http2
-- Explicit HTTP headers for `User-Agent` and `Accept` to improve API compatibility. MDN docs: `User-Agent` https://developer.mozilla.org/docs/Web/HTTP/Headers/User-Agent and `Accept` https://developer.mozilla.org/docs/Web/HTTP/Headers/Accept
-- Jittered exponential backoff for transient errors and rate limits; aligns with `429 Too Many Requests` and `Retry-After` guidance. MDN: 429 https://developer.mozilla.org/docs/Web/HTTP/Status/429 and `Retry-After` https://developer.mozilla.org/docs/Web/HTTP/Headers/Retry-After
-- Structured JSON logging (flat key/value events) for SIEM ingestion and correlation, implemented in [`tripper_recon/utils/logging.py`](./tripper_recon/utils/logging.py).
-- Async DNS resolution and reverse PTR lookups offloaded to threads to avoid blocking the event loop; see [`tripper_recon/utils/dns.py`](./tripper_recon/utils/dns.py). MDN DNS basics: https://developer.mozilla.org/docs/Glossary/DNS
-- Dependency injection of a shared `httpx` client and env-driven API keys to keep functions pure and testable; RORO (Receive an Object, Return an Object) throughout the toolchain.
-- Guard clauses and early returns to handle invalid inputs fast (e.g., malformed IPs/domains/ASNs) and keep the happy path last.
-- Provider composition: results are normalized and merged by orchestrators to render consolidated reports; console formatting aligns with your example outputs in [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py).
+---
 
-## Notable Libraries
+## Techniques & Architecture
 
-- httpx (async HTTP client with HTTP/2): https://www.python-httpx.org
-- FastAPI (typed, async web framework): https://fastapi.tiangolo.com
-- Pydantic v2 (data validation): https://docs.pydantic.dev
-- Uvicorn (ASGI server): https://www.uvicorn.org
-- python-dotenv (load `.env`): https://saurabh-kumar.com/python-dotenv
+- **HTTP/2 with connection pooling**: Utilizing `httpx.AsyncClient` for lower latency and better multiplexing.
+- **Explicit HTTP Headers**: Explicit `User-Agent` and `Accept` headers to improve API compatibility.
+- **Jittered Exponential Backoff**: Handing transient errors and rate limits; aligns with `429 Too Many Requests` and `Retry-After` guidance.
+- **Structured JSON Logging**: Flat key/value events for SIEM ingestion and correlation, implemented in [`tripper_recon/utils/logging.py`](./tripper_recon/utils/logging.py).
+- **Async DNS Resolution**: Reverse PTR lookups offloaded to threads to avoid blocking the event loop; see [`tripper_recon/utils/dns.py`](./tripper_recon/utils/dns.py).
+- **Dependency Injection**: Shared `httpx` client and environment-driven API keys to keep functions pure and testable (RORO throughout the toolchain).
+- **Guard Clauses**: Early returns to handle invalid inputs fast (e.g., malformed IPs/domains/ASNs).
+- **Provider Composition**: Results are normalized and merged by orchestrators to render consolidated reports. Console formatting utilizes Python's Rich library to render fast, borderless text tables that are perfectly aligned for copying and pasting directly into markdown reports (see [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py)).
 
-Provider APIs
-- Cloudflare Radar (GraphQL used for ASN metadata): https://developers.cloudflare.com/api
-- VirusTotal v3: https://docs.virustotal.com/reference/overview
-- Shodan: https://developer.shodan.io/api
-- AbuseIPDB: https://www.abuseipdb.com/api.html
-- IPInfo: https://ipinfo.io/developers
+---
+
+## Configuration
+
+The CLI and API auto-load a `.env` file when present; see [`tripper_recon/utils/env.py`](./tripper_recon/utils/env.py).
+- Example configuration: [`.env.example`](./.env.example)
+
+**Supported keys:**
+- `CLOUDFLARE_API_TOKEN`
+- `VT_API_KEY`
+- `SHODAN_API_KEY`
+- `ABUSEIPDB_API_KEY`
+- `IPINFO_TOKEN`
+- `OTX_API_KEY`
+- `TRIPPER_RECON_LOG_LEVEL`
+- `TRIPPER_RECON_USER_AGENT`
+
+*Note: Outbound HTTP requests default to a modern Chromium User-Agent and can be overridden via `TRIPPER_RECON_USER_AGENT`; all provider calls use HTTPS endpoints (port 443).*
+
+---
+
 ## Project Structure
 
-`
+```text
 .
-- README.md
-- pyproject.toml
-- .gitignore
-- .env.example
-- .env
-- tripper_recon/
-  - api/
-  - providers/
-  - reporting/
-  - types/
-  - utils/
-`
-## File Highlights
+├── README.md
+├── pyproject.toml
+├── .gitignore
+├── .env.example
+├── .env
+└── tripper_recon/
+    ├── api/
+    ├── providers/
+    ├── reporting/
+    ├── types/
+    └── utils/
+```
 
-- CLI: [`tripper_recon/cli.py`](./tripper_recon/cli.py) - Commands for IP, domain, and ASN. Auto-loads `.env`.
-- API Server: [`tripper_recon/api/server.py`](./tripper_recon/api/server.py) - Endpoints: `/ip/{ip}`, `/domain/{domain}`, `/asn/{asn}`.
-- Orchestrators: [`tripper_recon/orchestrators.py`](./tripper_recon/orchestrators.py) - Async flows that combine providers per target type.
-- Providers:
+### File Highlights
+
+- **CLI**: [`tripper_recon/cli.py`](./tripper_recon/cli.py) - Commands for IP, domain, and ASN. Auto-loads `.env`.
+- **API Server**: [`tripper_recon/api/server.py`](./tripper_recon/api/server.py) - Endpoints: `/ip/{ip}`, `/domain/{domain}`, `/asn/{asn}`.
+- **Orchestrators**: [`tripper_recon/orchestrators.py`](./tripper_recon/orchestrators.py) - Async flows that combine providers per target type.
+- **Providers**:
   - Cloudflare Radar GraphQL: [`tripper_recon/providers/cloudflare_radar.py`](./tripper_recon/providers/cloudflare_radar.py)
   - VirusTotal: [`tripper_recon/providers/virustotal.py`](./tripper_recon/providers/virustotal.py)
   - Shodan: [`tripper_recon/providers/shodan_api.py`](./tripper_recon/providers/shodan_api.py)
   - AbuseIPDB: [`tripper_recon/providers/abuseipdb.py`](./tripper_recon/providers/abuseipdb.py)
   - IPInfo: [`tripper_recon/providers/ipinfo.py`](./tripper_recon/providers/ipinfo.py)
   - AlienVault OTX: [`tripper_recon/providers/otx.py`](./tripper_recon/providers/otx.py)
-- Reporting: [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py) - Renders summaries aligned to your example outputs.
-- Utilities:
+- **Reporting**: [`tripper_recon/reporting/console.py`](./tripper_recon/reporting/console.py) - Renders summaries aligned to your example outputs.
+- **Utilities**:
   - JSON logging: [`tripper_recon/utils/logging.py`](./tripper_recon/utils/logging.py)
   - HTTP client + rate limiting: [`tripper_recon/utils/http.py`](./tripper_recon/utils/http.py)
   - Backoff: [`tripper_recon/utils/backoff.py`](./tripper_recon/utils/backoff.py)
@@ -167,14 +159,20 @@ Provider APIs
   - Validation: [`tripper_recon/utils/validation.py`](./tripper_recon/utils/validation.py)
   - Env loader: [`tripper_recon/utils/env.py`](./tripper_recon/utils/env.py)
 
-## Configuration
+---
 
-- The CLI and API auto-load a `.env` file when present; see [`tripper_recon/utils/env.py`](./tripper_recon/utils/env.py).
-- Example configuration: [`.env.example`](./.env.example)
-- Supported keys: `CLOUDFLARE_API_TOKEN`, `VT_API_KEY`, `SHODAN_API_KEY`, `ABUSEIPDB_API_KEY`, `IPINFO_TOKEN`, `OTX_API_KEY`, `TRIPPER_RECON_LOG_LEVEL`, `TRIPPER_RECON_USER_AGENT`.
-- Outbound HTTP requests default to a modern Chromium User-Agent and can be overridden via `TRIPPER_RECON_USER_AGENT`; all provider calls use HTTPS endpoints (port 443).
+## Notable Libraries
 
+- [httpx](https://www.python-httpx.org): Async HTTP client with HTTP/2.
+- [FastAPI](https://fastapi.tiangolo.com): Typed, async web framework.
+- [Pydantic v2](https://docs.pydantic.dev): Data validation.
+- [Uvicorn](https://www.uvicorn.org): ASGI server.
+- [python-dotenv](https://saurabh-kumar.com/python-dotenv): Load `.env` files.
 
+## Provider APIs
 
-
-
+- [Cloudflare Radar](https://developers.cloudflare.com/api) (GraphQL used for ASN metadata)
+- [VirusTotal v3](https://docs.virustotal.com/reference/overview)
+- [Shodan](https://developer.shodan.io/api)
+- [AbuseIPDB](https://www.abuseipdb.com/api.html)
+- [IPInfo](https://ipinfo.io/developers)
