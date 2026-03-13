@@ -107,6 +107,4 @@ OTX_API_KEY=your_key_here
 ```
 *(An example template is provided in `.env.example`)*
 
----
 
-*This project was developed with a focus on functional programming principles (Receive an Object, Return an Object) and strictly typed models (Pydantic v2).*
