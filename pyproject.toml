@@ -9,7 +9,7 @@ description = "Unified async OSINT IP/Domain/ASN investigation tool"
 requires-python = ">=3.10"
 authors = [{ name = "Your Name" }]
 readme = "README.md"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 dependencies = [
   "httpx[http2]>=0.27.0",
   "pydantic>=2.6.0",
