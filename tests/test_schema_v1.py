@@ -166,6 +166,49 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", serialized)
         self.assertNotIn("headers", serialized)
 
+    def test_deterministic_reputation_scoring_replays_exactly(self) -> None:
+        legacy = InvestigationResult(
+            ok=True,
+            data={
+                "virustotal": {
+                    "vt_last_analysis_stats": {"malicious": 4, "harmless": 80},
+                    "vt_reputation": -37,
+                },
+                "abuseipdb": {"abuseipdb_confidence_score": 82},
+            },
+            warnings=[],
+            errors=[],
+        )
+
+        first = ip_result_to_schema_v1(target="8.8.8.8", result=legacy).model_dump()
+        second = ip_result_to_schema_v1(target="8.8.8.8", result=legacy).model_dump()
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["verdict"], "malicious")
+        self.assertEqual(first["score"]["severity"], "high")
+        self.assertEqual(first["score"]["value"], 80)
+        self.assertGreater(first["confidence"], 0)
+        self.assertTrue(any("virustotal-summary:" in reason for reason in first["score"]["reasons"]))
+        self.assertTrue(any("abuseipdb-summary:" in reason for reason in first["score"]["reasons"]))
+
+    def test_context_only_scoring_cannot_mark_malicious(self) -> None:
+        legacy = InvestigationResult(
+            ok=True,
+            data={
+                "ipinfo": {"asn": 15169, "country": "US"},
+                "shodan": {"ports": [80, 443, 8080]},
+            },
+            warnings=[],
+            errors=[],
+        )
+
+        payload = ip_result_to_schema_v1(target="8.8.8.8", result=legacy).model_dump()
+
+        self.assertEqual(payload["verdict"], "benign_contextual")
+        self.assertNotEqual(payload["verdict"], "malicious")
+        self.assertEqual(payload["score"]["severity"], "low")
+        self.assertTrue(all("summary:" in reason for reason in payload["score"]["reasons"]))
+
     def test_provider_registry_skips_default_disallowed_provider(self) -> None:
         selection = select_providers(target_type="ip", mode=Mode.PASSIVE)
 
