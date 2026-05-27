@@ -190,7 +190,7 @@ async def investigate_ip(ip: str) -> InvestigationResult:
         return InvestigationResult(ok=True, data=data, errors=result_errors)
 
 
-async def investigate_domain(domain: str) -> InvestigationResult:
+async def investigate_domain(domain: str, *, mode: str = "passive") -> InvestigationResult:
     if not is_valid_domain(domain):
         return InvestigationResult(ok=False, errors=["Invalid domain"], data={})
     ips: List[str] = []
@@ -244,8 +244,10 @@ async def investigate_domain(domain: str) -> InvestigationResult:
                 domain_errors["otx"] = _error_details(otx_domain)
                 domain_error_msgs.append(_error_summary("otx_domain", otx_domain))
 
-        from tripper_recon.utils.dns import resolve_domain
-        active_ips = await resolve_domain(domain)
+        active_ips: List[str] = []
+        if mode == "resolver-passive":
+            from tripper_recon.utils.dns import resolve_domain
+            active_ips = await resolve_domain(domain)
         ips = active_ips + passive_ips
         if ips:
             ips = dedupe_preserve_order(ips)
@@ -556,4 +558,3 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             data["errors"] = provider_errors
 
         return InvestigationResult(ok=True, data=data, warnings=warnings, errors=result_errors)
-

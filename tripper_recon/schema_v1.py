@@ -129,6 +129,98 @@ def _ip_evidence(result: InvestigationResult) -> list[Evidence]:
     return evidence
 
 
+def _domain_provider_statuses(
+    result: InvestigationResult,
+    *,
+    provider_names: list[str] | tuple[str, ...] | None = None,
+    extra_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+) -> list[ProviderStatus]:
+    providers = provider_names or ["virustotal", "otx"]
+    data = result.data or {}
+    domain_intel = data.get("domain_intel") if isinstance(data.get("domain_intel"), dict) else {}
+    domain_errors = data.get("domain_errors") if isinstance(data.get("domain_errors"), dict) else {}
+    statuses: list[ProviderStatus] = list(extra_statuses or [])
+
+    for provider in providers:
+        payload = domain_intel.get(provider)
+        if payload:
+            statuses.append(ProviderStatus(provider=provider, status="completed"))
+        elif provider in domain_errors:
+            statuses.append(
+                ProviderStatus(
+                    provider=provider,
+                    status="failed",
+                    reason=str(domain_errors[provider]),
+                )
+            )
+        else:
+            statuses.append(
+                ProviderStatus(
+                    provider=provider,
+                    status="missing_credentials",
+                    reason="No provider data returned by legacy domain investigation.",
+                )
+            )
+    return statuses
+
+
+def _domain_evidence(result: InvestigationResult) -> list[Evidence]:
+    evidence: list[Evidence] = []
+    data = result.data or {}
+    domain_intel = data.get("domain_intel") if isinstance(data.get("domain_intel"), dict) else {}
+    for provider, payload in domain_intel.items():
+        if not payload:
+            continue
+        evidence.append(
+            Evidence(
+                id=f"domain-{provider}-summary",
+                provider=provider,
+                evidence_class="reputation",
+                summary=f"{provider} returned domain observation data.",
+                data=payload if isinstance(payload, dict) else {"value": payload},
+            )
+        )
+    for item in data.get("ips", []) or []:
+        if not isinstance(item, dict):
+            continue
+        ip = item.get("ip")
+        if not ip:
+            continue
+        evidence.append(
+            Evidence(
+                id=f"domain-passive-ip-{ip}",
+                provider="passive_relationship",
+                evidence_class="relationship",
+                summary=f"Domain has passive relationship to IP {ip}.",
+                data={"ip": ip},
+            )
+        )
+    return evidence
+
+
+def _domain_relationships(result: InvestigationResult) -> list[Relationship]:
+    relationships: list[Relationship] = []
+    data = result.data or {}
+    domain = str(data.get("domain") or "")
+    for item in data.get("ips", []) or []:
+        if not isinstance(item, dict):
+            continue
+        ip = item.get("ip")
+        if not ip:
+            continue
+        evidence_id = f"domain-passive-ip-{ip}"
+        relationships.append(
+            Relationship(
+                id=f"{domain}-resolves-to-{ip}",
+                source=domain,
+                target=str(ip),
+                relationship_type="passive_dns_a_or_aaaa",
+                evidence_ids=[evidence_id],
+            )
+        )
+    return relationships
+
+
 def ip_result_to_schema_v1(
     *,
     target: str,
@@ -178,6 +270,66 @@ def failed_ip_result_v1(
         target_type="ip",
         input=target,
         normalized_target=target,
+        mode=mode,
+        profile=profile,
+        execution_status="failed",
+        provider_status=[provider_status] if provider_status else [],
+        errors=[error],
+    )
+
+
+def domain_result_to_schema_v1(
+    *,
+    target: str,
+    normalized_target: str,
+    result: InvestigationResult,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    provider_names: list[str] | tuple[str, ...] | None = None,
+    extra_provider_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+) -> InvestigationResultV1:
+    execution_status: ExecutionStatus
+    if result.ok and result.errors:
+        execution_status = "partial"
+    elif result.ok:
+        execution_status = "completed"
+    else:
+        execution_status = "failed"
+
+    return InvestigationResultV1(
+        target_type="domain",
+        input=target,
+        normalized_target=normalized_target,
+        mode=mode,
+        profile=profile,
+        execution_status=execution_status,
+        provider_status=_domain_provider_statuses(
+            result,
+            provider_names=provider_names,
+            extra_statuses=extra_provider_statuses,
+        )
+        if result.ok
+        else list(extra_provider_statuses or []),
+        evidence=_domain_evidence(result) if result.ok else [],
+        relationships=_domain_relationships(result) if result.ok else [],
+        errors=list(result.errors),
+        warnings=list(result.warnings),
+    )
+
+
+def failed_domain_result_v1(
+    *,
+    target: str,
+    normalized_target: str,
+    error: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    provider_status: ProviderStatus | None = None,
+) -> InvestigationResultV1:
+    return InvestigationResultV1(
+        target_type="domain",
+        input=target,
+        normalized_target=normalized_target,
         mode=mode,
         profile=profile,
         execution_status="failed",
