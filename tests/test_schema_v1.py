@@ -117,6 +117,17 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         skipped = {status.provider: status for status in selection.skipped}
         self.assertEqual(skipped["local_dns"].status, "skipped")
 
+    def test_resolver_passive_allows_local_dns_but_blocks_direct_active(self) -> None:
+        selection = select_providers(target_type="domain", mode=Mode.RESOLVER_PASSIVE)
+
+        self.assertIn("local_dns", selection.executable)
+        with self.assertRaises(ProviderSelectionError):
+            select_providers(
+                target_type="domain",
+                mode=Mode.RESOLVER_PASSIVE,
+                requested_providers=["direct_http"],
+            )
+
     async def test_cli_single_ip_json_uses_schema_v1(self) -> None:
         stdout = io.StringIO()
         with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
@@ -219,6 +230,49 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.data["ips"][0]["ip"], "1.1.1.1")
+
+    async def test_resolver_passive_domain_investigation_calls_dns_and_ptr(self) -> None:
+        provider_missing = {"ok": False, "error": "missing_api_key"}
+        with patch("tripper_recon.orchestrators.create_client", return_value=FakeAsyncClient()):
+            with patch(
+                "tripper_recon.orchestrators._env_keys",
+                return_value=ApiKeys(vt_api_key="vt", otx_api_key="otx"),
+            ), patch(
+                "tripper_recon.orchestrators.vt_domain_summary",
+                new=AsyncMock(return_value={"ok": True, "data": {"vt_dns_records": []}}),
+            ), patch(
+                "tripper_recon.orchestrators.otx_domain_pulses",
+                new=AsyncMock(return_value={"ok": True, "data": {}}),
+            ), patch(
+                "tripper_recon.orchestrators.vt_ip_summary",
+                new=AsyncMock(return_value=provider_missing),
+            ), patch(
+                "tripper_recon.orchestrators.shodan_host",
+                new=AsyncMock(return_value=provider_missing),
+            ), patch(
+                "tripper_recon.orchestrators.ipinfo_ip",
+                new=AsyncMock(return_value=provider_missing),
+            ), patch(
+                "tripper_recon.orchestrators.abuseipdb_check",
+                new=AsyncMock(return_value=provider_missing),
+            ), patch(
+                "tripper_recon.orchestrators.otx_ip_pulses",
+                new=AsyncMock(return_value=provider_missing),
+            ), patch(
+                "tripper_recon.utils.dns.resolve_domain",
+                new=AsyncMock(return_value=["1.1.1.1"]),
+            ) as resolve_mock, patch(
+                "tripper_recon.utils.dns.reverse_ptr",
+                new=AsyncMock(return_value="one.one.one.one"),
+            ) as ptr_mock:
+                result = await investigate_domain("example.com", mode="resolver-passive")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["ips"][0]["ip"], "1.1.1.1")
+        self.assertEqual(result.data["ips"][0]["ptr"], "one.one.one.one")
+        self.assertEqual(result.data["ips"][0]["relationship_source"], "analyst_resolver")
+        resolve_mock.assert_awaited_once_with("example.com")
+        ptr_mock.assert_awaited_once_with("1.1.1.1")
 
 
 if __name__ == "__main__":

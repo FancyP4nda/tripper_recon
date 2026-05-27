@@ -248,12 +248,18 @@ async def investigate_domain(domain: str, *, mode: str = "passive") -> Investiga
         if mode == "resolver-passive":
             from tripper_recon.utils.dns import resolve_domain
             active_ips = await resolve_domain(domain)
+        active_ip_set = set(active_ips)
+        passive_ip_set = set(passive_ips)
         ips = active_ips + passive_ips
         if ips:
             ips = dedupe_preserve_order(ips)
 
         for ip in ips:
             ptr = None
+            relationship_source = "analyst_resolver" if ip in active_ip_set else "provider_observation"
+            if mode == "resolver-passive" and ip in active_ip_set:
+                from tripper_recon.utils.dns import reverse_ptr
+                ptr = await reverse_ptr(ip)
             try:
                 vt = await vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip)
             except Exception as e:  # noqa: BLE001
@@ -311,6 +317,8 @@ async def investigate_domain(domain: str, *, mode: str = "passive") -> Investiga
             entry = {
                 "ip": ip,
                 "ptr": ptr,
+                "relationship_source": relationship_source,
+                "also_seen_in_provider_observations": ip in passive_ip_set,
                 "virustotal": vt.get("data", {}) if vt.get("ok") else {},
                 "shodan": sh.get("data", {}) if sh.get("ok") else {},
                 "ipinfo": ipi.get("data", {}) if ipi.get("ok") else {},
@@ -325,6 +333,8 @@ async def investigate_domain(domain: str, *, mode: str = "passive") -> Investiga
     result_errors.extend(domain_error_msgs)
 
     data: Dict[str, Any] = {"domain": domain, "ips": out}
+    if active_ips:
+        data["resolver"] = {"ips": active_ips}
     if domain_intel:
         data["domain_intel"] = domain_intel
     if domain_errors:
