@@ -143,6 +143,157 @@ def _raw_payload_data(payload: Any, *, max_bytes: int = RAW_PAYLOAD_MAX_BYTES) -
     }
 
 
+def _as_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _severity(value: int) -> Literal["none", "low", "medium", "high", "critical"]:
+    if value >= 90:
+        return "critical"
+    if value >= 70:
+        return "high"
+    if value >= 40:
+        return "medium"
+    if value > 0:
+        return "low"
+    return "none"
+
+
+def _verdict(value: int, *, has_reputation_support: bool, has_contextual_support: bool) -> Verdict:
+    if has_reputation_support and value >= 70:
+        return "malicious"
+    if has_reputation_support and value >= 30:
+        return "suspicious"
+    if has_contextual_support and value > 0:
+        return "benign_contextual"
+    return "unknown"
+
+
+def _confidence(value: int, reason_count: int) -> float:
+    if value <= 0 or reason_count <= 0:
+        return 0.0
+    return min(1.0, round(0.35 + (0.15 * reason_count) + (0.2 if value >= 70 else 0.0), 2))
+
+
+def _evidence_ids_by_provider(evidence: list[Evidence]) -> dict[str, str]:
+    return {item.provider: item.id for item in evidence}
+
+
+def _score_from_ip_data(data: dict[str, Any], evidence: list[Evidence]) -> tuple[Score, Verdict, float]:
+    evidence_ids = _evidence_ids_by_provider(evidence)
+    scores: list[int] = []
+    reasons: list[str] = []
+    reputation_support = False
+    contextual_support = False
+
+    vt = data.get("virustotal") if isinstance(data.get("virustotal"), dict) else {}
+    vt_evidence_id = evidence_ids.get("virustotal")
+    if vt and vt_evidence_id:
+        stats = vt.get("vt_last_analysis_stats") if isinstance(vt.get("vt_last_analysis_stats"), dict) else {}
+        malicious = _as_int(stats.get("malicious"))
+        reputation = _as_int(vt.get("vt_reputation"))
+        if malicious > 0:
+            reputation_support = True
+            scores.append(min(90, 50 + (malicious * 5)))
+            reasons.append(f"{vt_evidence_id}: VirusTotal reported {malicious} malicious detections.")
+        elif reputation <= -10:
+            reputation_support = True
+            scores.append(40)
+            reasons.append(f"{vt_evidence_id}: VirusTotal community reputation is {reputation}.")
+
+    abuse = data.get("abuseipdb") if isinstance(data.get("abuseipdb"), dict) else {}
+    abuse_evidence_id = evidence_ids.get("abuseipdb")
+    if abuse and abuse_evidence_id:
+        confidence_score = _as_int(abuse.get("abuseipdb_confidence_score"))
+        if confidence_score >= 75:
+            reputation_support = True
+            scores.append(80)
+            reasons.append(f"{abuse_evidence_id}: AbuseIPDB confidence score is {confidence_score}.")
+        elif confidence_score >= 25:
+            reputation_support = True
+            scores.append(45)
+            reasons.append(f"{abuse_evidence_id}: AbuseIPDB confidence score is {confidence_score}.")
+
+    otx = data.get("otx") if isinstance(data.get("otx"), dict) else {}
+    otx_evidence_id = evidence_ids.get("otx")
+    if otx and otx_evidence_id:
+        pulse_count = _as_int(otx.get("otx_pulse_count"))
+        if pulse_count >= 10:
+            reputation_support = True
+            scores.append(60)
+            reasons.append(f"{otx_evidence_id}: OTX reported {pulse_count} pulses.")
+        elif pulse_count > 0:
+            reputation_support = True
+            scores.append(35)
+            reasons.append(f"{otx_evidence_id}: OTX reported {pulse_count} pulses.")
+
+    for provider in ("ipinfo", "shodan", "asn_meta"):
+        if data.get(provider) and evidence_ids.get(provider):
+            contextual_support = True
+            scores.append(15)
+            reasons.append(f"{evidence_ids[provider]}: {provider} returned context evidence.")
+
+    value = max(scores, default=0)
+    return (
+        Score(severity=_severity(value), value=value, reasons=reasons),
+        _verdict(value, has_reputation_support=reputation_support, has_contextual_support=contextual_support),
+        _confidence(value, len(reasons)),
+    )
+
+
+def _score_from_domain_data(data: dict[str, Any], evidence: list[Evidence]) -> tuple[Score, Verdict, float]:
+    evidence_ids = _evidence_ids_by_provider(evidence)
+    scores: list[int] = []
+    reasons: list[str] = []
+    reputation_support = False
+    contextual_support = False
+    domain_intel = data.get("domain_intel") if isinstance(data.get("domain_intel"), dict) else {}
+
+    vt = domain_intel.get("virustotal") if isinstance(domain_intel.get("virustotal"), dict) else {}
+    vt_evidence_id = evidence_ids.get("virustotal")
+    if vt and vt_evidence_id:
+        stats = vt.get("vt_last_analysis_stats") if isinstance(vt.get("vt_last_analysis_stats"), dict) else {}
+        malicious = _as_int(stats.get("malicious"))
+        reputation = _as_int(vt.get("vt_reputation"))
+        if malicious > 0:
+            reputation_support = True
+            scores.append(min(90, 50 + (malicious * 5)))
+            reasons.append(f"{vt_evidence_id}: VirusTotal reported {malicious} malicious detections.")
+        elif reputation <= -10:
+            reputation_support = True
+            scores.append(40)
+            reasons.append(f"{vt_evidence_id}: VirusTotal community reputation is {reputation}.")
+
+    otx = domain_intel.get("otx") if isinstance(domain_intel.get("otx"), dict) else {}
+    otx_evidence_id = evidence_ids.get("otx")
+    if otx and otx_evidence_id:
+        pulse_count = _as_int(otx.get("otx_pulse_count"))
+        if pulse_count >= 10:
+            reputation_support = True
+            scores.append(60)
+            reasons.append(f"{otx_evidence_id}: OTX reported {pulse_count} pulses.")
+        elif pulse_count > 0:
+            reputation_support = True
+            scores.append(35)
+            reasons.append(f"{otx_evidence_id}: OTX reported {pulse_count} pulses.")
+
+    relationship_ids = [item.id for item in evidence if item.evidence_class == "relationship"]
+    if relationship_ids:
+        contextual_support = True
+        scores.append(15)
+        reasons.extend(f"{evidence_id}: Domain relationship evidence is present." for evidence_id in relationship_ids)
+
+    value = max(scores, default=0)
+    return (
+        Score(severity=_severity(value), value=value, reasons=reasons),
+        _verdict(value, has_reputation_support=reputation_support, has_contextual_support=contextual_support),
+        _confidence(value, len(reasons)),
+    )
+
+
 def _provider_statuses(
     result: InvestigationResult,
     *,
@@ -326,6 +477,8 @@ def ip_result_to_schema_v1(
         execution_status = "completed"
     else:
         execution_status = "failed"
+    evidence = _ip_evidence(result, include_raw=include_raw) if result.ok else []
+    score, verdict, confidence = _score_from_ip_data(result.data or {}, evidence) if result.ok else (Score(), "unknown", 0.0)
 
     return InvestigationResultV1(
         target_type="ip",
@@ -334,6 +487,9 @@ def ip_result_to_schema_v1(
         mode=mode,
         profile=profile,
         execution_status=execution_status,
+        verdict=verdict,
+        score=score,
+        confidence=confidence,
         provider_status=_provider_statuses(
             result,
             provider_names=provider_names,
@@ -341,7 +497,7 @@ def ip_result_to_schema_v1(
         )
         if result.ok
         else list(extra_provider_statuses or []),
-        evidence=_ip_evidence(result, include_raw=include_raw) if result.ok else [],
+        evidence=evidence,
         errors=[_sanitize_reason(error) for error in result.errors],
         warnings=[_sanitize_reason(warning) for warning in result.warnings],
     )
@@ -385,6 +541,8 @@ def domain_result_to_schema_v1(
         execution_status = "completed"
     else:
         execution_status = "failed"
+    evidence = _domain_evidence(result, include_raw=include_raw) if result.ok else []
+    score, verdict, confidence = _score_from_domain_data(result.data or {}, evidence) if result.ok else (Score(), "unknown", 0.0)
 
     return InvestigationResultV1(
         target_type="domain",
@@ -393,6 +551,9 @@ def domain_result_to_schema_v1(
         mode=mode,
         profile=profile,
         execution_status=execution_status,
+        verdict=verdict,
+        score=score,
+        confidence=confidence,
         provider_status=_domain_provider_statuses(
             result,
             provider_names=provider_names,
@@ -400,7 +561,7 @@ def domain_result_to_schema_v1(
         )
         if result.ok
         else list(extra_provider_statuses or []),
-        evidence=_domain_evidence(result, include_raw=include_raw) if result.ok else [],
+        evidence=evidence,
         relationships=_domain_relationships(result) if result.ok else [],
         errors=[_sanitize_reason(error) for error in result.errors],
         warnings=[_sanitize_reason(warning) for warning in result.warnings],
