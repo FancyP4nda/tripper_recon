@@ -142,6 +142,19 @@ def _domain_provider_statuses(
     statuses: list[ProviderStatus] = list(extra_statuses or [])
 
     for provider in providers:
+        if provider == "local_dns":
+            resolver_payload = data.get("resolver") if isinstance(data.get("resolver"), dict) else {}
+            if resolver_payload:
+                statuses.append(ProviderStatus(provider=provider, status="completed"))
+            else:
+                statuses.append(
+                    ProviderStatus(
+                        provider=provider,
+                        status="missing_credentials",
+                        reason="Resolver did not return domain data.",
+                    )
+                )
+            continue
         payload = domain_intel.get(provider)
         if payload:
             statuses.append(ProviderStatus(provider=provider, status="completed"))
@@ -186,13 +199,20 @@ def _domain_evidence(result: InvestigationResult) -> list[Evidence]:
         ip = item.get("ip")
         if not ip:
             continue
+        relationship_source = str(item.get("relationship_source") or "provider_observation")
+        relationship_label = "analyst resolver" if relationship_source == "analyst_resolver" else "passive provider"
         evidence.append(
             Evidence(
-                id=f"domain-passive-ip-{ip}",
-                provider="passive_relationship",
+                id=f"domain-{relationship_source}-ip-{ip}",
+                provider=relationship_source,
                 evidence_class="relationship",
-                summary=f"Domain has passive relationship to IP {ip}.",
-                data={"ip": ip},
+                summary=f"Domain has {relationship_label} relationship to IP {ip}.",
+                data={
+                    "ip": ip,
+                    "ptr": item.get("ptr"),
+                    "relationship_source": relationship_source,
+                    "also_seen_in_provider_observations": bool(item.get("also_seen_in_provider_observations")),
+                },
             )
         )
     return evidence
@@ -208,13 +228,14 @@ def _domain_relationships(result: InvestigationResult) -> list[Relationship]:
         ip = item.get("ip")
         if not ip:
             continue
-        evidence_id = f"domain-passive-ip-{ip}"
+        relationship_source = str(item.get("relationship_source") or "provider_observation")
+        evidence_id = f"domain-{relationship_source}-ip-{ip}"
         relationships.append(
             Relationship(
                 id=f"{domain}-resolves-to-{ip}",
                 source=domain,
                 target=str(ip),
-                relationship_type="passive_dns_a_or_aaaa",
+                relationship_type="analyst_resolver_dns" if relationship_source == "analyst_resolver" else "passive_dns_a_or_aaaa",
                 evidence_ids=[evidence_id],
             )
         )
