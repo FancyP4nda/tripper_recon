@@ -76,11 +76,16 @@ class InvestigationResultV1(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def _provider_statuses(result: InvestigationResult) -> list[ProviderStatus]:
-    providers = ["ipinfo", "virustotal", "shodan", "abuseipdb", "otx"]
+def _provider_statuses(
+    result: InvestigationResult,
+    *,
+    provider_names: list[str] | tuple[str, ...] | None = None,
+    extra_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+) -> list[ProviderStatus]:
+    providers = provider_names or ["ipinfo", "virustotal", "shodan", "abuseipdb", "otx"]
     data = result.data or {}
     provider_errors = data.get("errors") if isinstance(data.get("errors"), dict) else {}
-    statuses: list[ProviderStatus] = []
+    statuses: list[ProviderStatus] = list(extra_statuses or [])
 
     for provider in providers:
         payload = data.get(provider)
@@ -130,6 +135,8 @@ def ip_result_to_schema_v1(
     result: InvestigationResult,
     mode: str = "passive",
     profile: str = "best_effort",
+    provider_names: list[str] | tuple[str, ...] | None = None,
+    extra_provider_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
 ) -> InvestigationResultV1:
     execution_status: ExecutionStatus
     if result.ok and result.errors:
@@ -146,9 +153,34 @@ def ip_result_to_schema_v1(
         mode=mode,
         profile=profile,
         execution_status=execution_status,
-        provider_status=_provider_statuses(result) if result.ok else [],
+        provider_status=_provider_statuses(
+            result,
+            provider_names=provider_names,
+            extra_statuses=extra_provider_statuses,
+        )
+        if result.ok
+        else list(extra_provider_statuses or []),
         evidence=_ip_evidence(result) if result.ok else [],
         errors=list(result.errors),
         warnings=list(result.warnings),
     )
 
+
+def failed_ip_result_v1(
+    *,
+    target: str,
+    error: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    provider_status: ProviderStatus | None = None,
+) -> InvestigationResultV1:
+    return InvestigationResultV1(
+        target_type="ip",
+        input=target,
+        normalized_target=target,
+        mode=mode,
+        profile=profile,
+        execution_status="failed",
+        provider_status=[provider_status] if provider_status else [],
+        errors=[error],
+    )
