@@ -39,8 +39,8 @@ def logger(module: str) -> Any:
             "message": message,
             **_parse_context(**ctx),
         }
-        sys.stdout.write(json.dumps(record) + "\n")
-        sys.stdout.flush()
+        sys.stderr.write(json.dumps(record) + "\n")
+        sys.stderr.flush()
 
     return {
         "debug": lambda msg, **c: _log(10, msg, **c),

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
+import sys
 from typing import Any, Dict, List
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +14,7 @@ from rich.panel import Panel
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
+from tripper_recon.schema_v1 import ip_result_to_schema_v1
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -138,7 +139,14 @@ def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
 
 
 
-async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") -> int:
+async def _cmd_ip(
+    ip: str,
+    *,
+    output: str = "console",
+    ports_limit: str = "25",
+    mode: str = "passive",
+    profile: str = "best_effort",
+) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
         log["error"]("IP list file is empty", file=source_file)
@@ -184,7 +192,26 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
             console.print(panel)
             console.print()
 
-    if output == "json":
+    if output == "json" and len(targets) == 1 and gathered:
+        target = targets[0]
+        if isinstance(gathered[0], Exception):
+            msg = results[0]["errors"][0] if results[0].get("errors") else "IP investigation crashed"
+            from tripper_recon.types.models import InvestigationResult
+            schema_result = ip_result_to_schema_v1(
+                target=target,
+                result=InvestigationResult(ok=False, errors=[msg], data={}),
+                mode=mode,
+                profile=profile,
+            )
+        else:
+            schema_result = ip_result_to_schema_v1(
+                target=target,
+                result=gathered[0],
+                mode=mode,
+                profile=profile,
+            )
+        sys.stdout.write(schema_result.model_dump_json(indent=2) + "\n")
+    elif output == "json":
         out = {
             "ok": failed == 0,
             "source_file": source_file,
@@ -388,6 +415,9 @@ def main() -> None:
     p_ip = sub.add_parser("ip", help="Investigate an IP address")
     p_ip.add_argument("ip", type=str)
     p_ip.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_ip.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a single IP target")
+    p_ip.add_argument("--mode", choices=["passive"], default="passive", help="Investigation mode for schema v1 output")
+    p_ip.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
     p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
@@ -418,7 +448,13 @@ def main() -> None:
 
     match args.cmd:
         case "ip":
-            code = asyncio.run(_cmd_ip(args.ip, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
+            code = asyncio.run(_cmd_ip(
+                args.ip,
+                output=args.format,
+                ports_limit=getattr(args, "ports_limit", "25"),
+                mode=getattr(args, "mode", "passive"),
+                profile=getattr(args, "profile", "best_effort"),
+            ))
         case "domain":
             code = asyncio.run(_cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
         case "asn":
