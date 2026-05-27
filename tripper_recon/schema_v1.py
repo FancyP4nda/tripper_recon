@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field
 
@@ -8,10 +10,14 @@ from tripper_recon.types.models import InvestigationResult
 
 
 SCHEMA_VERSION = "1.0"
+RAW_PAYLOAD_MAX_BYTES = 4096
+REDACTED = "[REDACTED]"
 
 TargetType = Literal["ip", "domain", "url", "asn"]
 ExecutionStatus = Literal["completed", "partial", "failed"]
 Verdict = Literal["malicious", "suspicious", "benign_contextual", "unknown"]
+SENSITIVE_KEYS = {"token", "key", "api_key", "apikey", "authorization", "x-api-key"}
+HEADER_KEYS = {"headers", "request_headers", "requestheaders"}
 
 
 class Finding(BaseModel):
@@ -76,6 +82,67 @@ class InvestigationResultV1(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+def _sanitize_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if not parsed.scheme or not parsed.netloc or not parsed.query:
+        return value
+    query = [
+        (key, REDACTED if key.lower() in SENSITIVE_KEYS else val)
+        for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+    ]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query, safe="[]"), parsed.fragment))
+
+
+def _sanitize_for_output(value: Any) -> Any:
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if key_lower in HEADER_KEYS:
+                continue
+            if key_lower in SENSITIVE_KEYS:
+                clean[key_text] = REDACTED
+            else:
+                clean[key_text] = _sanitize_for_output(item)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_for_output(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_output(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_url(value)
+    return value
+
+
+def _sanitize_reason(value: Any) -> str:
+    return str(_sanitize_for_output(value))
+
+
+def _raw_payload_data(payload: Any, *, max_bytes: int = RAW_PAYLOAD_MAX_BYTES) -> dict[str, Any]:
+    sanitized = _sanitize_for_output(payload)
+    encoded = json.dumps(sanitized, sort_keys=True, separators=(",", ":"), default=str)
+    original_size = len(encoded.encode("utf-8"))
+    if original_size <= max_bytes:
+        return {
+            "raw": sanitized,
+            "raw_truncated": False,
+            "raw_original_size_bytes": original_size,
+            "raw_emitted_size_bytes": original_size,
+            "raw_max_size_bytes": max_bytes,
+        }
+
+    truncated = encoded.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    emitted_size = len(truncated.encode("utf-8"))
+    return {
+        "raw": truncated,
+        "raw_truncated": True,
+        "raw_original_size_bytes": original_size,
+        "raw_emitted_size_bytes": emitted_size,
+        "raw_max_size_bytes": max_bytes,
+    }
+
+
 def _provider_statuses(
     result: InvestigationResult,
     *,
@@ -96,7 +163,7 @@ def _provider_statuses(
                 ProviderStatus(
                     provider=provider,
                     status="failed",
-                    reason=str(provider_errors[provider]),
+                    reason=_sanitize_reason(provider_errors[provider]),
                 )
             )
         else:
@@ -110,7 +177,7 @@ def _provider_statuses(
     return statuses
 
 
-def _ip_evidence(result: InvestigationResult) -> list[Evidence]:
+def _ip_evidence(result: InvestigationResult, *, include_raw: bool = False) -> list[Evidence]:
     evidence: list[Evidence] = []
     data = result.data or {}
     for provider in ("ipinfo", "virustotal", "shodan", "abuseipdb", "otx", "asn_meta"):
@@ -123,7 +190,7 @@ def _ip_evidence(result: InvestigationResult) -> list[Evidence]:
                 provider=provider,
                 evidence_class="context" if provider in {"ipinfo", "asn_meta"} else "reputation",
                 summary=f"{provider} returned observation data.",
-                data=payload if isinstance(payload, dict) else {"value": payload},
+                data=_raw_payload_data(payload) if include_raw else {},
             )
         )
     return evidence
@@ -163,7 +230,7 @@ def _domain_provider_statuses(
                 ProviderStatus(
                     provider=provider,
                     status="failed",
-                    reason=str(domain_errors[provider]),
+                    reason=_sanitize_reason(domain_errors[provider]),
                 )
             )
         else:
@@ -177,7 +244,7 @@ def _domain_provider_statuses(
     return statuses
 
 
-def _domain_evidence(result: InvestigationResult) -> list[Evidence]:
+def _domain_evidence(result: InvestigationResult, *, include_raw: bool = False) -> list[Evidence]:
     evidence: list[Evidence] = []
     data = result.data or {}
     domain_intel = data.get("domain_intel") if isinstance(data.get("domain_intel"), dict) else {}
@@ -190,7 +257,7 @@ def _domain_evidence(result: InvestigationResult) -> list[Evidence]:
                 provider=provider,
                 evidence_class="reputation",
                 summary=f"{provider} returned domain observation data.",
-                data=payload if isinstance(payload, dict) else {"value": payload},
+                data=_raw_payload_data(payload) if include_raw else {},
             )
         )
     for item in data.get("ips", []) or []:
@@ -250,6 +317,7 @@ def ip_result_to_schema_v1(
     profile: str = "best_effort",
     provider_names: list[str] | tuple[str, ...] | None = None,
     extra_provider_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+    include_raw: bool = False,
 ) -> InvestigationResultV1:
     execution_status: ExecutionStatus
     if result.ok and result.errors:
@@ -273,9 +341,9 @@ def ip_result_to_schema_v1(
         )
         if result.ok
         else list(extra_provider_statuses or []),
-        evidence=_ip_evidence(result) if result.ok else [],
-        errors=list(result.errors),
-        warnings=list(result.warnings),
+        evidence=_ip_evidence(result, include_raw=include_raw) if result.ok else [],
+        errors=[_sanitize_reason(error) for error in result.errors],
+        warnings=[_sanitize_reason(warning) for warning in result.warnings],
     )
 
 
@@ -308,6 +376,7 @@ def domain_result_to_schema_v1(
     profile: str = "best_effort",
     provider_names: list[str] | tuple[str, ...] | None = None,
     extra_provider_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+    include_raw: bool = False,
 ) -> InvestigationResultV1:
     execution_status: ExecutionStatus
     if result.ok and result.errors:
@@ -331,10 +400,10 @@ def domain_result_to_schema_v1(
         )
         if result.ok
         else list(extra_provider_statuses or []),
-        evidence=_domain_evidence(result) if result.ok else [],
+        evidence=_domain_evidence(result, include_raw=include_raw) if result.ok else [],
         relationships=_domain_relationships(result) if result.ok else [],
-        errors=list(result.errors),
-        warnings=list(result.warnings),
+        errors=[_sanitize_reason(error) for error in result.errors],
+        warnings=[_sanitize_reason(warning) for warning in result.warnings],
     )
 
 

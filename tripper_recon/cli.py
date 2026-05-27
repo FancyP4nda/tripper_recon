@@ -179,6 +179,7 @@ async def _cmd_ip(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: list[str] | None = None,
+    include_raw: bool = False,
 ) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
@@ -290,6 +291,7 @@ async def _cmd_ip(
                 profile=profile,
                 provider_names=provider_selection.executable,
                 extra_provider_statuses=provider_selection.skipped,
+                include_raw=include_raw,
             )
         else:
             schema_result = ip_result_to_schema_v1(
@@ -299,6 +301,7 @@ async def _cmd_ip(
                 profile=profile,
                 provider_names=provider_selection.executable,
                 extra_provider_statuses=provider_selection.skipped,
+                include_raw=include_raw,
             )
         sys.stdout.write(schema_result.model_dump_json(indent=2) + "\n")
     elif output == "json":
@@ -326,6 +329,7 @@ async def _cmd_domain(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: list[str] | None = None,
+    include_raw: bool = False,
 ) -> int:
     valid, norm_domain, validation_error = validate_typed_target("domain", domain)
     if not valid:
@@ -398,6 +402,7 @@ async def _cmd_domain(
                     profile=profile,
                     provider_names=provider_selection.executable,
                     extra_provider_statuses=provider_selection.skipped,
+                    include_raw=include_raw,
                 ).model_dump_json(indent=2)
                 + "\n"
             )
@@ -414,6 +419,7 @@ async def _cmd_domain(
             profile=profile,
             provider_names=provider_selection.executable,
             extra_provider_statuses=provider_selection.skipped,
+            include_raw=include_raw,
         )
         sys.stdout.write(schema_result.model_dump_json(indent=2) + "\n")
         return 0
@@ -505,6 +511,7 @@ async def _cmd_investigate(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: list[str] | None = None,
+    include_raw: bool = False,
 ) -> int:
     targets, source_file = _load_targets(target_or_file)
     if not targets:
@@ -516,7 +523,12 @@ async def _cmd_investigate(
         for target in targets:
             result = await schema_result_for_target(
                 target,
-                InvestigationOptions(mode=mode, profile=profile, providers=tuple(providers) if providers else None),
+                InvestigationOptions(
+                    mode=mode,
+                    profile=profile,
+                    providers=tuple(providers) if providers else None,
+                    include_raw=include_raw,
+                ),
             )
             if result.execution_status == "failed":
                 failed += 1
@@ -529,9 +541,9 @@ async def _cmd_investigate(
     for target in targets:
         target_type, _normalized = classify_target(target)
         if target_type == "ip":
-            failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers) != 0)
+            failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw) != 0)
         elif target_type == "domain":
-            failed += int(await _cmd_domain(target, output=output, mode=mode, profile=profile, providers=providers) != 0)
+            failed += int(await _cmd_domain(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw) != 0)
         else:
             failed += 1
             console.print(f"[bold red]Unsupported target for console investigate:[/] {target}")
@@ -547,6 +559,7 @@ async def _cmd_url(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: list[str] | None = None,
+    include_raw: bool = False,
 ) -> int:
     valid, normalized_url, validation_error = validate_typed_target("url", url)
     if not valid:
@@ -560,7 +573,12 @@ async def _cmd_url(
     else:
         result = await url_schema_result(
             url,
-            InvestigationOptions(mode=mode, profile=profile, providers=tuple(providers) if providers else None),
+            InvestigationOptions(
+                mode=mode,
+                profile=profile,
+                providers=tuple(providers) if providers else None,
+                include_raw=include_raw,
+            ),
         )
     if output == "json":
         sys.stdout.write(result.model_dump_json(indent=2) + "\n")
@@ -732,6 +750,7 @@ def main() -> None:
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
+                include_raw=getattr(args, "include_raw", False),
             ))
         case "domain":
             code = asyncio.run(_cmd_domain(
@@ -741,6 +760,7 @@ def main() -> None:
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
+                include_raw=getattr(args, "include_raw", False),
             ))
         case "url":
             code = asyncio.run(_cmd_url(
@@ -749,6 +769,7 @@ def main() -> None:
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
+                include_raw=getattr(args, "include_raw", False),
             ))
         case "investigate":
             code = asyncio.run(_cmd_investigate(
@@ -757,6 +778,7 @@ def main() -> None:
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
+                include_raw=getattr(args, "include_raw", False),
             ))
         case "asn":
             asn_str = str(args.asn).strip()
