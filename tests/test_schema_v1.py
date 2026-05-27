@@ -13,6 +13,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
 
 from tripper_recon.api.server import api_ip
 from tripper_recon.cli import _cmd_ip
+from tripper_recon.provider_registry import Capability, Mode, ProviderSelectionError, select_providers
 from tripper_recon.schema_v1 import InvestigationResultV1, ip_result_to_schema_v1
 from tripper_recon.types.models import InvestigationResult
 
@@ -62,6 +63,22 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["mode"], "passive")
         self.assertEqual(payload["profile"], "best_effort")
 
+    def test_provider_registry_skips_default_disallowed_provider(self) -> None:
+        selection = select_providers(target_type="ip", mode=Mode.PASSIVE)
+
+        self.assertIn("ipinfo", selection.executable)
+        skipped = {status.provider: status for status in selection.skipped}
+        self.assertEqual(skipped["local_dns"].status, "skipped")
+        self.assertIn(Capability.ANALYST_RESOLVER.value, skipped["local_dns"].reason or "")
+
+    def test_provider_registry_fails_explicit_disallowed_provider(self) -> None:
+        with self.assertRaises(ProviderSelectionError):
+            select_providers(
+                target_type="ip",
+                mode=Mode.PASSIVE,
+                requested_providers=["local_dns"],
+            )
+
     async def test_cli_single_ip_json_uses_schema_v1(self) -> None:
         stdout = io.StringIO()
         with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
@@ -73,6 +90,22 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(REQUIRED_KEYS.issubset(payload.keys()))
         self.assertNotIn("ok", payload)
         self.assertEqual(payload["normalized_target"], "8.8.8.8")
+        skipped = {status["provider"]: status for status in payload["provider_status"] if status["status"] == "skipped"}
+        self.assertIn("local_dns", skipped)
+
+    async def test_cli_explicit_disallowed_provider_fails_before_investigation(self) -> None:
+        stdout = io.StringIO()
+        mock_investigate = AsyncMock(return_value=legacy_ip_result())
+        with patch("tripper_recon.cli.investigate_ip", new=mock_investigate):
+            with contextlib.redirect_stdout(stdout):
+                code = await _cmd_ip("8.8.8.8", output="json", providers=["local_dns"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["execution_status"], "failed")
+        self.assertNotIn("ok", payload)
+        self.assertEqual(payload["provider_status"][0]["provider"], "local_dns")
+        mock_investigate.assert_not_awaited()
 
     async def test_api_ip_uses_schema_v1(self) -> None:
         with patch("tripper_recon.api.server.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):

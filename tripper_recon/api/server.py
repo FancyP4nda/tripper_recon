@@ -6,7 +6,8 @@ from typing import Any, Dict
 from fastapi import FastAPI, HTTPException
 
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
-from tripper_recon.schema_v1 import ip_result_to_schema_v1
+from tripper_recon.provider_registry import ProviderSelectionError, select_providers
+from tripper_recon.schema_v1 import ProviderStatus, failed_ip_result_v1, ip_result_to_schema_v1
 from tripper_recon.utils.env import load_env
 
 
@@ -22,15 +23,51 @@ async def health() -> Dict[str, str]:
 
 
 @app.get("/ip/{ip}")
-async def api_ip(ip: str, mode: str = "passive", profile: str = "best_effort") -> Dict[str, Any]:
-    if mode != "passive":
-        raise HTTPException(status_code=400, detail=["Unsupported mode for schema v1 IP path"])
+async def api_ip(
+    ip: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: str | None = None,
+) -> Dict[str, Any]:
     if profile != "best_effort":
         raise HTTPException(status_code=400, detail=["Unsupported profile for schema v1 IP path"])
+    requested_providers = [value.strip() for value in providers.split(",") if value.strip()] if providers else None
+    try:
+        provider_selection = select_providers(
+            target_type="ip",
+            mode=mode,
+            profile=profile,
+            requested_providers=requested_providers,
+        )
+    except ProviderSelectionError as exc:
+        status = ProviderStatus(provider=exc.provider, status="failed", reason=str(exc))
+        return failed_ip_result_v1(
+            target=ip,
+            error=str(exc),
+            mode=mode,
+            profile=profile,
+            provider_status=status,
+        ).model_dump()
+    except ValueError as exc:
+        return failed_ip_result_v1(target=ip, error=str(exc), mode=mode, profile=profile).model_dump()
     res = await investigate_ip(ip)
     if not res.ok:
-        return ip_result_to_schema_v1(target=ip, result=res, mode=mode, profile=profile).model_dump()
-    return ip_result_to_schema_v1(target=ip, result=res, mode=mode, profile=profile).model_dump()
+        return ip_result_to_schema_v1(
+            target=ip,
+            result=res,
+            mode=mode,
+            profile=profile,
+            provider_names=provider_selection.executable,
+            extra_provider_statuses=provider_selection.skipped,
+        ).model_dump()
+    return ip_result_to_schema_v1(
+        target=ip,
+        result=res,
+        mode=mode,
+        profile=profile,
+        provider_names=provider_selection.executable,
+        extra_provider_statuses=provider_selection.skipped,
+    ).model_dump()
 
 
 @app.get("/domain/{domain}")

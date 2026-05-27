@@ -14,7 +14,8 @@ from rich.panel import Panel
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
-from tripper_recon.schema_v1 import ip_result_to_schema_v1
+from tripper_recon.provider_registry import ProviderSelectionError, select_providers
+from tripper_recon.schema_v1 import ProviderStatus, failed_ip_result_v1, ip_result_to_schema_v1
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -146,6 +147,7 @@ async def _cmd_ip(
     ports_limit: str = "25",
     mode: str = "passive",
     profile: str = "best_effort",
+    providers: list[str] | None = None,
 ) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
@@ -154,6 +156,44 @@ async def _cmd_ip(
 
     if output == "console" and source_file:
         console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
+
+    try:
+        provider_selection = select_providers(
+            target_type="ip",
+            mode=mode,
+            profile=profile,
+            requested_providers=providers,
+        )
+    except ProviderSelectionError as exc:
+        if output == "json" and len(targets) == 1:
+            status = ProviderStatus(provider=exc.provider, status="failed", reason=str(exc))
+            sys.stdout.write(
+                failed_ip_result_v1(
+                    target=targets[0],
+                    error=str(exc),
+                    mode=mode,
+                    profile=profile,
+                    provider_status=status,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        else:
+            log["error"]("Provider selection failed", error=str(exc))
+        return 1
+    except ValueError as exc:
+        if output == "json" and len(targets) == 1:
+            sys.stdout.write(
+                failed_ip_result_v1(
+                    target=targets[0],
+                    error=str(exc),
+                    mode=mode,
+                    profile=profile,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        else:
+            log["error"]("Provider selection failed", error=str(exc))
+        return 1
 
     tasks = [investigate_ip(t) for t in targets]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -202,6 +242,8 @@ async def _cmd_ip(
                 result=InvestigationResult(ok=False, errors=[msg], data={}),
                 mode=mode,
                 profile=profile,
+                provider_names=provider_selection.executable,
+                extra_provider_statuses=provider_selection.skipped,
             )
         else:
             schema_result = ip_result_to_schema_v1(
@@ -209,6 +251,8 @@ async def _cmd_ip(
                 result=gathered[0],
                 mode=mode,
                 profile=profile,
+                provider_names=provider_selection.executable,
+                extra_provider_statuses=provider_selection.skipped,
             )
         sys.stdout.write(schema_result.model_dump_json(indent=2) + "\n")
     elif output == "json":
@@ -416,8 +460,9 @@ def main() -> None:
     p_ip.add_argument("ip", type=str)
     p_ip.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_ip.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a single IP target")
-    p_ip.add_argument("--mode", choices=["passive"], default="passive", help="Investigation mode for schema v1 output")
+    p_ip.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
     p_ip.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
+    p_ip.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
     p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
@@ -454,6 +499,7 @@ def main() -> None:
                 ports_limit=getattr(args, "ports_limit", "25"),
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
+                providers=getattr(args, "providers", None),
             ))
         case "domain":
             code = asyncio.run(_cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
