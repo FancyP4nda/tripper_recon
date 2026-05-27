@@ -55,6 +55,20 @@ def classify_target(value: str) -> tuple[str, str]:
     return "domain", stripped
 
 
+def validate_typed_target(expected_type: str, value: str) -> tuple[bool, str, str | None]:
+    actual_type, normalized = classify_target(value)
+    if expected_type == "asn":
+        asn_candidate = value.strip()[2:] if value.strip().lower().startswith("as") else value.strip()
+        if is_valid_asn(asn_candidate):
+            return True, asn_candidate, None
+        return False, value.strip(), f"Expected asn target but received {actual_type!r}: {value}"
+    if actual_type != expected_type:
+        return False, normalized, f"Expected {expected_type} target but received {actual_type!r}: {value}"
+    if expected_type == "domain" and urlparse(value.strip()).scheme:
+        return False, normalized, f"Expected domain target but received URL: {value}"
+    return True, normalized, None
+
+
 async def ip_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
     opts = options or InvestigationOptions()
     try:

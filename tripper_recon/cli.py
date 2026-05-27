@@ -6,7 +6,6 @@ import os
 import sys
 from typing import Any, Dict, List
 from pathlib import Path
-from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
@@ -22,7 +21,7 @@ from tripper_recon.schema_v1 import (
     failed_ip_result_v1,
     ip_result_to_schema_v1,
 )
-from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target
+from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target, validate_typed_target
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -183,6 +182,21 @@ async def _cmd_ip(
     if source_file and not targets:
         log["error"]("IP list file is empty", file=source_file)
         return 1
+    invalid_targets = []
+    for target in targets:
+        valid, _normalized, error = validate_typed_target("ip", target)
+        if not valid:
+            invalid_targets.append((target, error or f"Invalid IP target: {target}"))
+    if invalid_targets:
+        if output == "json" and len(targets) == 1:
+            target, error = invalid_targets[0]
+            sys.stdout.write(failed_ip_result_v1(target=target, error=error, mode=mode, profile=profile).model_dump_json(indent=2) + "\n")
+        else:
+            for target, error in invalid_targets:
+                log["error"]("Invalid IP target", target=target, error=error)
+                if output == "console":
+                    console.print(f"[bold red]Invalid IP target:[/] {target}")
+        return 1
 
     if output == "console" and source_file:
         console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
@@ -311,8 +325,23 @@ async def _cmd_domain(
     profile: str = "best_effort",
     providers: list[str] | None = None,
 ) -> int:
-    parsed = urlparse(domain)
-    norm_domain = parsed.hostname or domain.strip().strip("/")
+    valid, norm_domain, validation_error = validate_typed_target("domain", domain)
+    if not valid:
+        if output == "json":
+            sys.stdout.write(
+                failed_domain_result_v1(
+                    target=domain,
+                    normalized_target=norm_domain,
+                    error=validation_error or f"Invalid domain target: {domain}",
+                    mode=mode,
+                    profile=profile,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        else:
+            log["error"]("Invalid domain target", target=domain, error=validation_error)
+            console.print(f"[bold red]Invalid domain target:[/] {domain}")
+        return 1
 
     try:
         provider_selection = select_providers(
@@ -509,6 +538,29 @@ async def _cmd_investigate(
     return 0 if failed == 0 else 1
 
 
+async def _cmd_url(
+    url: str,
+    *,
+    output: str = "console",
+    mode: str = "passive",
+    profile: str = "best_effort",
+) -> int:
+    valid, normalized_url, validation_error = validate_typed_target("url", url)
+    result = failed_result_v1(
+        target_type="url",
+        target=url,
+        normalized_target=normalized_url,
+        mode=mode,
+        profile=profile,
+        error=validation_error or "URL investigation is not implemented yet.",
+    )
+    if output == "json":
+        sys.stdout.write(result.model_dump_json(indent=2) + "\n")
+    else:
+        console.print(f"[bold red]{result.errors[0]}[/]")
+    return 1
+
+
 def _default_output_dir() -> Path:
     here = Path(__file__).resolve()
     root = here.parent.parent
@@ -516,7 +568,7 @@ def _default_output_dir() -> Path:
 
 
 async def _cmd_asn(
-    asn: int,
+    asn: int | str,
     *,
     output: str = "console",
     neighbors: int = 8,
@@ -526,6 +578,21 @@ async def _cmd_asn(
     prefixes_out: str | None = None,
     prefixes: str = "both",
 ) -> int:
+    valid, normalized_asn, validation_error = validate_typed_target("asn", str(asn))
+    if not valid:
+        log["error"]("Invalid ASN provided", asn=asn, error=validation_error)
+        if output == "json":
+            result = failed_result_v1(
+                target_type="asn",
+                target=str(asn),
+                normalized_target=normalized_asn,
+                error=validation_error or f"Invalid ASN provided: {asn}",
+            )
+            sys.stdout.write(result.model_dump_json(indent=2) + "\n")
+        elif output == "console":
+            console.print(f"[bold red]Error:[/] Invalid ASN provided: {asn}")
+        return 2
+    asn = int(normalized_asn)
     res = await investigate_asn(asn, resolve_neighbors=neighbors, enrich=enrich, enrich_limit=enrich_limit)
     if not res.ok:
         log["error"]("ASN lookup failed", asn=asn, errors=res.errors)
@@ -613,6 +680,12 @@ def main() -> None:
     _add_machine_options(p_domain)
     p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
 
+    p_url = sub.add_parser("url", help="Investigate a URL")
+    p_url.add_argument("url", type=str)
+    p_url.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_url.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a URL target")
+    _add_machine_options(p_url)
+
     p_investigate = sub.add_parser("investigate", help="Investigate a target or file of mixed indicators")
     p_investigate.add_argument("target_or_file", type=str)
     p_investigate.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
@@ -658,6 +731,13 @@ def main() -> None:
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
             ))
+        case "url":
+            code = asyncio.run(_cmd_url(
+                args.url,
+                output=args.format,
+                mode=getattr(args, "mode", "passive"),
+                profile=getattr(args, "profile", "best_effort"),
+            ))
         case "investigate":
             code = asyncio.run(_cmd_investigate(
                 args.target_or_file,
@@ -668,25 +748,16 @@ def main() -> None:
             ))
         case "asn":
             asn_str = str(args.asn).strip()
-            if asn_str.lower().startswith("as"):
-                asn_str = asn_str[2:]
-            try:
-                asn_int = int(asn_str)
-            except Exception:
-                log["error"]("Invalid ASN provided", asn=args.asn)
-                console.print(f"[bold red]Error:[/] Invalid ASN provided: {args.asn}")
-                code = 2
-            else:
-                code = asyncio.run(_cmd_asn(
-                    asn_int,
-                    output=args.format or "console",
-                    neighbors=args.neighbors,
-                    enrich=args.enrich,
-                    enrich_limit=args.enrich_limit,
-                    monochrome=args.monochrome,
-                    prefixes_out=getattr(args, "prefixes_out", None),
-                    prefixes=getattr(args, "prefixes", "both"),
-                ))
+            code = asyncio.run(_cmd_asn(
+                asn_str,
+                output=args.format or "console",
+                neighbors=args.neighbors,
+                enrich=args.enrich,
+                enrich_limit=args.enrich_limit,
+                monochrome=args.monochrome,
+                prefixes_out=getattr(args, "prefixes_out", None),
+                prefixes=getattr(args, "prefixes", "both"),
+            ))
         case _:
             code = 2
     raise SystemExit(code)
