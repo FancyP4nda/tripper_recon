@@ -159,7 +159,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         mock_investigate.assert_not_awaited()
 
     async def test_api_ip_uses_schema_v1(self) -> None:
-        with patch("tripper_recon.api.server.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
             payload = await api_ip("8.8.8.8")
 
         InvestigationResultV1.model_validate(payload)
@@ -191,8 +191,8 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         try:
-            with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
-                with patch("tripper_recon.cli.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
+            with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
+                with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
                     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                         code = await _cmd_investigate(str(path), output="json")
         finally:
@@ -220,13 +220,40 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ok", payload)
 
     async def test_api_domain_uses_schema_v1(self) -> None:
-        with patch("tripper_recon.api.server.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
             payload = await api_domain("example.com")
 
         InvestigationResultV1.model_validate(payload)
         self.assertTrue(REQUIRED_KEYS.issubset(payload.keys()))
         self.assertNotIn("ok", payload)
         self.assertEqual(payload["target_type"], "domain")
+
+    async def test_api_accepts_machine_parameters_and_uses_shared_ip_service(self) -> None:
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())) as mock_investigate:
+            payload = await api_ip(
+                "8.8.8.8",
+                mode="resolver-passive",
+                profile="best_effort",
+                providers="ipinfo,virustotal",
+                include_raw=True,
+                require_profile_complete=False,
+                cache=False,
+            )
+
+        self.assertEqual(payload["mode"], "resolver-passive")
+        self.assertEqual(payload["profile"], "best_effort")
+        self.assertEqual([status["provider"] for status in payload["provider_status"]], ["ipinfo", "virustotal"])
+        mock_investigate.assert_awaited_once_with("8.8.8.8")
+
+    async def test_api_provider_validation_returns_schema_failure_without_secret_leak(self) -> None:
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
+            payload = await api_domain("example.com", providers="direct_http")
+
+        self.assertEqual(payload["execution_status"], "failed")
+        self.assertEqual(payload["provider_status"][0]["provider"], "direct_http")
+        self.assertNotIn("ok", payload)
+        self.assertNotIn("apikey", json.dumps(payload).lower())
+        mock_investigate.assert_not_awaited()
 
     async def test_passive_domain_investigation_does_not_call_dns(self) -> None:
         provider_missing = {"ok": False, "error": "missing_api_key"}

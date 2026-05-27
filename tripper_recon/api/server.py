@@ -1,19 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
 
-from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
-from tripper_recon.provider_registry import ProviderSelectionError, select_providers
-from tripper_recon.schema_v1 import (
-    ProviderStatus,
-    domain_result_to_schema_v1,
-    failed_domain_result_v1,
-    failed_ip_result_v1,
-    ip_result_to_schema_v1,
-)
+from tripper_recon.schema_v1 import failed_result_v1
+from tripper_recon.service import InvestigationOptions, domain_schema_result, ip_schema_result, normalize_provider_param, schema_result_for_target
 from tripper_recon.utils.env import load_env
 
 
@@ -34,46 +26,24 @@ async def api_ip(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: str | None = None,
+    include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> Dict[str, Any]:
     if profile != "best_effort":
         raise HTTPException(status_code=400, detail=["Unsupported profile for schema v1 IP path"])
-    requested_providers = [value.strip() for value in providers.split(",") if value.strip()] if providers else None
-    try:
-        provider_selection = select_providers(
-            target_type="ip",
+    result = await ip_schema_result(
+        ip,
+        InvestigationOptions(
             mode=mode,
             profile=profile,
-            requested_providers=requested_providers,
-        )
-    except ProviderSelectionError as exc:
-        status = ProviderStatus(provider=exc.provider, status="failed", reason=str(exc))
-        return failed_ip_result_v1(
-            target=ip,
-            error=str(exc),
-            mode=mode,
-            profile=profile,
-            provider_status=status,
-        ).model_dump()
-    except ValueError as exc:
-        return failed_ip_result_v1(target=ip, error=str(exc), mode=mode, profile=profile).model_dump()
-    res = await investigate_ip(ip)
-    if not res.ok:
-        return ip_result_to_schema_v1(
-            target=ip,
-            result=res,
-            mode=mode,
-            profile=profile,
-            provider_names=provider_selection.executable,
-            extra_provider_statuses=provider_selection.skipped,
-        ).model_dump()
-    return ip_result_to_schema_v1(
-        target=ip,
-        result=res,
-        mode=mode,
-        profile=profile,
-        provider_names=provider_selection.executable,
-        extra_provider_statuses=provider_selection.skipped,
-    ).model_dump()
+            providers=normalize_provider_param(providers),
+            include_raw=include_raw,
+            require_profile_complete=require_profile_complete,
+            cache=cache,
+        ),
+    )
+    return result.model_dump()
 
 
 @app.get("/domain/{domain}")
@@ -82,64 +52,93 @@ async def api_domain(
     mode: str = "passive",
     profile: str = "best_effort",
     providers: str | None = None,
+    include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> Dict[str, Any]:
     if profile != "best_effort":
         raise HTTPException(status_code=400, detail=["Unsupported profile for schema v1 domain path"])
-    requested_providers = [value.strip() for value in providers.split(",") if value.strip()] if providers else None
-    try:
-        provider_selection = select_providers(
-            target_type="domain",
+    result = await domain_schema_result(
+        domain,
+        InvestigationOptions(
             mode=mode,
             profile=profile,
-            requested_providers=requested_providers,
-        )
-    except ProviderSelectionError as exc:
-        status = ProviderStatus(provider=exc.provider, status="failed", reason=str(exc))
-        return failed_domain_result_v1(
-            target=domain,
-            normalized_target=domain,
-            error=str(exc),
-            mode=mode,
-            profile=profile,
-            provider_status=status,
-        ).model_dump()
-    except ValueError as exc:
-        return failed_domain_result_v1(
-            target=domain,
-            normalized_target=domain,
-            error=str(exc),
-            mode=mode,
-            profile=profile,
-        ).model_dump()
+            providers=normalize_provider_param(providers),
+            include_raw=include_raw,
+            require_profile_complete=require_profile_complete,
+            cache=cache,
+        ),
+    )
+    return result.model_dump()
 
-    res = await investigate_domain(domain, mode=mode)
-    if not res.ok:
-        return domain_result_to_schema_v1(
-            target=domain,
-            normalized_target=domain,
-            result=res,
+
+@app.get("/url")
+async def api_url(
+    target: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: str | None = None,
+    include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
+) -> Dict[str, Any]:
+    result = await schema_result_for_target(
+        target,
+        InvestigationOptions(
             mode=mode,
             profile=profile,
-            provider_names=provider_selection.executable,
-            extra_provider_statuses=provider_selection.skipped,
-        ).model_dump()
-    return domain_result_to_schema_v1(
-        target=domain,
-        normalized_target=domain,
-        result=res,
-        mode=mode,
-        profile=profile,
-        provider_names=provider_selection.executable,
-        extra_provider_statuses=provider_selection.skipped,
-    ).model_dump()
+            providers=normalize_provider_param(providers),
+            include_raw=include_raw,
+            require_profile_complete=require_profile_complete,
+            cache=cache,
+        ),
+    )
+    return result.model_dump()
+
+
+@app.get("/investigate")
+async def api_investigate(
+    target: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: str | None = None,
+    include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
+) -> Dict[str, Any]:
+    result = await schema_result_for_target(
+        target,
+        InvestigationOptions(
+            mode=mode,
+            profile=profile,
+            providers=normalize_provider_param(providers),
+            include_raw=include_raw,
+            require_profile_complete=require_profile_complete,
+            cache=cache,
+        ),
+    )
+    return result.model_dump()
 
 
 @app.get("/asn/{asn}")
-async def api_asn(asn: int) -> Dict[str, Any]:
-    res = await investigate_asn(asn)
-    if not res.ok:
-        raise HTTPException(status_code=400, detail=res.errors)
-    return res.model_dump()
+async def api_asn(
+    asn: int,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: str | None = None,
+    include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
+) -> Dict[str, Any]:
+    _ = (providers, include_raw, require_profile_complete, cache)
+    return failed_result_v1(
+        target_type="asn",
+        target=str(asn),
+        normalized_target=str(asn),
+        mode=mode,
+        profile=profile,
+        error="Target type 'asn' is not implemented for schema v1 API output yet.",
+    ).model_dump()
 
 
 def run() -> None:
