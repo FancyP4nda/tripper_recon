@@ -359,6 +359,67 @@ def failed_domain_result_v1(
     )
 
 
+def url_result_to_schema_v1(
+    *,
+    target: str,
+    normalized_target: str,
+    extracted_domain: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    provider_statuses: list[ProviderStatus] | tuple[ProviderStatus, ...] | None = None,
+) -> InvestigationResultV1:
+    evidence_id = "url-parser-domain"
+    return InvestigationResultV1(
+        target_type="url",
+        input=target,
+        normalized_target=normalized_target,
+        mode=mode,
+        profile=profile,
+        execution_status="completed",
+        verdict="unknown",
+        provider_status=list(provider_statuses or []),
+        evidence=[
+            Evidence(
+                id=evidence_id,
+                provider="url_parser",
+                evidence_class="relationship",
+                summary=f"URL contains domain {extracted_domain}.",
+                data={"domain": extracted_domain},
+            )
+        ],
+        relationships=[
+            Relationship(
+                id=f"{normalized_target}-contains-domain-{extracted_domain}",
+                source=normalized_target,
+                target=extracted_domain,
+                relationship_type="url_contains_domain",
+                evidence_ids=[evidence_id],
+            )
+        ],
+    )
+
+
+def failed_url_result_v1(
+    *,
+    target: str,
+    normalized_target: str,
+    error: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    provider_status: ProviderStatus | None = None,
+) -> InvestigationResultV1:
+    return InvestigationResultV1(
+        target_type="url",
+        input=target,
+        normalized_target=normalized_target,
+        mode=mode,
+        profile=profile,
+        execution_status="failed",
+        provider_status=[provider_status] if provider_status else [],
+        errors=[error],
+    )
+
+
 def failed_result_v1(
     *,
     target_type: TargetType,

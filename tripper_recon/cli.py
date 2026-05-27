@@ -18,10 +18,12 @@ from tripper_recon.schema_v1 import (
     ProviderStatus,
     domain_result_to_schema_v1,
     failed_domain_result_v1,
+    failed_result_v1,
     failed_ip_result_v1,
+    failed_url_result_v1,
     ip_result_to_schema_v1,
 )
-from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target, validate_typed_target
+from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target, url_schema_result, validate_typed_target
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -544,21 +546,30 @@ async def _cmd_url(
     output: str = "console",
     mode: str = "passive",
     profile: str = "best_effort",
+    providers: list[str] | None = None,
 ) -> int:
     valid, normalized_url, validation_error = validate_typed_target("url", url)
-    result = failed_result_v1(
-        target_type="url",
-        target=url,
-        normalized_target=normalized_url,
-        mode=mode,
-        profile=profile,
-        error=validation_error or "URL investigation is not implemented yet.",
-    )
+    if not valid:
+        result = failed_url_result_v1(
+            target=url,
+            normalized_target=normalized_url,
+            mode=mode,
+            profile=profile,
+            error=validation_error or f"Invalid URL target: {url}",
+        )
+    else:
+        result = await url_schema_result(
+            url,
+            InvestigationOptions(mode=mode, profile=profile, providers=tuple(providers) if providers else None),
+        )
     if output == "json":
         sys.stdout.write(result.model_dump_json(indent=2) + "\n")
     else:
-        console.print(f"[bold red]{result.errors[0]}[/]")
-    return 1
+        if result.execution_status == "failed":
+            console.print(f"[bold red]{result.errors[0]}[/]")
+        else:
+            console.print(result.model_dump_json(indent=2))
+    return 1 if result.execution_status == "failed" else 0
 
 
 def _default_output_dir() -> Path:
@@ -737,6 +748,7 @@ def main() -> None:
                 output=args.format,
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
+                providers=getattr(args, "providers", None),
             ))
         case "investigate":
             code = asyncio.run(_cmd_investigate(
