@@ -14,7 +14,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
     raise unittest.SkipTest("Project runtime dependencies are not installed") from exc
 
 from tripper_recon.api.server import api_domain, api_ip
-from tripper_recon.cli import _cmd_domain, _cmd_investigate, _cmd_ip
+from tripper_recon.cli import _cmd_asn, _cmd_domain, _cmd_investigate, _cmd_ip, _cmd_url
 from tripper_recon.orchestrators import investigate_domain
 from tripper_recon.provider_registry import Capability, Mode, ProviderSelectionError, select_providers
 from tripper_recon.schema_v1 import InvestigationResultV1, ip_result_to_schema_v1
@@ -218,6 +218,81 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["target_type"], "url")
         self.assertEqual(payload["execution_status"], "failed")
         self.assertNotIn("ok", payload)
+
+    async def test_typed_domain_rejects_url_without_coercion(self) -> None:
+        stdout = io.StringIO()
+        with patch("tripper_recon.cli.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
+            with contextlib.redirect_stdout(stdout):
+                code = await _cmd_domain("https://example.com/path", output="json")
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["target_type"], "domain")
+        self.assertEqual(payload["execution_status"], "failed")
+        self.assertEqual(payload["normalized_target"], "example.com")
+        mock_investigate.assert_not_awaited()
+
+    async def test_typed_ip_rejects_domain(self) -> None:
+        stdout = io.StringIO()
+        with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())) as mock_investigate:
+            with contextlib.redirect_stdout(stdout):
+                code = await _cmd_ip("example.com", output="json")
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["target_type"], "ip")
+        self.assertEqual(payload["execution_status"], "failed")
+        mock_investigate.assert_not_awaited()
+
+    async def test_typed_url_rejects_domain_and_accepts_url_shape(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            domain_code = await _cmd_url("example.com", output="json")
+        domain_payload = json.loads(stdout.getvalue())
+        self.assertEqual(domain_code, 1)
+        self.assertEqual(domain_payload["target_type"], "url")
+        self.assertEqual(domain_payload["execution_status"], "failed")
+        self.assertIn("Expected url target", domain_payload["errors"][0])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            url_code = await _cmd_url("https://example.com/path", output="json")
+        url_payload = json.loads(stdout.getvalue())
+        self.assertEqual(url_code, 1)
+        self.assertEqual(url_payload["target_type"], "url")
+        self.assertIn("not implemented", url_payload["errors"][0])
+
+    async def test_typed_asn_rejects_domain(self) -> None:
+        stdout = io.StringIO()
+        with patch("tripper_recon.cli.investigate_asn", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
+            with contextlib.redirect_stdout(stdout):
+                code = await _cmd_asn("example.com", output="json")
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(payload["target_type"], "asn")
+        self.assertEqual(payload["execution_status"], "failed")
+        mock_investigate.assert_not_awaited()
+
+    async def test_investigate_routes_mixed_indicators_without_typed_rejection(self) -> None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("8.8.8.8\nexample.com\nhttps://example.com/path\nAS15169\n")
+            path = Path(handle.name)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
+                with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = await _cmd_investigate(str(path), output="json")
+        finally:
+            path.unlink(missing_ok=True)
+
+        rows = [json.loads(line) for line in stdout.getvalue().splitlines()]
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual([row["target_type"] for row in rows], ["ip", "domain", "url", "asn"])
 
     async def test_api_domain_uses_schema_v1(self) -> None:
         with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
