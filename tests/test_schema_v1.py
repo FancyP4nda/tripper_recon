@@ -206,17 +206,20 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(REQUIRED_KEYS.issubset(line.keys()))
             self.assertNotIn("ok", line)
 
-    async def test_cli_investigate_json_emits_failed_schema_row_for_unimplemented_target(self) -> None:
+    async def test_cli_investigate_json_emits_passive_url_schema_row(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = await _cmd_investigate("https://example.com/path", output="json")
 
         payload = json.loads(stdout.getvalue())
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 0)
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(payload["target_type"], "url")
-        self.assertEqual(payload["execution_status"], "failed")
+        self.assertEqual(payload["execution_status"], "completed")
+        self.assertEqual(payload["verdict"], "unknown")
+        self.assertEqual(payload["normalized_target"], "https://example.com/path")
+        self.assertEqual(payload["relationships"][0]["target"], "example.com")
         self.assertNotIn("ok", payload)
 
     async def test_typed_domain_rejects_url_without_coercion(self) -> None:
@@ -258,9 +261,37 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         with contextlib.redirect_stdout(stdout):
             url_code = await _cmd_url("https://example.com/path", output="json")
         url_payload = json.loads(stdout.getvalue())
-        self.assertEqual(url_code, 1)
+        self.assertEqual(url_code, 0)
         self.assertEqual(url_payload["target_type"], "url")
-        self.assertIn("not implemented", url_payload["errors"][0])
+        self.assertEqual(url_payload["execution_status"], "completed")
+        self.assertEqual(url_payload["verdict"], "unknown")
+
+    async def test_passive_url_investigation_does_not_contact_network_or_resolver(self) -> None:
+        stdout = io.StringIO()
+        with patch(
+            "tripper_recon.service.investigate_ip",
+            new=AsyncMock(side_effect=AssertionError("IP investigation should not run")),
+        ), patch(
+            "tripper_recon.service.investigate_domain",
+            new=AsyncMock(side_effect=AssertionError("Domain investigation should not run")),
+        ), patch(
+            "tripper_recon.utils.dns.resolve_domain",
+            side_effect=AssertionError("DNS resolution should not run"),
+        ), patch(
+            "tripper_recon.utils.dns.reverse_ptr",
+            side_effect=AssertionError("PTR resolution should not run"),
+        ):
+            with contextlib.redirect_stdout(stdout):
+                code = await _cmd_url("HTTPS://Example.COM/path?q=1#fragment", output="json")
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["normalized_target"], "https://example.com/path?q=1")
+        self.assertEqual(payload["execution_status"], "completed")
+        self.assertEqual(payload["verdict"], "unknown")
+        skipped = {status["provider"]: status for status in payload["provider_status"] if status["status"] == "skipped"}
+        self.assertIn("urlscan_submit", skipped)
+        self.assertIn("direct_http", skipped)
 
     async def test_typed_asn_rejects_domain(self) -> None:
         stdout = io.StringIO()
@@ -293,6 +324,8 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual([row["target_type"] for row in rows], ["ip", "domain", "url", "asn"])
+        self.assertEqual(rows[2]["execution_status"], "completed")
+        self.assertEqual(rows[2]["verdict"], "unknown")
 
     async def test_api_domain_uses_schema_v1(self) -> None:
         with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from tripper_recon.orchestrators import investigate_domain, investigate_ip
 from tripper_recon.provider_registry import ProviderSelectionError, select_providers
@@ -11,8 +11,10 @@ from tripper_recon.schema_v1 import (
     domain_result_to_schema_v1,
     failed_domain_result_v1,
     failed_ip_result_v1,
+    failed_url_result_v1,
     failed_result_v1,
     ip_result_to_schema_v1,
+    url_result_to_schema_v1,
 )
 from tripper_recon.utils.validation import is_valid_asn, is_valid_domain, is_valid_ip
 
@@ -67,6 +69,18 @@ def validate_typed_target(expected_type: str, value: str) -> tuple[bool, str, st
     if expected_type == "domain" and urlparse(value.strip()).scheme:
         return False, normalized, f"Expected domain target but received URL: {value}"
     return True, normalized, None
+
+
+def normalize_url_target(target: str) -> tuple[str, str]:
+    parsed = urlparse(target.strip())
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    path = parsed.path or "/"
+    normalized = urlunparse((scheme, netloc, path, "", parsed.query, ""))
+    return normalized, hostname
 
 
 async def ip_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
@@ -151,6 +165,54 @@ async def domain_schema_result(target: str, options: InvestigationOptions | None
     )
 
 
+async def url_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
+    opts = options or InvestigationOptions()
+    normalized_url, extracted_domain = normalize_url_target(target)
+    try:
+        provider_selection = select_providers(
+            target_type="url",
+            mode=opts.mode,
+            profile=opts.profile,
+            requested_providers=opts.providers,
+        )
+    except ProviderSelectionError as exc:
+        return failed_url_result_v1(
+            target=target,
+            normalized_target=normalized_url,
+            error=str(exc),
+            mode=opts.mode,
+            profile=opts.profile,
+            provider_status=ProviderStatus(provider=exc.provider, status="failed", reason=str(exc)),
+        )
+    except ValueError as exc:
+        return failed_url_result_v1(
+            target=target,
+            normalized_target=normalized_url,
+            error=str(exc),
+            mode=opts.mode,
+            profile=opts.profile,
+        )
+
+    provider_statuses = list(provider_selection.skipped)
+    for provider in provider_selection.executable:
+        provider_statuses.append(
+            ProviderStatus(
+                provider=provider,
+                status="missing_credentials",
+                reason="No passive URL observation data returned by this schema slice.",
+            )
+        )
+
+    return url_result_to_schema_v1(
+        target=target,
+        normalized_target=normalized_url,
+        extracted_domain=extracted_domain,
+        mode=opts.mode,
+        profile=opts.profile,
+        provider_statuses=provider_statuses,
+    )
+
+
 async def schema_result_for_target(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
     opts = options or InvestigationOptions()
     target_type, normalized = classify_target(target)
@@ -158,6 +220,8 @@ async def schema_result_for_target(target: str, options: InvestigationOptions | 
         return await ip_schema_result(normalized, opts)
     if target_type == "domain":
         return await domain_schema_result(normalized, opts)
+    if target_type == "url":
+        return await url_schema_result(normalized, opts)
     return failed_result_v1(
         target_type=target_type,  # type: ignore[arg-type]
         target=target,
