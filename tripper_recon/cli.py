@@ -16,18 +16,16 @@ from tripper_recon.orchestrators import investigate_asn, investigate_domain, inv
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
 from tripper_recon.provider_registry import ProviderSelectionError, select_providers
 from tripper_recon.schema_v1 import (
-    InvestigationResultV1,
     ProviderStatus,
     domain_result_to_schema_v1,
     failed_domain_result_v1,
     failed_ip_result_v1,
-    failed_result_v1,
     ip_result_to_schema_v1,
 )
+from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
-from tripper_recon.utils.validation import is_valid_asn, is_valid_domain, is_valid_ip
 
 log = logger("cli")
 console = Console()
@@ -169,129 +167,6 @@ def _load_targets(value: str) -> tuple[List[str], str | None]:
             continue
         targets.append(line)
     return targets, str(p)
-
-
-def _classify_target(value: str) -> tuple[str, str]:
-    stripped = value.strip()
-    parsed = urlparse(stripped)
-    if is_valid_ip(stripped):
-        return "ip", stripped
-    if parsed.scheme and parsed.netloc:
-        return "url", stripped
-    if is_valid_domain(stripped):
-        return "domain", stripped
-    asn_candidate = stripped[2:] if stripped.lower().startswith("as") else stripped
-    if is_valid_asn(asn_candidate):
-        return "asn", asn_candidate
-    return "domain", stripped
-
-
-async def _ip_schema_result(
-    target: str,
-    *,
-    mode: str = "passive",
-    profile: str = "best_effort",
-    providers: list[str] | None = None,
-) -> InvestigationResultV1:
-    try:
-        provider_selection = select_providers(
-            target_type="ip",
-            mode=mode,
-            profile=profile,
-            requested_providers=providers,
-        )
-    except ProviderSelectionError as exc:
-        return failed_ip_result_v1(
-            target=target,
-            error=str(exc),
-            mode=mode,
-            profile=profile,
-            provider_status=ProviderStatus(provider=exc.provider, status="failed", reason=str(exc)),
-        )
-    except ValueError as exc:
-        return failed_ip_result_v1(target=target, error=str(exc), mode=mode, profile=profile)
-
-    try:
-        res = await investigate_ip(target)
-    except Exception as exc:  # noqa: BLE001
-        from tripper_recon.types.models import InvestigationResult
-        res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
-
-    return ip_result_to_schema_v1(
-        target=target,
-        result=res,
-        mode=mode,
-        profile=profile,
-        provider_names=provider_selection.executable,
-        extra_provider_statuses=provider_selection.skipped,
-    )
-
-
-async def _domain_schema_result(
-    target: str,
-    *,
-    mode: str = "passive",
-    profile: str = "best_effort",
-    providers: list[str] | None = None,
-) -> InvestigationResultV1:
-    parsed = urlparse(target)
-    norm_domain = parsed.hostname or target.strip().strip("/")
-    try:
-        provider_selection = select_providers(
-            target_type="domain",
-            mode=mode,
-            profile=profile,
-            requested_providers=providers,
-        )
-    except ProviderSelectionError as exc:
-        return failed_domain_result_v1(
-            target=target,
-            normalized_target=norm_domain,
-            error=str(exc),
-            mode=mode,
-            profile=profile,
-            provider_status=ProviderStatus(provider=exc.provider, status="failed", reason=str(exc)),
-        )
-    except ValueError as exc:
-        return failed_domain_result_v1(target=target, normalized_target=norm_domain, error=str(exc), mode=mode, profile=profile)
-
-    try:
-        res = await investigate_domain(norm_domain, mode=mode)
-    except Exception as exc:  # noqa: BLE001
-        from tripper_recon.types.models import InvestigationResult
-        res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
-
-    return domain_result_to_schema_v1(
-        target=target,
-        normalized_target=norm_domain,
-        result=res,
-        mode=mode,
-        profile=profile,
-        provider_names=provider_selection.executable,
-        extra_provider_statuses=provider_selection.skipped,
-    )
-
-
-async def _schema_result_for_target(
-    target: str,
-    *,
-    mode: str = "passive",
-    profile: str = "best_effort",
-    providers: list[str] | None = None,
-) -> InvestigationResultV1:
-    target_type, normalized = _classify_target(target)
-    if target_type == "ip":
-        return await _ip_schema_result(normalized, mode=mode, profile=profile, providers=providers)
-    if target_type == "domain":
-        return await _domain_schema_result(normalized, mode=mode, profile=profile, providers=providers)
-    return failed_result_v1(
-        target_type=target_type,  # type: ignore[arg-type]
-        target=target,
-        normalized_target=normalized,
-        mode=mode,
-        profile=profile,
-        error=f"Target type {target_type!r} is not implemented for schema v1 batch output yet.",
-    )
 
 
 
@@ -608,7 +483,10 @@ async def _cmd_investigate(
     if output == "json":
         failed = 0
         for target in targets:
-            result = await _schema_result_for_target(target, mode=mode, profile=profile, providers=providers)
+            result = await schema_result_for_target(
+                target,
+                InvestigationOptions(mode=mode, profile=profile, providers=tuple(providers) if providers else None),
+            )
             if result.execution_status == "failed":
                 failed += 1
             sys.stdout.write(result.model_dump_json() + "\n")
@@ -618,7 +496,7 @@ async def _cmd_investigate(
         console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
     failed = 0
     for target in targets:
-        target_type, _normalized = _classify_target(target)
+        target_type, _normalized = classify_target(target)
         if target_type == "ip":
             failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers) != 0)
         elif target_type == "domain":
