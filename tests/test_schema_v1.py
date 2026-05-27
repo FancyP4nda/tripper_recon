@@ -95,6 +95,76 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["execution_status"], "completed")
         self.assertEqual(payload["mode"], "passive")
         self.assertEqual(payload["profile"], "best_effort")
+        self.assertEqual(payload["evidence"][0]["data"], {})
+
+    def test_raw_evidence_requires_opt_in_and_redacts_sensitive_values(self) -> None:
+        legacy = InvestigationResult(
+            ok=True,
+            data={
+                "ipinfo": {
+                    "url": "https://ipinfo.io/8.8.8.8?token=secret&safe=1",
+                    "token": "secret",
+                    "request_headers": {"Authorization": "Bearer secret"},
+                    "nested": {"api_key": "secret-key"},
+                },
+            },
+            warnings=[],
+            errors=[],
+        )
+
+        default_payload = ip_result_to_schema_v1(target="8.8.8.8", result=legacy).model_dump()
+        self.assertEqual(default_payload["evidence"][0]["data"], {})
+
+        raw_payload = ip_result_to_schema_v1(target="8.8.8.8", result=legacy, include_raw=True).model_dump()
+        raw_data = raw_payload["evidence"][0]["data"]
+        serialized = json.dumps(raw_data)
+        self.assertIn("raw", raw_data)
+        self.assertIn("[REDACTED]", serialized)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("request_headers", serialized)
+        self.assertNotIn("Authorization", serialized)
+
+    def test_raw_evidence_records_truncation_metadata(self) -> None:
+        legacy = InvestigationResult(
+            ok=True,
+            data={"ipinfo": {"blob": "x" * 5000}},
+            warnings=[],
+            errors=[],
+        )
+
+        payload = ip_result_to_schema_v1(target="8.8.8.8", result=legacy, include_raw=True).model_dump()
+        raw_data = payload["evidence"][0]["data"]
+
+        self.assertTrue(raw_data["raw_truncated"])
+        self.assertGreater(raw_data["raw_original_size_bytes"], raw_data["raw_max_size_bytes"])
+        self.assertLessEqual(raw_data["raw_emitted_size_bytes"], raw_data["raw_max_size_bytes"])
+
+    def test_provider_error_reasons_are_sanitized(self) -> None:
+        legacy = InvestigationResult(
+            ok=True,
+            data={
+                "errors": {
+                    "ipinfo": {
+                        "url": "https://ipinfo.io/8.8.8.8?apikey=secret",
+                        "headers": {"X-Api-Key": "secret"},
+                        "message": "forbidden",
+                    }
+                }
+            },
+            warnings=["https://example.test/path?key=secret"],
+            errors=["https://example.test/path?token=secret"],
+        )
+
+        payload = ip_result_to_schema_v1(
+            target="8.8.8.8",
+            result=legacy,
+            provider_names=["ipinfo"],
+        ).model_dump()
+        serialized = json.dumps(payload)
+
+        self.assertIn("[REDACTED]", serialized)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("headers", serialized)
 
     def test_provider_registry_skips_default_disallowed_provider(self) -> None:
         selection = select_providers(target_type="ip", mode=Mode.PASSIVE)

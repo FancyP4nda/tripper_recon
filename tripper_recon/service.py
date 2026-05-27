@@ -116,6 +116,7 @@ async def ip_schema_result(target: str, options: InvestigationOptions | None = N
         profile=opts.profile,
         provider_names=provider_selection.executable,
         extra_provider_statuses=provider_selection.skipped,
+        include_raw=opts.include_raw,
     )
 
 
@@ -162,6 +163,7 @@ async def domain_schema_result(target: str, options: InvestigationOptions | None
         profile=opts.profile,
         provider_names=provider_selection.executable,
         extra_provider_statuses=provider_selection.skipped,
+        include_raw=opts.include_raw,
     )
 
 
