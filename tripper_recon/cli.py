@@ -16,18 +16,32 @@ from tripper_recon.orchestrators import investigate_asn, investigate_domain, inv
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
 from tripper_recon.provider_registry import ProviderSelectionError, select_providers
 from tripper_recon.schema_v1 import (
+    InvestigationResultV1,
     ProviderStatus,
     domain_result_to_schema_v1,
     failed_domain_result_v1,
     failed_ip_result_v1,
+    failed_result_v1,
     ip_result_to_schema_v1,
 )
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
+from tripper_recon.utils.validation import is_valid_asn, is_valid_domain, is_valid_ip
 
 log = logger("cli")
 console = Console()
+
+
+def _add_machine_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
+    parser.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
+    parser.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
+    parser.add_argument("--include-raw", action="store_true", help="Accept raw evidence flag for schema v1 paths; raw payload emission is implemented in a later slice")
+    parser.add_argument("--require-profile-complete", action="store_true", help="Accept profile completeness flag for schema v1 paths; enforcement is implemented in a later slice")
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument("--cache", action="store_true", dest="cache", default=True, help="Enable cache reads for schema v1 paths when cache support is available")
+    cache_group.add_argument("--no-cache", action="store_false", dest="cache", help="Disable cache reads for schema v1 paths when cache support is available")
 
 
 def _fmt_provider_error(detail: Any) -> str:
@@ -143,6 +157,141 @@ def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
     return list(dict.fromkeys(targets)), str(p)
 
 
+def _load_targets(value: str) -> tuple[List[str], str | None]:
+    p = Path(value).expanduser()
+    if not p.is_file():
+        return [value], None
+
+    targets: List[str] = []
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        targets.append(line)
+    return targets, str(p)
+
+
+def _classify_target(value: str) -> tuple[str, str]:
+    stripped = value.strip()
+    parsed = urlparse(stripped)
+    if is_valid_ip(stripped):
+        return "ip", stripped
+    if parsed.scheme and parsed.netloc:
+        return "url", stripped
+    if is_valid_domain(stripped):
+        return "domain", stripped
+    asn_candidate = stripped[2:] if stripped.lower().startswith("as") else stripped
+    if is_valid_asn(asn_candidate):
+        return "asn", asn_candidate
+    return "domain", stripped
+
+
+async def _ip_schema_result(
+    target: str,
+    *,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: list[str] | None = None,
+) -> InvestigationResultV1:
+    try:
+        provider_selection = select_providers(
+            target_type="ip",
+            mode=mode,
+            profile=profile,
+            requested_providers=providers,
+        )
+    except ProviderSelectionError as exc:
+        return failed_ip_result_v1(
+            target=target,
+            error=str(exc),
+            mode=mode,
+            profile=profile,
+            provider_status=ProviderStatus(provider=exc.provider, status="failed", reason=str(exc)),
+        )
+    except ValueError as exc:
+        return failed_ip_result_v1(target=target, error=str(exc), mode=mode, profile=profile)
+
+    try:
+        res = await investigate_ip(target)
+    except Exception as exc:  # noqa: BLE001
+        from tripper_recon.types.models import InvestigationResult
+        res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
+
+    return ip_result_to_schema_v1(
+        target=target,
+        result=res,
+        mode=mode,
+        profile=profile,
+        provider_names=provider_selection.executable,
+        extra_provider_statuses=provider_selection.skipped,
+    )
+
+
+async def _domain_schema_result(
+    target: str,
+    *,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: list[str] | None = None,
+) -> InvestigationResultV1:
+    parsed = urlparse(target)
+    norm_domain = parsed.hostname or target.strip().strip("/")
+    try:
+        provider_selection = select_providers(
+            target_type="domain",
+            mode=mode,
+            profile=profile,
+            requested_providers=providers,
+        )
+    except ProviderSelectionError as exc:
+        return failed_domain_result_v1(
+            target=target,
+            normalized_target=norm_domain,
+            error=str(exc),
+            mode=mode,
+            profile=profile,
+            provider_status=ProviderStatus(provider=exc.provider, status="failed", reason=str(exc)),
+        )
+    except ValueError as exc:
+        return failed_domain_result_v1(target=target, normalized_target=norm_domain, error=str(exc), mode=mode, profile=profile)
+
+    try:
+        res = await investigate_domain(norm_domain, mode=mode)
+    except Exception as exc:  # noqa: BLE001
+        from tripper_recon.types.models import InvestigationResult
+        res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
+
+    return domain_result_to_schema_v1(
+        target=target,
+        normalized_target=norm_domain,
+        result=res,
+        mode=mode,
+        profile=profile,
+        provider_names=provider_selection.executable,
+        extra_provider_statuses=provider_selection.skipped,
+    )
+
+
+async def _schema_result_for_target(
+    target: str,
+    *,
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: list[str] | None = None,
+) -> InvestigationResultV1:
+    target_type, normalized = _classify_target(target)
+    if target_type == "ip":
+        return await _ip_schema_result(normalized, mode=mode, profile=profile, providers=providers)
+    if target_type == "domain":
+        return await _domain_schema_result(normalized, mode=mode, profile=profile, providers=providers)
+    return failed_result_v1(
+        target_type=target_type,  # type: ignore[arg-type]
+        target=target,
+        normalized_target=normalized,
+        mode=mode,
+        profile=profile,
+        error=f"Target type {target_type!r} is not implemented for schema v1 batch output yet.",
+    )
 
 
 
@@ -443,6 +592,45 @@ async def _cmd_domain(
     return 0
 
 
+async def _cmd_investigate(
+    target_or_file: str,
+    *,
+    output: str = "console",
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: list[str] | None = None,
+) -> int:
+    targets, source_file = _load_targets(target_or_file)
+    if not targets:
+        log["error"]("Investigation target list is empty", file=source_file)
+        return 1
+
+    if output == "json":
+        failed = 0
+        for target in targets:
+            result = await _schema_result_for_target(target, mode=mode, profile=profile, providers=providers)
+            if result.execution_status == "failed":
+                failed += 1
+            sys.stdout.write(result.model_dump_json() + "\n")
+        return 0 if failed == 0 else 1
+
+    if source_file:
+        console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
+    failed = 0
+    for target in targets:
+        target_type, _normalized = _classify_target(target)
+        if target_type == "ip":
+            failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers) != 0)
+        elif target_type == "domain":
+            failed += int(await _cmd_domain(target, output=output, mode=mode, profile=profile, providers=providers) != 0)
+        else:
+            failed += 1
+            console.print(f"[bold red]Unsupported target for console investigate:[/] {target}")
+    color = "green" if failed == 0 else "yellow"
+    console.print(f"[{color}]Summary:[/] total={len(targets)} failed={failed}")
+    return 0 if failed == 0 else 1
+
+
 def _default_output_dir() -> Path:
     here = Path(__file__).resolve()
     root = here.parent.parent
@@ -537,20 +725,21 @@ def main() -> None:
     p_ip.add_argument("ip", type=str)
     p_ip.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_ip.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a single IP target")
-    p_ip.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
-    p_ip.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
-    p_ip.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
+    _add_machine_options(p_ip)
     p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
     p_domain.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
     p_domain.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a domain target")
-    p_domain.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
-    p_domain.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
-    p_domain.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
+    _add_machine_options(p_domain)
     p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
 
+    p_investigate = sub.add_parser("investigate", help="Investigate a target or file of mixed indicators")
+    p_investigate.add_argument("target_or_file", type=str)
+    p_investigate.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_investigate.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSONL")
+    _add_machine_options(p_investigate)
 
     p_asn = sub.add_parser("asn", help="Lookup ASN details")
     p_asn.add_argument("asn", type=str)
@@ -587,6 +776,14 @@ def main() -> None:
                 args.domain,
                 output=args.format,
                 ports_limit=getattr(args, "ports_limit", "25"),
+                mode=getattr(args, "mode", "passive"),
+                profile=getattr(args, "profile", "best_effort"),
+                providers=getattr(args, "providers", None),
+            ))
+        case "investigate":
+            code = asyncio.run(_cmd_investigate(
+                args.target_or_file,
+                output=args.format,
                 mode=getattr(args, "mode", "passive"),
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),

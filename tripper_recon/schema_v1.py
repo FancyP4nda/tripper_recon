@@ -357,3 +357,23 @@ def failed_domain_result_v1(
         provider_status=[provider_status] if provider_status else [],
         errors=[error],
     )
+
+
+def failed_result_v1(
+    *,
+    target_type: TargetType,
+    target: str,
+    normalized_target: str,
+    error: str,
+    mode: str = "passive",
+    profile: str = "best_effort",
+) -> InvestigationResultV1:
+    return InvestigationResultV1(
+        target_type=target_type,
+        input=target,
+        normalized_target=normalized_target,
+        mode=mode,
+        profile=profile,
+        execution_status="failed",
+        errors=[error],
+    )
