@@ -56,6 +56,7 @@ PROVIDER_REGISTRY: dict[str, ProviderEntry] = {
 
 PROFILE_PROVIDERS: dict[tuple[str, TargetType], tuple[str, ...]] = {
     ("best_effort", "ip"): ("ipinfo", "virustotal", "shodan", "abuseipdb", "otx", "local_dns"),
+    ("best_effort", "domain"): ("virustotal", "otx", "local_dns"),
 }
 
 
@@ -104,4 +105,3 @@ def select_providers(
         executable.append(provider_name)
 
     return ProviderSelection(executable=tuple(executable), skipped=tuple(skipped))
-

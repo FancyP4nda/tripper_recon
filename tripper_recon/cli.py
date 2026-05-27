@@ -15,7 +15,13 @@ from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
 from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
 from tripper_recon.provider_registry import ProviderSelectionError, select_providers
-from tripper_recon.schema_v1 import ProviderStatus, failed_ip_result_v1, ip_result_to_schema_v1
+from tripper_recon.schema_v1 import (
+    ProviderStatus,
+    domain_result_to_schema_v1,
+    failed_domain_result_v1,
+    failed_ip_result_v1,
+    ip_result_to_schema_v1,
+)
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -272,19 +278,89 @@ async def _cmd_ip(
     return 0 if failed == 0 else 1
 
 
-async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str = "25") -> int:
+async def _cmd_domain(
+    domain: str,
+    *,
+    output: str = "console",
+    ports_limit: str = "25",
+    mode: str = "passive",
+    profile: str = "best_effort",
+    providers: list[str] | None = None,
+) -> int:
     parsed = urlparse(domain)
     norm_domain = parsed.hostname or domain.strip().strip("/")
 
-    res = await investigate_domain(norm_domain)
+    try:
+        provider_selection = select_providers(
+            target_type="domain",
+            mode=mode,
+            profile=profile,
+            requested_providers=providers,
+        )
+    except ProviderSelectionError as exc:
+        if output == "json":
+            status = ProviderStatus(provider=exc.provider, status="failed", reason=str(exc))
+            sys.stdout.write(
+                failed_domain_result_v1(
+                    target=domain,
+                    normalized_target=norm_domain,
+                    error=str(exc),
+                    mode=mode,
+                    profile=profile,
+                    provider_status=status,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        else:
+            log["error"]("Provider selection failed", error=str(exc))
+        return 1
+    except ValueError as exc:
+        if output == "json":
+            sys.stdout.write(
+                failed_domain_result_v1(
+                    target=domain,
+                    normalized_target=norm_domain,
+                    error=str(exc),
+                    mode=mode,
+                    profile=profile,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        else:
+            log["error"]("Provider selection failed", error=str(exc))
+        return 1
+
+    res = await investigate_domain(norm_domain, mode=mode)
     if not res.ok:
         log["error"]("Domain investigation failed", domain=domain, errors=res.errors)
-        if output == "console":
+        if output == "json":
+            sys.stdout.write(
+                domain_result_to_schema_v1(
+                    target=domain,
+                    normalized_target=norm_domain,
+                    result=res,
+                    mode=mode,
+                    profile=profile,
+                    provider_names=provider_selection.executable,
+                    extra_provider_statuses=provider_selection.skipped,
+                ).model_dump_json(indent=2)
+                + "\n"
+            )
+        elif output == "console":
             console.print(f"[bold red]Domain investigation failed:[/] {'; '.join(res.errors)}")
         return 1
 
     if output == "json":
-        console.print_json(data=res.model_dump())
+        schema_result = domain_result_to_schema_v1(
+            target=domain,
+            normalized_target=norm_domain,
+            result=res,
+            mode=mode,
+            profile=profile,
+            provider_names=provider_selection.executable,
+            extra_provider_statuses=provider_selection.skipped,
+        )
+        sys.stdout.write(schema_result.model_dump_json(indent=2) + "\n")
         return 0
 
     data = res.data
@@ -351,7 +427,8 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             console.print(f"  - [bold]{name}[/]: {_fmt_provider_error(detail)}")
         console.print()
 
-    console.print(f'\n[bold]- Resolving "{norm_domain}"... {len(ips)} IP addresses found:[/]\n\n')
+    source_label = "Resolving" if mode == "resolver-passive" else "Passive IP relationships for"
+    console.print(f'\n[bold]- {source_label} "{norm_domain}"... {len(ips)} IP addresses found:[/]\n\n')
 
     if not ips:
         console.print("No IPs available for IP-level enrichment.\n")
@@ -468,6 +545,10 @@ def main() -> None:
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
     p_domain.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_domain.add_argument("--json", action="store_const", const="json", dest="format", help="Emit schema v1 JSON for a domain target")
+    p_domain.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
+    p_domain.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
+    p_domain.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
     p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
 
 
@@ -502,7 +583,14 @@ def main() -> None:
                 providers=getattr(args, "providers", None),
             ))
         case "domain":
-            code = asyncio.run(_cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
+            code = asyncio.run(_cmd_domain(
+                args.domain,
+                output=args.format,
+                ports_limit=getattr(args, "ports_limit", "25"),
+                mode=getattr(args, "mode", "passive"),
+                profile=getattr(args, "profile", "best_effort"),
+                providers=getattr(args, "providers", None),
+            ))
         case "asn":
             asn_str = str(args.asn).strip()
             if asn_str.lower().startswith("as"):
