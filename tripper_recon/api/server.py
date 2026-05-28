@@ -30,7 +30,7 @@ async def api_ip(
     require_profile_complete: bool = False,
     cache: bool = True,
 ) -> Dict[str, Any]:
-    if profile != "best_effort":
+    if profile not in {"best_effort", "ciso_daily"}:
         raise HTTPException(status_code=400, detail=["Unsupported profile for schema v1 IP path"])
     result = await ip_schema_result(
         ip,
@@ -56,7 +56,7 @@ async def api_domain(
     require_profile_complete: bool = False,
     cache: bool = True,
 ) -> Dict[str, Any]:
-    if profile != "best_effort":
+    if profile not in {"best_effort", "ciso_daily"}:
         raise HTTPException(status_code=400, detail=["Unsupported profile for schema v1 domain path"])
     result = await domain_schema_result(
         domain,

@@ -23,7 +23,7 @@ from tripper_recon.schema_v1 import (
     failed_url_result_v1,
     ip_result_to_schema_v1,
 )
-from tripper_recon.service import InvestigationOptions, classify_target, schema_result_for_target, url_schema_result, validate_typed_target
+from tripper_recon.service import InvestigationOptions, classify_target, domain_schema_result, ip_schema_result, schema_result_for_target, url_schema_result, validate_typed_target
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.env import load_env
@@ -34,10 +34,10 @@ console = Console()
 
 def _add_machine_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["passive", "resolver-passive"], default="passive", help="Investigation mode for schema v1 output")
-    parser.add_argument("--profile", choices=["best_effort"], default="best_effort", help="Provider profile for schema v1 output")
+    parser.add_argument("--profile", choices=["best_effort", "ciso_daily"], default="best_effort", help="Provider profile for schema v1 output")
     parser.add_argument("--provider", action="append", dest="providers", help="Request a specific provider by registry name")
-    parser.add_argument("--include-raw", action="store_true", help="Accept raw evidence flag for schema v1 paths; raw payload emission is implemented in a later slice")
-    parser.add_argument("--require-profile-complete", action="store_true", help="Accept profile completeness flag for schema v1 paths; enforcement is implemented in a later slice")
+    parser.add_argument("--include-raw", action="store_true", help="Emit sanitized raw evidence for schema v1 paths")
+    parser.add_argument("--require-profile-complete", action="store_true", help="Fail report-grade profiles when minimum evidence coverage is unavailable")
     cache_group = parser.add_mutually_exclusive_group()
     cache_group.add_argument("--cache", action="store_true", dest="cache", default=True, help="Enable cache reads for schema v1 paths when cache support is available")
     cache_group.add_argument("--no-cache", action="store_false", dest="cache", help="Disable cache reads for schema v1 paths when cache support is available")
@@ -180,6 +180,8 @@ async def _cmd_ip(
     profile: str = "best_effort",
     providers: list[str] | None = None,
     include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
@@ -200,6 +202,21 @@ async def _cmd_ip(
                 if output == "console":
                     console.print(f"[bold red]Invalid IP target:[/] {target}")
         return 1
+
+    if output == "json" and len(targets) == 1:
+        result = await ip_schema_result(
+            targets[0],
+            InvestigationOptions(
+                mode=mode,
+                profile=profile,
+                providers=tuple(providers) if providers else None,
+                include_raw=include_raw,
+                require_profile_complete=require_profile_complete,
+                cache=cache,
+            ),
+        )
+        sys.stdout.write(result.model_dump_json(indent=2) + "\n")
+        return 1 if result.execution_status == "failed" else 0
 
     if output == "console" and source_file:
         console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
@@ -330,6 +347,8 @@ async def _cmd_domain(
     profile: str = "best_effort",
     providers: list[str] | None = None,
     include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> int:
     valid, norm_domain, validation_error = validate_typed_target("domain", domain)
     if not valid:
@@ -348,6 +367,21 @@ async def _cmd_domain(
             log["error"]("Invalid domain target", target=domain, error=validation_error)
             console.print(f"[bold red]Invalid domain target:[/] {domain}")
         return 1
+
+    if output == "json":
+        result = await domain_schema_result(
+            norm_domain,
+            InvestigationOptions(
+                mode=mode,
+                profile=profile,
+                providers=tuple(providers) if providers else None,
+                include_raw=include_raw,
+                require_profile_complete=require_profile_complete,
+                cache=cache,
+            ),
+        )
+        sys.stdout.write(result.model_dump_json(indent=2) + "\n")
+        return 1 if result.execution_status == "failed" else 0
 
     try:
         provider_selection = select_providers(
@@ -512,6 +546,8 @@ async def _cmd_investigate(
     profile: str = "best_effort",
     providers: list[str] | None = None,
     include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> int:
     targets, source_file = _load_targets(target_or_file)
     if not targets:
@@ -528,6 +564,8 @@ async def _cmd_investigate(
                     profile=profile,
                     providers=tuple(providers) if providers else None,
                     include_raw=include_raw,
+                    require_profile_complete=require_profile_complete,
+                    cache=cache,
                 ),
             )
             if result.execution_status == "failed":
@@ -541,9 +579,9 @@ async def _cmd_investigate(
     for target in targets:
         target_type, _normalized = classify_target(target)
         if target_type == "ip":
-            failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw) != 0)
+            failed += int(await _cmd_ip(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw, require_profile_complete=require_profile_complete, cache=cache) != 0)
         elif target_type == "domain":
-            failed += int(await _cmd_domain(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw) != 0)
+            failed += int(await _cmd_domain(target, output=output, mode=mode, profile=profile, providers=providers, include_raw=include_raw, require_profile_complete=require_profile_complete, cache=cache) != 0)
         else:
             failed += 1
             console.print(f"[bold red]Unsupported target for console investigate:[/] {target}")
@@ -560,6 +598,8 @@ async def _cmd_url(
     profile: str = "best_effort",
     providers: list[str] | None = None,
     include_raw: bool = False,
+    require_profile_complete: bool = False,
+    cache: bool = True,
 ) -> int:
     valid, normalized_url, validation_error = validate_typed_target("url", url)
     if not valid:
@@ -578,6 +618,8 @@ async def _cmd_url(
                 profile=profile,
                 providers=tuple(providers) if providers else None,
                 include_raw=include_raw,
+                require_profile_complete=require_profile_complete,
+                cache=cache,
             ),
         )
     if output == "json":
@@ -751,6 +793,8 @@ def main() -> None:
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
                 include_raw=getattr(args, "include_raw", False),
+                require_profile_complete=getattr(args, "require_profile_complete", False),
+                cache=getattr(args, "cache", True),
             ))
         case "domain":
             code = asyncio.run(_cmd_domain(
@@ -761,6 +805,8 @@ def main() -> None:
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
                 include_raw=getattr(args, "include_raw", False),
+                require_profile_complete=getattr(args, "require_profile_complete", False),
+                cache=getattr(args, "cache", True),
             ))
         case "url":
             code = asyncio.run(_cmd_url(
@@ -770,6 +816,8 @@ def main() -> None:
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
                 include_raw=getattr(args, "include_raw", False),
+                require_profile_complete=getattr(args, "require_profile_complete", False),
+                cache=getattr(args, "cache", True),
             ))
         case "investigate":
             code = asyncio.run(_cmd_investigate(
@@ -779,6 +827,8 @@ def main() -> None:
                 profile=getattr(args, "profile", "best_effort"),
                 providers=getattr(args, "providers", None),
                 include_raw=getattr(args, "include_raw", False),
+                require_profile_complete=getattr(args, "require_profile_complete", False),
+                cache=getattr(args, "cache", True),
             ))
         case "asn":
             asn_str = str(args.asn).strip()

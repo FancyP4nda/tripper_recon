@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 from tripper_recon.orchestrators import investigate_domain, investigate_ip
 from tripper_recon.provider_registry import ProviderSelectionError, select_providers
+from tripper_recon.cache import ProviderCache, CachedObservation
+from tripper_recon.profile_policy import apply_profile_completeness
 from tripper_recon.schema_v1 import (
     InvestigationResultV1,
     ProviderStatus,
@@ -16,6 +19,7 @@ from tripper_recon.schema_v1 import (
     ip_result_to_schema_v1,
     url_result_to_schema_v1,
 )
+from tripper_recon.types.models import InvestigationResult
 from tripper_recon.utils.validation import is_valid_asn, is_valid_domain, is_valid_ip
 
 
@@ -83,6 +87,75 @@ def normalize_url_target(target: str) -> tuple[str, str]:
     return normalized, hostname
 
 
+def _ip_payloads(result: InvestigationResult) -> dict[str, dict[str, Any]]:
+    data = result.data or {}
+    payloads: dict[str, dict[str, Any]] = {}
+    for provider in ("ipinfo", "virustotal", "shodan", "abuseipdb", "otx", "cloudflare_asn"):
+        source_key = "asn_meta" if provider == "cloudflare_asn" else provider
+        payload = data.get(source_key)
+        if isinstance(payload, dict) and payload:
+            payloads[provider] = payload
+    return payloads
+
+
+def _domain_payloads(result: InvestigationResult) -> dict[str, dict[str, Any]]:
+    data = result.data or {}
+    domain_intel = data.get("domain_intel") if isinstance(data.get("domain_intel"), dict) else {}
+    return {provider: payload for provider, payload in domain_intel.items() if isinstance(payload, dict) and payload}
+
+
+def _domain_ips_from_payloads(payloads: dict[str, CachedObservation]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    vt = payloads.get("virustotal")
+    if not vt:
+        return out
+    for record in vt.payload.get("vt_dns_records") or []:
+        if not isinstance(record, dict) or record.get("type") not in {"A", "AAAA"}:
+            continue
+        value = record.get("value")
+        if not value or str(value) in seen:
+            continue
+        seen.add(str(value))
+        out.append(
+            {
+                "ip": str(value),
+                "relationship_source": "provider_observation",
+                "also_seen_in_provider_observations": True,
+            }
+        )
+    return out
+
+
+def _result_from_cached_ip(payloads: dict[str, CachedObservation]) -> InvestigationResult:
+    data: dict[str, Any] = {
+        "ipinfo": payloads.get("ipinfo").payload if payloads.get("ipinfo") else {},
+        "virustotal": payloads.get("virustotal").payload if payloads.get("virustotal") else {},
+        "shodan": payloads.get("shodan").payload if payloads.get("shodan") else {},
+        "abuseipdb": payloads.get("abuseipdb").payload if payloads.get("abuseipdb") else {},
+        "otx": payloads.get("otx").payload if payloads.get("otx") else {},
+        "asn_meta": payloads.get("cloudflare_asn").payload if payloads.get("cloudflare_asn") else {},
+    }
+    return InvestigationResult(ok=True, errors=[], warnings=[], data=data)
+
+
+def _result_from_cached_domain(normalized_target: str, payloads: dict[str, CachedObservation]) -> InvestigationResult:
+    return InvestigationResult(
+        ok=True,
+        errors=[],
+        warnings=[],
+        data={
+            "domain": normalized_target,
+            "domain_intel": {provider: item.payload for provider, item in payloads.items()},
+            "ips": _domain_ips_from_payloads(payloads),
+        },
+    )
+
+
+def _cache_enabled_cache() -> ProviderCache:
+    return ProviderCache()
+
+
 async def ip_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
     opts = options or InvestigationOptions()
     try:
@@ -103,13 +176,35 @@ async def ip_schema_result(target: str, options: InvestigationOptions | None = N
     except ValueError as exc:
         return failed_ip_result_v1(target=target, error=str(exc), mode=opts.mode, profile=opts.profile)
 
+    cache_infos = []
+    if opts.cache:
+        cache = _cache_enabled_cache()
+        cached_payloads, cache_infos = cache.get_many(
+            normalized_target=target,
+            target_type="ip",
+            mode=opts.mode,
+            providers=provider_selection.executable,
+        )
+        if provider_selection.executable and len(cached_payloads) == len(provider_selection.executable):
+            res = _result_from_cached_ip(cached_payloads)
+            schema = ip_result_to_schema_v1(
+                target=target,
+                result=res,
+                mode=opts.mode,
+                profile=opts.profile,
+                provider_names=provider_selection.executable,
+                extra_provider_statuses=provider_selection.skipped,
+                include_raw=opts.include_raw,
+            )
+            schema.cache = cache_infos
+            return apply_profile_completeness(schema, require_profile_complete=opts.require_profile_complete)
+
     try:
         res = await investigate_ip(target)
     except Exception as exc:  # noqa: BLE001
-        from tripper_recon.types.models import InvestigationResult
         res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
 
-    return ip_result_to_schema_v1(
+    schema = ip_result_to_schema_v1(
         target=target,
         result=res,
         mode=opts.mode,
@@ -118,6 +213,22 @@ async def ip_schema_result(target: str, options: InvestigationOptions | None = N
         extra_provider_statuses=provider_selection.skipped,
         include_raw=opts.include_raw,
     )
+    if opts.cache and res.ok:
+        cache = _cache_enabled_cache()
+        stored = {
+            provider: cache.set(
+                normalized_target=target,
+                target_type="ip",
+                mode=opts.mode,
+                provider=provider,
+                payload=payload,
+            )
+            for provider, payload in _ip_payloads(res).items()
+        }
+        schema.cache = [stored.get(info.provider, info) for info in cache_infos if info.provider]
+    elif opts.cache:
+        schema.cache = cache_infos
+    return apply_profile_completeness(schema, require_profile_complete=opts.require_profile_complete)
 
 
 async def domain_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
@@ -149,13 +260,36 @@ async def domain_schema_result(target: str, options: InvestigationOptions | None
             profile=opts.profile,
         )
 
+    cache_infos = []
+    if opts.cache:
+        cache = _cache_enabled_cache()
+        cached_payloads, cache_infos = cache.get_many(
+            normalized_target=norm_domain,
+            target_type="domain",
+            mode=opts.mode,
+            providers=provider_selection.executable,
+        )
+        if provider_selection.executable and len(cached_payloads) == len(provider_selection.executable):
+            res = _result_from_cached_domain(norm_domain, cached_payloads)
+            schema = domain_result_to_schema_v1(
+                target=target,
+                normalized_target=norm_domain,
+                result=res,
+                mode=opts.mode,
+                profile=opts.profile,
+                provider_names=provider_selection.executable,
+                extra_provider_statuses=provider_selection.skipped,
+                include_raw=opts.include_raw,
+            )
+            schema.cache = cache_infos
+            return apply_profile_completeness(schema, require_profile_complete=opts.require_profile_complete)
+
     try:
         res = await investigate_domain(norm_domain, mode=opts.mode)
     except Exception as exc:  # noqa: BLE001
-        from tripper_recon.types.models import InvestigationResult
         res = InvestigationResult(ok=False, errors=[f"{type(exc).__name__}: {exc}"], data={})
 
-    return domain_result_to_schema_v1(
+    schema = domain_result_to_schema_v1(
         target=target,
         normalized_target=norm_domain,
         result=res,
@@ -165,6 +299,22 @@ async def domain_schema_result(target: str, options: InvestigationOptions | None
         extra_provider_statuses=provider_selection.skipped,
         include_raw=opts.include_raw,
     )
+    if opts.cache and res.ok:
+        cache = _cache_enabled_cache()
+        stored = {
+            provider: cache.set(
+                normalized_target=norm_domain,
+                target_type="domain",
+                mode=opts.mode,
+                provider=provider,
+                payload=payload,
+            )
+            for provider, payload in _domain_payloads(res).items()
+        }
+        schema.cache = [stored.get(info.provider, info) for info in cache_infos if info.provider]
+    elif opts.cache:
+        schema.cache = cache_infos
+    return apply_profile_completeness(schema, require_profile_complete=opts.require_profile_complete)
 
 
 async def url_schema_result(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
@@ -205,7 +355,7 @@ async def url_schema_result(target: str, options: InvestigationOptions | None = 
             )
         )
 
-    return url_result_to_schema_v1(
+    result = url_result_to_schema_v1(
         target=target,
         normalized_target=normalized_url,
         extracted_domain=extracted_domain,
@@ -213,6 +363,7 @@ async def url_schema_result(target: str, options: InvestigationOptions | None = 
         profile=opts.profile,
         provider_statuses=provider_statuses,
     )
+    return apply_profile_completeness(result, require_profile_complete=opts.require_profile_complete)
 
 
 async def schema_result_for_target(target: str, options: InvestigationOptions | None = None) -> InvestigationResultV1:
@@ -224,7 +375,7 @@ async def schema_result_for_target(target: str, options: InvestigationOptions | 
         return await domain_schema_result(normalized, opts)
     if target_type == "url":
         return await url_schema_result(normalized, opts)
-    return failed_result_v1(
+    result = failed_result_v1(
         target_type=target_type,  # type: ignore[arg-type]
         target=target,
         normalized_target=normalized,
@@ -232,3 +383,4 @@ async def schema_result_for_target(target: str, options: InvestigationOptions | 
         profile=opts.profile,
         error=f"Target type {target_type!r} is not implemented for schema v1 output yet.",
     )
+    return apply_profile_completeness(result, require_profile_complete=opts.require_profile_complete)

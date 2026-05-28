@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -15,9 +16,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
 
 from tripper_recon.api.server import api_domain, api_ip
 from tripper_recon.cli import _cmd_asn, _cmd_domain, _cmd_investigate, _cmd_ip, _cmd_url
+from tripper_recon.cache import ProviderCache, utc_now
 from tripper_recon.orchestrators import investigate_domain
 from tripper_recon.provider_registry import Capability, Mode, ProviderSelectionError, select_providers
 from tripper_recon.schema_v1 import InvestigationResultV1, ip_result_to_schema_v1
+from tripper_recon.service import InvestigationOptions, domain_schema_result, ip_schema_result
 from tripper_recon.types.models import ApiKeys, InvestigationResult
 
 
@@ -85,6 +88,18 @@ class FakeAsyncClient:
 
 
 class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._cache_dir = tempfile.TemporaryDirectory()
+        self._previous_cache_db = os.environ.get("TRIPPER_RECON_CACHE_DB")
+        os.environ["TRIPPER_RECON_CACHE_DB"] = str(Path(self._cache_dir.name) / "cache.sqlite3")
+
+    def tearDown(self) -> None:
+        if self._previous_cache_db is None:
+            os.environ.pop("TRIPPER_RECON_CACHE_DB", None)
+        else:
+            os.environ["TRIPPER_RECON_CACHE_DB"] = self._previous_cache_db
+        self._cache_dir.cleanup()
+
     def test_ip_adapter_returns_required_schema_without_top_level_ok(self) -> None:
         result = ip_result_to_schema_v1(target="8.8.8.8", result=legacy_ip_result())
         payload = result.model_dump()
@@ -138,6 +153,69 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raw_data["raw_truncated"])
         self.assertGreater(raw_data["raw_original_size_bytes"], raw_data["raw_max_size_bytes"])
         self.assertLessEqual(raw_data["raw_emitted_size_bytes"], raw_data["raw_max_size_bytes"])
+
+    def test_sqlite_cache_hit_miss_ttl_schema_version_and_sanitization(self) -> None:
+        cache = ProviderCache(Path(os.environ["TRIPPER_RECON_CACHE_DB"]))
+        now = utc_now()
+
+        self.assertIsNone(
+            cache.get(
+                normalized_target="8.8.8.8",
+                target_type="ip",
+                mode="passive",
+                provider="ipinfo",
+                now=now,
+            )
+        )
+
+        cache.set(
+            normalized_target="8.8.8.8",
+            target_type="ip",
+            mode="passive",
+            provider="ipinfo",
+            payload={"token": "secret", "observed_at": "2026-05-28T00:00:00Z", "asn": 15169},
+            retrieved_at=now,
+        )
+        hit = cache.get(
+            normalized_target="8.8.8.8",
+            target_type="ip",
+            mode="passive",
+            provider="ipinfo",
+            now=now,
+        )
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit.payload["token"], "[REDACTED]")
+        self.assertEqual(hit.observed_at, "2026-05-28T00:00:00Z")
+        self.assertIsNone(
+            cache.get(
+                normalized_target="8.8.8.8",
+                target_type="ip",
+                mode="passive",
+                provider="ipinfo",
+                schema_version="2.0",
+                now=now,
+            )
+        )
+
+        old_retrieved = now.replace(year=2020)
+        cache.set(
+            normalized_target="8.8.4.4",
+            target_type="ip",
+            mode="passive",
+            provider="virustotal",
+            payload={"vt_reputation": 0},
+            retrieved_at=old_retrieved,
+        )
+        self.assertIsNone(
+            cache.get(
+                normalized_target="8.8.4.4",
+                target_type="ip",
+                mode="passive",
+                provider="virustotal",
+                now=now,
+            )
+        )
 
     def test_provider_error_reasons_are_sanitized(self) -> None:
         legacy = InvestigationResult(
@@ -245,7 +323,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cli_single_ip_json_uses_schema_v1(self) -> None:
         stdout = io.StringIO()
-        with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())):
             with contextlib.redirect_stdout(stdout):
                 code = await _cmd_ip("8.8.8.8", output="json")
 
@@ -260,7 +338,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_explicit_disallowed_provider_fails_before_investigation(self) -> None:
         stdout = io.StringIO()
         mock_investigate = AsyncMock(return_value=legacy_ip_result())
-        with patch("tripper_recon.cli.investigate_ip", new=mock_investigate):
+        with patch("tripper_recon.service.investigate_ip", new=mock_investigate):
             with contextlib.redirect_stdout(stdout):
                 code = await _cmd_ip("8.8.8.8", output="json", providers=["local_dns"])
 
@@ -282,7 +360,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cli_domain_json_uses_schema_v1_with_passive_relationship(self) -> None:
         stdout = io.StringIO()
-        with patch("tripper_recon.cli.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
             with contextlib.redirect_stdout(stdout):
                 code = await _cmd_domain("example.com", output="json")
 
@@ -337,7 +415,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_typed_domain_rejects_url_without_coercion(self) -> None:
         stdout = io.StringIO()
-        with patch("tripper_recon.cli.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
             with contextlib.redirect_stdout(stdout):
                 code = await _cmd_domain("https://example.com/path", output="json")
 
@@ -350,7 +428,7 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_typed_ip_rejects_domain(self) -> None:
         stdout = io.StringIO()
-        with patch("tripper_recon.cli.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())) as mock_investigate:
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=legacy_ip_result())) as mock_investigate:
             with contextlib.redirect_stdout(stdout):
                 code = await _cmd_ip("example.com", output="json")
 
@@ -465,6 +543,89 @@ class SchemaV1Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["profile"], "best_effort")
         self.assertEqual([status["provider"] for status in payload["provider_status"]], ["ipinfo", "virustotal"])
         mock_investigate.assert_awaited_once_with("8.8.8.8")
+
+    async def test_ip_service_uses_cache_when_all_selected_providers_are_fresh(self) -> None:
+        cache = ProviderCache(Path(os.environ["TRIPPER_RECON_CACHE_DB"]))
+        now = utc_now()
+        cache.set(
+            normalized_target="8.8.8.8",
+            target_type="ip",
+            mode="passive",
+            provider="ipinfo",
+            payload={"asn": 15169, "country": "US"},
+            retrieved_at=now,
+        )
+
+        with patch(
+            "tripper_recon.service.investigate_ip",
+            new=AsyncMock(side_effect=AssertionError("network should not run")),
+        ):
+            result = await ip_schema_result(
+                "8.8.8.8",
+                InvestigationOptions(providers=("ipinfo",), cache=True),
+            )
+
+        self.assertEqual(result.execution_status, "completed")
+        self.assertEqual(result.cache[0].provider, "ipinfo")
+        self.assertTrue(result.cache[0].hit)
+
+    async def test_ciso_daily_complete_and_incomplete_ip_coverage(self) -> None:
+        complete = InvestigationResult(
+            ok=True,
+            data={
+                "ipinfo": {"asn": 15169},
+                "virustotal": {"vt_last_analysis_stats": {"malicious": 0}, "vt_reputation": 0},
+            },
+            warnings=[],
+            errors=[],
+        )
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=complete)):
+            result = await ip_schema_result(
+                "8.8.8.8",
+                InvestigationOptions(profile="ciso_daily", providers=("ipinfo", "virustotal"), cache=False),
+            )
+        self.assertNotIn("profile_incomplete", "\n".join(result.warnings))
+
+        incomplete = InvestigationResult(ok=True, data={"ipinfo": {"asn": 15169}}, warnings=[], errors=[])
+        with patch("tripper_recon.service.investigate_ip", new=AsyncMock(return_value=incomplete)):
+            failed = await ip_schema_result(
+                "8.8.8.8",
+                InvestigationOptions(
+                    profile="ciso_daily",
+                    providers=("ipinfo", "virustotal"),
+                    require_profile_complete=True,
+                    cache=False,
+                ),
+            )
+        self.assertEqual(failed.execution_status, "failed")
+        self.assertIn("profile_incomplete:ciso_daily", failed.errors[-1])
+
+    async def test_ciso_daily_domain_requires_reputation_and_relationship(self) -> None:
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())):
+            result = await domain_schema_result(
+                "example.com",
+                InvestigationOptions(profile="ciso_daily", providers=("virustotal", "otx"), cache=False),
+            )
+        self.assertNotIn("profile_incomplete", "\n".join(result.warnings))
+
+        incomplete = InvestigationResult(
+            ok=True,
+            data={"domain": "example.com", "domain_intel": {"virustotal": {"vt_dns_records": []}}, "ips": []},
+            warnings=[],
+            errors=[],
+        )
+        with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=incomplete)):
+            failed = await domain_schema_result(
+                "example.com",
+                InvestigationOptions(
+                    profile="ciso_daily",
+                    providers=("virustotal",),
+                    require_profile_complete=True,
+                    cache=False,
+                ),
+            )
+        self.assertEqual(failed.execution_status, "failed")
+        self.assertIn("domain_relationship", failed.errors[-1])
 
     async def test_api_provider_validation_returns_schema_failure_without_secret_leak(self) -> None:
         with patch("tripper_recon.service.investigate_domain", new=AsyncMock(return_value=legacy_domain_result())) as mock_investigate:
