@@ -58,6 +58,9 @@ PROFILE_PROVIDERS: dict[tuple[str, TargetType], tuple[str, ...]] = {
     ("best_effort", "ip"): ("ipinfo", "virustotal", "shodan", "abuseipdb", "otx", "local_dns"),
     ("best_effort", "domain"): ("virustotal", "otx", "local_dns"),
     ("best_effort", "url"): ("virustotal", "otx", "urlscan_submit", "direct_http"),
+    ("ciso_daily", "ip"): ("ipinfo", "virustotal", "shodan", "abuseipdb", "otx"),
+    ("ciso_daily", "domain"): ("virustotal", "otx", "local_dns"),
+    ("ciso_daily", "url"): ("virustotal", "otx"),
 }
 
 
