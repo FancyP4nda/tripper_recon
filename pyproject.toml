@@ -50,6 +50,10 @@ tripper-recon = "tripper_recon.cli:main"
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+# ruff >=0.16 formats Python code blocks inside Markdown. docs/ is evidence: the review reports
+# and the roadmap quote source verbatim with file:line anchors, and reformatting those blocks
+# silently rewrites the thing being cited. Never let the formatter touch them.
+extend-exclude = ["docs/"]
 
 [tool.ruff.lint]
 # Selected explicitly. Without a `select` key ruff walks up the filesystem and can inherit a
