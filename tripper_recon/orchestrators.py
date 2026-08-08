@@ -23,6 +23,59 @@ What changed here and why (roadmap W2/W3):
   which covers neither 224/4 nor 240/4, and the domain path checked nothing at all -- so a
   split-horizon or sinkholed domain forwarded internal addressing to five third parties under
   the operator's own API keys.
+
+What changed here and why (roadmap W4):
+
+* **``ok`` reflects what was learned, not what parsed.** See :ref:`the contract <ok-contract>`
+  below. ``investigate_ip`` used to return ``ok=True`` the moment the address parsed, so a run
+  in which every provider was unconfigured or down was indistinguishable, to anything keyed on
+  the result, from a clean lookup.
+* **Coverage is published, not implied.** Every result carries a :class:`Coverage` on
+  ``result.coverage`` and its dump on ``data['coverage']``: which providers answered, which
+  errored, which had no credential, and which were never attempted -- by name, with
+  ``headline`` already rendered as "2 of 6 providers answered". W3.6 put the raw material in
+  ``provider_status``; this is the counted form. The denominator comes from the declared
+  ``*_PROVIDERS`` sets, never from the calls that happened to be made.
+* **Run metadata is published.** :class:`RunMetadata` on ``result.run`` and ``data['run']``:
+  tool, version, run id and RFC 3339 UTC start. The run id is shared by every target in one
+  invocation, so a bulk run correlates.
+* **Warnings reach the renderer.** ``investigate_asn`` computed a ``warnings`` list that only
+  the JSON path ever read, because the console renderers are handed ``result.data`` and nothing
+  else. All three paths now compute warnings, and all three mirror them into
+  ``data['warnings']``.
+* **Skipped addresses survive.** A domain resolving to three internal addresses and one public
+  one is not a domain with one address. Each refused address is a :class:`SkippedAddress` on
+  ``result.skipped_addresses``, keeps its existing ``data['skipped_ips']`` entry, is counted in
+  ``data['addresses']``, and raises a warning naming it.
+
+.. _ok-contract:
+
+**The ``ok`` contract, and the exit code that rides on it.**
+
+``cli.py`` maps ``not result.ok`` onto a non-zero exit for every subcommand, so this rule is a
+public interface. Automation may rely on it:
+
+``ok is False`` when, and only when, one of the following holds:
+
+1. the target failed validation (``Invalid IP address`` / ``Invalid domain`` / ``Invalid ASN``);
+2. the target is non-public addressing the tool refuses to forward to a third party;
+3. the wall-clock deadline fired before the run completed; or
+4. **no provider answered.** ``result.coverage.answered_count`` is zero while at least one
+   provider was applicable, because every one was unconfigured, errored or never attempted.
+   Nothing was learned.
+
+``ok is True`` otherwise. **``ok is True`` does not mean the lookup was complete**, and a caller
+that treats it that way is making the mistake this contract exists to prevent. A partial answer
+-- two providers of six -- is ``ok=True``. Read ``result.coverage`` (or ``data['coverage']``,
+whose ``headline`` is already rendered) before drawing any conclusion from sparse output;
+``coverage.is_complete`` is the flag that says the answer is whole.
+
+Cases 1-3 return an empty ``data``; the failure is entirely in ``errors``, and ``coverage`` is
+``None`` -- which :attr:`InvestigationResult.coverage_or_unknown` reads as zero coverage, never
+as full. Case 4 returns the full ``data``, because coverage, run metadata and per-provider
+status are exactly what the operator needs in order to see *why* nothing came back; it also
+states the blackout as the first entry in ``errors``, so the terse console failure branch has
+something to print.
 """
 
 from __future__ import annotations
@@ -51,7 +104,18 @@ from tripper_recon.providers.ripestat import (
 )
 from tripper_recon.providers.shodan_api import shodan_host
 from tripper_recon.providers.virustotal import vt_domain_summary, vt_ip_summary
-from tripper_recon.types.models import ApiKeys, InvestigationResult, ProviderCall, ProviderOutcome
+from tripper_recon.types.models import (
+    ApiKeys,
+    Coverage,
+    InvestigationResult,
+    ProviderCall,
+    ProviderStatus,
+    RunMetadata,
+    SkippedAddress,
+    SkipReason,
+    coverage_from_result_data,
+    current_run,
+)
 from tripper_recon.utils.http import PassiveBoundaryViolation, create_client, rate_limited
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
@@ -85,6 +149,33 @@ MAX_CONCURRENT_NEIGHBOUR_LOOKUPS = 8
 #: failures are configuration rather than incidents.
 NOT_CONFIGURED_ERRORS: FrozenSet[str] = frozenset(
     {"missing_api_key", "missing_api_token", "missing_token", "API key not configured"}
+)
+
+#: The providers each path INTENDS to consult, which is the denominator of "N of M answered".
+#:
+#: Declared rather than counted from the calls that happened, because the two differ in exactly
+#: the case that matters. ``cloudflare_asn`` on the IP path is a second wave that only runs when
+#: IPinfo returned an ASN, so when IPinfo fails, Cloudflare is never attempted at all -- and a
+#: denominator derived from attempts would quietly shrink from six to five and report better
+#: coverage for the worse run. :meth:`Coverage.from_status_map` files an expected provider with
+#: no status entry as ``skipped``, which keeps it in the denominator where it belongs.
+IP_PROVIDERS: Tuple[str, ...] = ("virustotal", "ipinfo", "shodan", "abuseipdb", "otx", "cloudflare_asn")
+
+#: The domain-level providers, asked about the name itself rather than about an address.
+DOMAIN_PROVIDERS: Tuple[str, ...] = ("virustotal", "otx")
+
+#: The ASN providers. Order matches the single gather wave in :func:`_investigate_asn`.
+ASN_PROVIDERS: Tuple[str, ...] = (
+    "ipinfo_asn",
+    "ripe_overview",
+    "ripe_abuse",
+    "caida",
+    "peeringdb",
+    "ripe_routing_status",
+    "ripe_neighbors",
+    "ripe_prefixes",
+    "cloudflare_bgp",
+    "cloudflare_asn",
 )
 
 
@@ -199,16 +290,14 @@ def _envelope(provider: str, payload: Dict[str, Any], elapsed: float) -> Provide
         data = payload.get("data")
         return ProviderCall(
             provider=provider,
-            outcome=ProviderOutcome.OK,
+            outcome=ProviderStatus.OK,
             elapsed_seconds=elapsed,
             data=data if isinstance(data, dict) else {},
         )
 
     err = payload.get("error")
     outcome = (
-        ProviderOutcome.NOT_CONFIGURED
-        if isinstance(err, str) and err in NOT_CONFIGURED_ERRORS
-        else ProviderOutcome.ERROR
+        ProviderStatus.NOT_CONFIGURED if isinstance(err, str) and err in NOT_CONFIGURED_ERRORS else ProviderStatus.ERROR
     )
     return ProviderCall(
         provider=provider,
@@ -295,6 +384,143 @@ def _status_map(calls: Mapping[str, ProviderCall]) -> Dict[str, Dict[str, Any]]:
             entry["suppressed"] = True
         status[key] = entry
     return status
+
+
+# --------------------------------------------------------------------------------------
+# Coverage, run metadata and the warnings that carry them to the screen (W4.2-W4.5)
+# --------------------------------------------------------------------------------------
+
+
+def _suppressed_names(data: Mapping[str, Any]) -> List[str]:
+    """Providers whose failure was deliberately kept out of ``errors``, across every scope.
+
+    A suppressed failure is still a provider that did not answer. It is kept out of the error
+    list because it is expected noise (IPinfo's free tier refusing ASN lookups, RIPEstat
+    flapping), not because it is nothing -- and W3.6 was explicit that suppression is a
+    rendering decision, never a data-loss one.
+
+    Unconfigured providers are excluded here only because ``Coverage.unconfigured`` already
+    names them, and saying it twice reads as two separate problems.
+
+    Names are namespaced exactly as :func:`types.models.coverage_from_result_data` namespaces
+    them, so the two lists can be read side by side.
+    """
+    names: List[str] = []
+
+    def _scan(status_map: Any, prefix: str) -> None:
+        if not isinstance(status_map, Mapping):
+            return
+        for name, entry in status_map.items():
+            if not isinstance(entry, Mapping) or not entry.get("suppressed"):
+                continue
+            if entry.get("outcome") == ProviderStatus.NOT_CONFIGURED.value:
+                continue
+            names.append(f"{prefix}{name}")
+
+    _scan(data.get("provider_status"), "")
+    _scan(data.get("domain_provider_status"), "domain:")
+    for entry in data.get("ips") or []:
+        if isinstance(entry, Mapping):
+            _scan(entry.get("provider_status"), f"{entry.get('ip') or '?'}:")
+    return names
+
+
+def _is_blackout(coverage: Coverage) -> bool:
+    """True when providers were applicable and none of them answered. See the ``ok`` contract."""
+    return coverage.applicable_count > 0 and coverage.answered_count == 0
+
+
+def _blackout_error(target: str, coverage: Coverage) -> str:
+    """The sentence that goes in ``errors`` when nothing answered.
+
+    It lands in ``errors`` rather than only in ``warnings`` because ``cli.py``'s failure branch
+    prints ``'; '.join(res.errors)`` and nothing else. A blackout caused entirely by unset API
+    keys produces no provider errors at all, so without this line the operator would be told
+    the lookup failed and given a blank reason.
+    """
+    return (
+        f"no provider answered for {target} ({coverage.headline}): this is an intelligence blackout, not a clean result"
+    )
+
+
+def _coverage_warnings(
+    coverage: Coverage,
+    *,
+    suppressed: Sequence[str],
+    skipped_addresses: Sequence[SkippedAddress],
+) -> List[str]:
+    """Say on the screen what the data already knew: which providers were never asked.
+
+    This is the whole point of W4. A run with two of six keys configured prints one score and
+    one error, and an analyst reads sparse output as a clean indicator unless something tells
+    them the other four were never consulted.
+
+    The coverage sentences come first and the per-address ones after, so a renderer that shows
+    only the first warning shows the load-bearing one.
+    """
+    warnings: List[str] = []
+
+    if _is_blackout(coverage):
+        warnings.append(f"no provider answered ({coverage.headline}): absence of findings here is absence of evidence")
+    elif not coverage.is_complete:
+        warnings.append(f"partial coverage: {coverage.headline}")
+
+    if coverage.unconfigured:
+        warnings.append("never asked, no API key configured: " + ", ".join(coverage.unconfigured))
+    if coverage.skipped:
+        warnings.append("never attempted: " + ", ".join(coverage.skipped))
+    if suppressed:
+        warnings.append("failed, and kept out of the error list as expected noise: " + ", ".join(suppressed))
+
+    warnings.extend(address.explanation for address in skipped_addresses)
+    return warnings
+
+
+def _finalise(
+    data: Dict[str, Any],
+    *,
+    target: str,
+    run: RunMetadata,
+    errors: List[str],
+    expected: Sequence[str],
+    domain_expected: Optional[Sequence[str]] = None,
+    skipped_addresses: Sequence[SkippedAddress] = (),
+) -> InvestigationResult:
+    """Compute coverage, publish it with the run metadata, and settle ``ok``.
+
+    One helper for all three orchestrators on purpose: ``ok`` is now a public contract that
+    automation keys an exit code on, and three hand-written copies of the rule would eventually
+    be three different rules.
+
+    Coverage and run metadata are written into ``data`` **as well as** onto the model fields.
+    The model fields are the typed interface; the ``data`` copies exist because the console
+    renderers are handed ``result.data`` and nothing else, which is exactly why the ASN path's
+    ``warnings`` reached the JSON consumer and never reached the screen (W4.3).
+    """
+    coverage = coverage_from_result_data(data, expected=expected, domain_expected=domain_expected)
+    warnings = _coverage_warnings(
+        coverage,
+        suppressed=_suppressed_names(data),
+        skipped_addresses=skipped_addresses,
+    )
+
+    data["coverage"] = coverage.model_dump()
+    data["run"] = run.model_dump()
+    data["warnings"] = warnings
+
+    blackout = _is_blackout(coverage)
+    if blackout:
+        errors.insert(0, _blackout_error(target, coverage))
+
+    return InvestigationResult(
+        ok=not blackout,
+        data=data,
+        warnings=warnings,
+        errors=errors,
+        run=run,
+        coverage=coverage,
+        skipped_addresses=list(skipped_addresses),
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -411,6 +637,7 @@ async def _asn_meta_for_ip(
 
 def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, Any]) -> Dict[str, Any]:
     """The per-IP analysis dict ``reporting.console.render_ip_analysis`` consumes."""
+    status = _status_map(calls)
     return {
         "ip": ip,
         "ptr": None,
@@ -420,7 +647,11 @@ def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, An
         "abuseipdb": calls["abuseipdb"].data,
         "otx": calls["otx"].data,
         "asn_meta": asn_meta,
-        "provider_status": _status_map(calls),
+        "provider_status": status,
+        # Per address, not only per run: on the domain path each address gets its own panel,
+        # and one address answered by five providers beside one answered by none is exactly
+        # the distinction a single run-level number would flatten.
+        "coverage": Coverage.from_status_map(status, expected=IP_PROVIDERS).model_dump(),
     }
 
 
@@ -430,6 +661,13 @@ def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, An
 
 
 async def investigate_ip(ip: str, *, deadline: Optional[float] = None) -> InvestigationResult:
+    """Investigate one IP address across the five per-IP providers, plus ASN metadata.
+
+    ``ok`` follows the contract in the module docstring: ``False`` for a malformed address, for
+    non-public addressing this tool refuses to forward, for a deadline breach, and for a run in
+    which no provider answered. ``True`` otherwise -- including for a partial answer, whose
+    extent is in ``data['coverage']``. ``ok=True`` is not a claim that the lookup was complete.
+    """
     if not is_valid_ip(ip):
         return InvestigationResult(ok=False, errors=["Invalid IP address"], data={})
 
@@ -462,7 +700,13 @@ async def _investigate_ip(ip: str) -> InvestigationResult:
         if provider_errors:
             data["errors"] = provider_errors
 
-        return InvestigationResult(ok=True, data=data, errors=result_errors)
+        return _finalise(
+            data,
+            target=ip,
+            run=current_run(),
+            errors=result_errors,
+            expected=IP_PROVIDERS,
+        )
 
 
 # --------------------------------------------------------------------------------------
@@ -525,7 +769,39 @@ async def _enrich_domain_ip(
     return entry, messages
 
 
+def _skipped_address(ip: str, source: str, reason: str) -> SkippedAddress:
+    """One address the non-public guard refused, as a typed record.
+
+    An address that vanishes from the output is worse than one reported as not investigated: a
+    domain resolving to three internal addresses and one public one renders as a domain with
+    one address, and the analyst is never told the other three exist.
+
+    ``reason`` arrives as the human label from ``_NON_PUBLIC_CATEGORIES`` (``Private``,
+    ``Link-local``); :class:`SkipReason` normalises the casing and the hyphen/underscore drift,
+    and falls back to ``OTHER`` with the original wording preserved rather than dropping a
+    category it does not recognise.
+    """
+    label = reason.strip().lower()
+    parsed = SkipReason(label)
+    return SkippedAddress(
+        address=ip,
+        reason=parsed,
+        source=source,
+        detail=label if parsed is SkipReason.OTHER else None,
+    )
+
+
 async def investigate_domain(domain: str, *, deadline: Optional[float] = None) -> InvestigationResult:
+    """Investigate one domain: domain-level intel, then every public address it resolves to.
+
+    ``ok`` follows the contract in the module docstring: ``False`` for a malformed domain, for a
+    deadline breach, and for a run in which no provider answered at either level. ``True``
+    otherwise, with ``data['coverage']`` stating how much of what was attempted came back.
+
+    Addresses refused by the non-public guard are **not** dropped. They appear in
+    ``data['skipped_ips']`` with their provenance and the reason, are counted in
+    ``data['coverage']['addresses_skipped']``, and each one raises a warning.
+    """
     if not is_valid_domain(domain):
         return InvestigationResult(ok=False, errors=["Invalid domain"], data={})
     return await _with_deadline(_investigate_domain(domain), target=domain, deadline=deadline)
@@ -534,7 +810,6 @@ async def investigate_domain(domain: str, *, deadline: Optional[float] = None) -
 async def _investigate_domain(domain: str) -> InvestigationResult:
     keys = _env_keys()
     result_errors: List[str] = []
-    warnings: List[str] = []
     domain_intel: Dict[str, Any] = {}
     domain_errors: Dict[str, Dict[str, Any]] = {}
 
@@ -563,14 +838,13 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
         active_ips = await resolve_domain(domain)
 
         enrichable: List[Tuple[str, str]] = []
-        skipped: List[Dict[str, str]] = []
+        skipped: List[SkippedAddress] = []
         for ip, source in _tag_ip_sources(active_ips, passive_ips):
             reason = non_public_ip_reason(ip)
             if reason is None:
                 enrichable.append((ip, source))
                 continue
-            skipped.append({"ip": ip, "source": source, "reason": reason.lower()})
-            warnings.append(f"{ip} ({source}) skipped: {reason.lower()} addressing is never sent to a provider")
+            skipped.append(_skipped_address(ip, source, reason))
 
         gate = asyncio.Semaphore(MAX_CONCURRENT_IPS)
 
@@ -590,15 +864,32 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
         "domain": domain,
         "ips": out,
         "domain_provider_status": _status_map(domain_calls),
+        "addresses": {
+            "resolved": len(out) + len(skipped),
+            "investigated": len(out),
+            "skipped": len(skipped),
+        },
+        # Always present, even when empty. A renderer that sees the key only when something was
+        # skipped cannot tell "none were skipped" from "this build does not report skips", and
+        # the second reading is the one that gets an analyst hurt.
+        "skipped_ips": [
+            {"ip": address.address, "source": address.source, "reason": address.reason.value} for address in skipped
+        ],
     }
     if domain_intel:
         data["domain_intel"] = domain_intel
     if domain_errors:
         data["domain_errors"] = domain_errors
-    if skipped:
-        data["skipped_ips"] = skipped
 
-    return InvestigationResult(ok=True, data=data, warnings=warnings, errors=result_errors)
+    return _finalise(
+        data,
+        target=domain,
+        run=current_run(),
+        errors=result_errors,
+        expected=IP_PROVIDERS,
+        domain_expected=DOMAIN_PROVIDERS,
+        skipped_addresses=skipped,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -637,6 +928,12 @@ async def investigate_asn(
     enrich_limit: int = 50,
     deadline: Optional[float] = None,
 ) -> InvestigationResult:
+    """Investigate one ASN across the ten registry, routing and reputation providers.
+
+    ``ok`` follows the contract in the module docstring: ``False`` for a malformed or
+    out-of-range ASN, for a deadline breach, and for a run in which no provider answered.
+    ``True`` otherwise, with ``data['coverage']`` stating how partial the answer is.
+    """
     if not is_valid_asn(asn):
         return InvestigationResult(ok=False, errors=["Invalid ASN"], data={})
     asn_int = int(asn)
@@ -815,19 +1112,22 @@ async def _investigate_asn(
                 }
                 meta_bgp.update({"inetnums": inetnums})
 
-        warnings: list[str] = []
+        # The per-provider tokens this path has always computed. They stay, unchanged, because
+        # the JSON consumers already parse them; the coverage sentences go in front of them so
+        # a renderer that shows only the first line shows the load-bearing one.
+        provider_warnings: list[str] = []
         if keys.cloudflare_api_token and not cf.ok:
-            warnings.append("cloudflare_query_failed_or_missing")
+            provider_warnings.append("cloudflare_query_failed_or_missing")
         if not ipi.ok and not ipi.suppressed:
-            warnings.append("ipinfo_query_failed_or_missing")
+            provider_warnings.append("ipinfo_query_failed_or_missing")
         if not ripe.ok:
-            warnings.append("ripestat_overview_failed")
+            provider_warnings.append("ripestat_overview_failed")
         if not rp_abuse.ok:
-            warnings.append("ripestat_abuse_failed")
+            provider_warnings.append("ripestat_abuse_failed")
         if not caida.ok:
-            warnings.append("caida_failed")
+            provider_warnings.append("caida_failed")
         if not pdb.ok:
-            warnings.append("peeringdb_failed")
+            provider_warnings.append("peeringdb_failed")
 
         data: Dict[str, Any] = {
             "asn": asn_int,
@@ -838,4 +1138,17 @@ async def _investigate_asn(
         if provider_errors:
             data["errors"] = provider_errors
 
-        return InvestigationResult(ok=True, data=data, warnings=warnings, errors=result_errors)
+        result = _finalise(
+            data,
+            target=f"AS{asn_int}",
+            run=current_run(),
+            errors=result_errors,
+            expected=ASN_PROVIDERS,
+        )
+        # The per-provider tokens are appended after the coverage sentences rather than merged
+        # into them, so a renderer showing only the first warning shows the load-bearing one.
+        # Reassigned through ``result.data`` rather than the local ``data``: pydantic copies a
+        # ``Dict[str, Any]`` field on validation, so the two are no longer the same object.
+        result.warnings.extend(provider_warnings)
+        result.data["warnings"] = list(result.warnings)
+        return result

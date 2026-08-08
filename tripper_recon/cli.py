@@ -1,3 +1,29 @@
+"""Command-line entry point, and the exit-code contract automation keys on.
+
+**Exit codes.** These are a public interface. A playbook that branches on them is relying on
+the rules below, so they are stated here rather than left to be inferred from the code:
+
+===== =========================================================================================
+Code  Meaning
+===== =========================================================================================
+``0`` The investigation ran and at least one provider answered. **This is not a claim that the
+      indicator is clean, and not a claim that the lookup was complete.** A run with two of six
+      credentials configured exits 0. Read ``coverage`` -- rendered as the ``provider_coverage``
+      line on every console block and carried as ``coverage.headline`` in ``-o json`` -- before
+      drawing any conclusion from sparse output.
+``1`` The orchestrator returned ``ok=False``: an intelligence blackout (no provider answered at
+      all), a wall-clock deadline breach, a non-public target this tool refuses to forward to a
+      third party, or a target the orchestrator rejected as malformed. Nothing was learned, and
+      the console prints the coverage line so the operator can see which providers to fix.
+``2`` The CLI rejected the input before any provider was consulted: an unparseable or defanged
+      target, a non-numeric ASN, or no subcommand.
+===== =========================================================================================
+
+The ``ok`` rule itself belongs to :mod:`tripper_recon.orchestrators`; see the ``ok`` contract in
+its module docstring. Code ``1`` versus code ``2`` is the only distinction this module adds:
+``2`` means no request ever left, ``1`` means requests left and taught us nothing.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,7 +36,17 @@ from rich.console import Console
 
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
-from tripper_recon.reporting.console import esc, render_asn_bgp_panels, render_asn_header, render_ip_analysis
+from tripper_recon.reporting.console import (
+    esc,
+    no_data_text,
+    provider_outcome,
+    render_asn_bgp_panels,
+    render_asn_header,
+    render_coverage,
+    render_domain_header,
+    render_ip_analysis,
+    run_fields,
+)
 from tripper_recon.utils.env import load_env
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
@@ -96,8 +132,25 @@ def _print_whois_block(whois: Any) -> None:
     console.print()
 
 
+def _has_cert_value(value: Any) -> bool:
+    """True when a certificate field actually carries something.
+
+    Nested one level because ``vt_last_https_certificate`` holds ``issuer``, ``subject`` and
+    ``validity`` sub-dicts that are themselves present-but-empty when VirusTotal held no
+    certificate.
+    """
+    if isinstance(value, dict):
+        return any(_has_cert_value(item) for item in value.values())
+    return bool(value)
+
+
 def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
-    if not cert:
+    # `vt_domain_summary` always emits this key as a fully-shaped dict whose values are all
+    # None when VirusTotal held no certificate, so `if not cert` never fired and the report
+    # carried a "Last HTTPS Certificate" heading with nothing under it. An empty heading reads
+    # as a rendering failure, and a reader cannot tell it from a certificate the tool dropped.
+    has_cert = bool(cert) and any(_has_cert_value(value) for value in cert.values())
+    if not has_cert and not jarm:
         return
     console.print("[bold white]Last HTTPS Certificate[/]")
     if jarm:
@@ -126,6 +179,23 @@ def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
     if subject:
         console.print(f"  [cyan]Subject[/]: {esc(_fmt_dn(subject))}")
     console.print()
+
+
+def _print_failure_coverage(data: Dict[str, Any]) -> None:
+    """Name the providers behind a failed lookup, when the orchestrator recorded them.
+
+    ``ok=False`` for an intelligence blackout still returns the full ``data`` -- coverage, run
+    metadata and per-provider status -- precisely so the operator can see *why* nothing came
+    back. Printing the error sentence alone throws that away and leaves "the lookup failed"
+    with no attribution, which for a blackout caused entirely by unset API keys is the least
+    actionable message the tool can produce.
+    """
+    if not isinstance(data, dict):
+        return
+    source = data.get("coverage") or data.get("provider_status") or data.get("domain_provider_status")
+    if source:
+        console.print(render_coverage(source))
+        console.print()
 
 
 def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
@@ -186,6 +256,7 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
             if output == "console":
                 console.print(f"[bold red]IP: {esc(target)}[/]")
                 console.print(f"  error: {esc('; '.join(res.errors)) if res.errors else 'Investigation failed'}\n")
+                _print_failure_coverage(res.data)
             continue
 
         succeeded += 1
@@ -248,6 +319,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
         log["error"]("Domain investigation failed", domain=domain, errors=res.errors)
         if output == "console":
             console.print(f"[bold red]Domain investigation failed:[/] {esc('; '.join(res.errors))}")
+            _print_failure_coverage(res.data)
         return 1
 
     if output == "json":
@@ -255,31 +327,64 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
         return 0
 
     data = res.data
-    domain_intel = data.get("domain_intel", {})
-    domain_errors = data.get("domain_errors", {})
-    ips = data.get("ips", [])
+    domain_intel = data.get("domain_intel") or {}
+    domain_errors = data.get("domain_errors") or {}
+    ips = data.get("ips") or []
+    domain_status = data.get("domain_provider_status") or {}
+    run_id, started_at, tool_version = run_fields(data.get("run"))
 
-    console.print(f"\n[bold white]--- Domain lookup for {norm_domain} ---[/]")
-    console.print("\n[bold]domain_intelligence:[/]")
+    # The header carries everything a reader who stops after the first screen must still have
+    # seen: which build produced this and when, how much of the intended provider set answered,
+    # the collector's warnings, and every address that was resolved and deliberately not
+    # investigated. `coverage` here is the whole-run figure the JSON export also carries -- its
+    # names are namespaced `domain:` and `<address>:` -- so the two can never state different
+    # ratios. See render_domain_header on why the label has to match that scope.
+    console.print()
+    console.print(
+        render_domain_header(
+            norm_domain,
+            coverage=data.get("coverage") or domain_status,
+            coverage_label="provider_coverage",
+            warnings=res.warnings or data.get("warnings"),
+            skipped_ips=data.get("skipped_ips"),
+            run_id=run_id,
+            generated_at=started_at,
+            version=tool_version,
+        )
+    )
+
+    console.print("[bold]domain_intelligence:[/]")
     console.print(f"  [cyan]cloudflare_radar_link[/]: https://radar.cloudflare.com/domain/{norm_domain}")
 
-    vt_dom = domain_intel.get("virustotal", {}) if isinstance(domain_intel, dict) else {}
-    if vt_dom:
-        vt_stats = vt_dom.get("vt_last_analysis_stats", {}) or {}
-        vt_total = 0
-        if isinstance(vt_stats, dict):
-            vt_total = sum(int(v or 0) for v in vt_stats.values() if str(v).isdigit())
-        vt_mal = int(vt_stats.get("malicious", 0) or 0)
+    vt_dom_raw = domain_intel.get("virustotal") if isinstance(domain_intel, dict) else None
+    vt_dom: Dict[str, Any] = vt_dom_raw if isinstance(vt_dom_raw, dict) else {}
+    vt_stats = vt_dom.get("vt_last_analysis_stats") or {}
+    vt_total = 0
+    if isinstance(vt_stats, dict):
+        vt_total = sum(int(v or 0) for v in vt_stats.values() if str(v).isdigit())
+    vt_mal = int(vt_stats.get("malicious", 0) or 0) if isinstance(vt_stats, dict) else 0
 
+    if vt_total <= 0:
+        # The IP path stopped rendering a manufactured `0/0` in W0.2; the domain path kept
+        # doing it for two more workstreams. An unset VT key summed an absent stats dict to
+        # zero and printed a green `0/0`, which is the exact equivalence -- absence rendered as
+        # a clean verdict -- that this whole workstream exists to remove.
+        vt_no_data = no_data_text(provider_outcome(domain_status, "virustotal"))
+        console.print(f"  [cyan]virustotal_detections[/]: [yellow]{esc(vt_no_data)}[/]")
+    else:
         vt_color = "red" if vt_mal > 0 else "green"
         console.print(f"  [cyan]virustotal_detections[/]: [{vt_color}]{vt_mal}/{vt_total}[/]")
+        stamp = vt_dom.get("vt_last_analysis_date_iso")
+        stamp_text = esc(stamp) if stamp else "unknown - VirusTotal supplied no date"
+        console.print(f"  [cyan]virustotal_last_analysis[/]: {stamp_text}")
 
+    if vt_dom:
         if vt_dom.get("vt_reputation") is not None:
-            console.print(f"  [cyan]virustotal_community_score[/]: {vt_dom.get('vt_reputation')}")
+            console.print(f"  [cyan]virustotal_community_score[/]: {esc(vt_dom.get('vt_reputation'))}")
 
         cats = vt_dom.get("vt_categories") or {}
         if isinstance(cats, dict) and cats:
-            j_cats = ", ".join(sorted({str(val) for val in cats.values() if val}))
+            j_cats = ", ".join(sorted({esc(val) for val in cats.values() if val}))
             if j_cats:
                 console.print(f"  [cyan]virustotal_categories[/]: {j_cats}")
 
@@ -290,27 +395,32 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             if isinstance(r, dict) and r.get("type") in {"A", "AAAA"} and r.get("value")
         ]
         if passive_ips:
-            preview = ", ".join(passive_ips[:5])
+            preview = ", ".join(esc(value) for value in passive_ips[:5])
             suffix = "" if len(passive_ips) <= 5 else f" ... (+{len(passive_ips) - 5} more)"
             console.print(f"  [cyan]virustotal_passive_ips[/]: {preview}{suffix}")
 
-    vt_link = (
-        vt_dom.get("vt_link") if isinstance(vt_dom, dict) else None
-    ) or f"https://www.virustotal.com/gui/domain/{norm_domain}"
-    console.print(f"  [cyan]virustotal_analysis_link[/]: {vt_link}")
-    console.print(f"  [cyan]abuseipdb_analysis_link[/]: https://www.abuseipdb.com/check/{norm_domain}")
+    vt_link = vt_dom.get("vt_link") or f"https://www.virustotal.com/gui/domain/{norm_domain}"
+    console.print(f"  [cyan]virustotal_analysis_link[/]: {esc(vt_link)}")
+    console.print(f"  [cyan]abuseipdb_analysis_link[/]: https://www.abuseipdb.com/check/{esc(norm_domain)}")
 
-    otx_dom = domain_intel.get("otx", {}) if isinstance(domain_intel, dict) else {}
-    otx_link = f"https://otx.alienvault.com/indicator/domain/{norm_domain}"
-    if otx_dom:
-        if otx_dom.get("otx_pulse_count") is not None:
-            console.print(f"  [cyan]otx_pulse_count[/]: {otx_dom.get('otx_pulse_count')}")
-        console.print(f"  [cyan]otx_pulse_link[/]: {otx_link}")
-        titles = otx_dom.get("otx_pulse_titles") or []
-        if isinstance(titles, list) and titles:
-            console.print(f"  [cyan]otx_pulse_titles[/]: {'; '.join(str(t) for t in titles)}")
+    otx_dom_raw = domain_intel.get("otx") if isinstance(domain_intel, dict) else None
+    otx_dom: Dict[str, Any] = otx_dom_raw if isinstance(otx_dom_raw, dict) else {}
+    otx_link = f"https://otx.alienvault.com/indicator/domain/{esc(norm_domain)}"
+    if otx_dom.get("otx_pulse_count") is not None:
+        console.print(f"  [cyan]otx_pulse_count[/]: {esc(otx_dom.get('otx_pulse_count'))}")
     else:
-        console.print(f"  [cyan]otx_pulse_link[/]: {otx_link}")
+        # Same rule as the VirusTotal row above and as every row on the IP path: an OTX that
+        # was never asked must not render as an OTX that had nothing. Dropping the count row
+        # and printing the pivot link on its own reads as the second.
+        otx_no_data = no_data_text(provider_outcome(domain_status, "otx"))
+        console.print(f"  [cyan]otx_pulse_count[/]: [yellow]{esc(otx_no_data)}[/]")
+    console.print(f"  [cyan]otx_pulse_link[/]: {otx_link}")
+    titles = otx_dom.get("otx_pulse_titles") or []
+    if isinstance(titles, list) and titles:
+        # Pulse titles are attacker-influenced free text. Unescaped, `evil [/] campaign` raised
+        # MarkupError mid-render and `[green]0/94 clean[/]` painted a verdict the tool never
+        # computed. W0.3 fixed this in reporting/console.py; this call site was missed.
+        console.print(f"  [cyan]otx_pulse_titles[/]: {'; '.join(esc(t) for t in titles)}")
 
     console.print()
 
@@ -326,15 +436,43 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             console.print(f"  - [bold]{esc(name)}[/]: {esc(_fmt_provider_error(detail))}")
         console.print()
 
-    console.print(f'\n[bold]- Resolving "{norm_domain}"... {len(ips)} IP addresses found:[/]\n\n')
+    # "N IP addresses found" counted only the addresses that survived the private/reserved
+    # guard, so a domain resolving to three internal addresses and one public one reported one
+    # address and never mentioned the other three. The orchestrator publishes the real
+    # accounting; print all three numbers, and say plainly that the skipped ones were not
+    # investigated rather than letting them disappear.
+    accounting = data.get("addresses") or {}
+    resolved = accounting.get("resolved", len(ips))
+    investigated = accounting.get("investigated", len(ips))
+    skipped_count = accounting.get("skipped", 0)
+    line = f'- Resolving "{norm_domain}"... {resolved} addresses resolved, {investigated} investigated'
+    if skipped_count:
+        line += f", {skipped_count} skipped as non-public and never sent to a provider"
+    console.print(f"\n[bold]{esc(line)}:[/]\n")
 
     if not ips:
-        console.print("No IPs available for IP-level enrichment.\n")
+        if skipped_count:
+            console.print(
+                "[yellow]No address was investigated: every address this domain resolved to is "
+                "non-public. Nothing above is evidence that this domain is clean.[/]\n"
+            )
+        else:
+            console.print("No IPs available for IP-level enrichment.\n")
         return 0
 
     for item in ips:
         item_ip = item.get("ip", "")
-        panel = render_ip_analysis(item_ip, item, ports_limit=ports_limit)
+        # show_run_line=False: the header printed the version, timestamp and run id once
+        # already. run_id still travels so a per-address panel lifted out of this report on its
+        # own can still be tied back to the run that produced it.
+        panel = render_ip_analysis(
+            item_ip,
+            item,
+            ports_limit=ports_limit,
+            run_id=run_id,
+            generated_at=started_at,
+            show_run_line=False,
+        )
         console.print(panel)
         console.print()
 
@@ -363,13 +501,30 @@ async def _cmd_asn(
         log["error"]("ASN lookup failed", asn=asn, errors=res.errors)
         if output == "console":
             console.print(f"[bold red]ASN lookup failed:[/] {esc('; '.join(res.errors))}")
+            _print_failure_coverage(res.data)
         return 1
 
     if output == "json":
         console.print_json(data=res.model_dump())
     else:
         meta = res.data.get("meta", {})
-        console.print(render_asn_header(asn, meta, use_color=not monochrome))
+        run_id, started_at, tool_version = run_fields(res.data.get("run"))
+        # Roadmap 4.3 for the ASN path closes here. The orchestrator has always computed these
+        # warnings and only the JSON branch ever read them, so a failed CAIDA or PeeringDB
+        # lookup degraded the panel silently -- and without `coverage` the header renders the
+        # ratio as "unknown", which is honest but is not the point of the workstream.
+        console.print(
+            render_asn_header(
+                asn,
+                meta,
+                use_color=not monochrome,
+                coverage=res.data.get("coverage") or res.data.get("provider_status"),
+                warnings=res.warnings or res.data.get("warnings"),
+                run_id=run_id,
+                generated_at=started_at,
+                version=tool_version,
+            )
+        )
         console.print()
 
         if not meta:
@@ -449,7 +604,7 @@ def main() -> None:
         "--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers"
     )
     parser.add_argument(
-        "--user-agent", type=str, default=None, help="Custom User-Agent string to spoof in HTTP requests"
+        "--user-agent", type=str, default=None, help="Override the User-Agent sent to providers (default: tripper-recon/<version>)"
     )
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")

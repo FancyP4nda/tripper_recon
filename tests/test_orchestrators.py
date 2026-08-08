@@ -33,7 +33,7 @@ import httpx
 import pytest
 import respx
 
-from tripper_recon import orchestrators
+from tripper_recon import __version__, orchestrators
 from tripper_recon.orchestrators import (
     MAX_CONCURRENT_IPS,
     MAX_CONCURRENT_NEIGHBOUR_LOOKUPS,
@@ -47,6 +47,7 @@ from tripper_recon.orchestrators import (
     investigate_ip,
     non_public_ip_reason,
 )
+from tripper_recon.types.models import SkipReason, skipped_addresses_from_data
 from tripper_recon.utils import http
 from tripper_recon.utils.http import PassiveBoundaryViolation
 from tripper_recon.utils.redact import _SECRET_ENV_VARS, REDACTED
@@ -353,14 +354,26 @@ async def test_investigate_ip_rejects_malformed_input(ip: str) -> None:
 async def test_investigate_ip_accepts_a_public_address_as_far_as_the_guard() -> None:
     """Control for the two tests above: a public address is NOT rejected by the input guard.
 
-    Every provider call is refused by respx rather than by validation, so the run comes back
-    ``ok=True`` with per-provider errors. That is how we know the private-IP tests are exercising
-    the guard rather than a blanket refusal of everything.
+    ``ok`` is ``False`` here, and that is the W4.2 rule rather than the guard: with no
+    credentials in the environment and respx refusing every request, no provider answered.
+    Before W4.2 this returned ``ok=True``, which is the defect -- a total intelligence blackout
+    was indistinguishable from a clean lookup to anything keyed on the result.
+
+    The guard is what this test pins, so it asserts on the *shape* of the refusal rather than
+    on ``ok``: the run reached the providers, and no guard message appears.
     """
     async with respx.mock(assert_all_called=False):
         result = await investigate_ip("8.8.8.8")
 
-    assert result.ok is True
+    # Reached the providers -- a guard refusal returns data={} and one "cannot be
+    # investigated" error, and neither is true here.
+    assert result.data["provider_status"]
+    assert not any("cannot be investigated" in msg for msg in result.errors)
+
+    # ...and failed for the W4.2 reason instead, said plainly and said first.
+    assert result.ok is False
+    assert result.data["coverage"]["headline"] == "0 of 6 providers answered"
+    assert result.errors[0].startswith("no provider answered for 8.8.8.8")
 
 
 # ---------------------------------------------------------------------------
@@ -379,14 +392,21 @@ async def test_investigate_asn_rejects_invalid_asn(asn: Any) -> None:
 
 
 async def test_investigate_asn_accepts_a_valid_asn_as_far_as_the_guard() -> None:
-    """Control: 15169 passes validation and is stopped only by the network mock, not by the guard."""
+    """Control: 15169 passes validation and is stopped only by the network mock, not by the guard.
+
+    ``ok`` is ``False`` under the W4.2 rule -- respx refused all ten providers, so nothing was
+    learned -- but the ASN itself was accepted, which is what this test exists to prove.
+    """
     async with respx.mock(assert_all_called=False):
         result = await investigate_asn(15169)
 
-    assert result.ok is True
     assert result.data["asn"] == 15169
+    assert result.errors != ["Invalid ASN"]
     # Every provider was refused by respx, so each one that ran reports an error.
     assert result.errors
+
+    assert result.ok is False
+    assert result.data["coverage"]["headline"] == "0 of 10 providers answered"
 
 
 # =======================================================================================
@@ -890,3 +910,380 @@ async def test_a_boundary_violation_is_not_downgraded_to_a_provider_error(
 
     with pytest.raises(PassiveBoundaryViolation):
         await investigate_ip("8.8.8.8")
+
+
+# =======================================================================================
+# W4 — truthful output: the ok contract, coverage, warnings, skipped addresses
+# =======================================================================================
+
+# The verified failure this section exists to prevent: run the tool with two of six keys set
+# and the console shows one VirusTotal score and one Shodan error. Nothing on the screen says
+# four providers were never asked. An analyst reads sparse output as a clean indicator.
+
+
+# ---------------------------------------------------------------------------
+# 4.2 — ok reflects what was learned, and the denominator does not shrink
+# ---------------------------------------------------------------------------
+
+
+async def test_a_total_blackout_is_not_ok() -> None:
+    """Every provider unconfigured is ``ok=False``. This is the whole of W4.2.
+
+    Pre-fix ``investigate_ip`` returned ``ok=True`` the moment the address parsed, so ``cli.py``
+    exited 0 and reported success on a run that learned nothing at all.
+    """
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert result.ok is False
+    assert result.coverage is not None
+    assert result.coverage.answered_count == 0
+    assert result.coverage.applicable_count == 6
+    # The reason is stated first, because cli.py's failure branch prints '; '.join(errors) and
+    # nothing else -- and a blackout caused by unset keys produces no provider errors to print.
+    assert result.errors[0] == (
+        "no provider answered for 8.8.8.8 (0 of 6 providers answered): "
+        "this is an intelligence blackout, not a clean result"
+    )
+
+
+async def test_a_partial_answer_is_ok_and_says_how_partial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One provider of six is ``ok=True`` -- and carries the coverage that stops it reading as clean."""
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    monkeypatch.setattr(orchestrators, "shodan_host", _fake_provider(_ok(ports=[443])))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert result.ok is True
+    assert result.coverage is not None
+    assert result.coverage.answered == ["shodan"]
+    assert result.coverage.is_complete is False
+    assert result.data["coverage"]["headline"] == "1 of 6 providers answered"
+
+
+async def test_the_denominator_is_declared_not_counted_from_attempts() -> None:
+    """``cloudflare_asn`` runs only when IPinfo returns an ASN, so a failed IPinfo means it is
+    never attempted at all.
+
+    A denominator derived from the calls that happened would shrink from six to five exactly
+    when IPinfo failed, and report BETTER coverage for the worse run. ``IP_PROVIDERS`` is
+    declared so the never-attempted provider stays in the denominator as ``skipped``.
+    """
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert "cloudflare_asn" not in result.data["provider_status"]
+    assert result.coverage is not None
+    assert result.coverage.skipped == ["cloudflare_asn"]
+    assert result.coverage.applicable_count == 6
+
+
+async def test_ok_is_true_as_soon_as_one_provider_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rule is "no provider answered", not "any provider failed".
+
+    W3.6's ok/error distinction must not be weakened into "any error fails the run": a partial
+    answer is a usable answer, and downgrading it to a non-zero exit would train the operator
+    to ignore the exit code.
+    """
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    monkeypatch.setenv("VT_API_KEY", "vt-key-0123456789")
+    monkeypatch.setattr(orchestrators, "shodan_host", _fake_provider(_ok(ports=[443])))
+
+    async with respx.mock(assert_all_called=False) as router:
+        router.get(url__regex=r"https://www\.virustotal\.com/api/v3/ip_addresses/.*").respond(403)
+        result = await investigate_ip("8.8.8.8")
+
+    assert result.ok is True
+    assert result.coverage is not None
+    assert "virustotal" in result.coverage.errored
+    assert any(msg.startswith("virustotal | 403") for msg in result.errors)
+
+
+@pytest.mark.parametrize(
+    ("call", "target"),
+    [
+        (lambda: investigate_ip("8.8.8.8"), "8.8.8.8"),
+        (lambda: investigate_asn(15169), "AS15169"),
+    ],
+    ids=["ip", "asn"],
+)
+async def test_a_blackout_names_its_target(call: Callable[[], Any], target: str) -> None:
+    async with respx.mock(assert_all_called=False):
+        result = await call()
+
+    assert result.ok is False
+    assert target in result.errors[0]
+
+
+async def test_a_guard_refusal_leaves_coverage_unmeasured() -> None:
+    """Refused before any provider was consulted, so coverage is ``None``, not zero-of-six.
+
+    ``coverage_or_unknown`` reads ``None`` as zero coverage, so nothing downstream can mistake
+    an unmeasured run for a covered one -- but the result must not claim to have measured six
+    providers it never intended to ask about a private address.
+    """
+    async with no_network():
+        result = await investigate_ip("10.0.0.1")
+
+    assert result.ok is False
+    assert result.coverage is None
+    assert result.coverage_or_unknown.applicable_count == 0
+    assert result.coverage_or_unknown.is_complete is False
+
+
+# ---------------------------------------------------------------------------
+# 4.3 — warnings reach the renderer, which is handed data and nothing else
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("call", "resolve_stub"),
+    [
+        (lambda: investigate_ip("8.8.8.8"), False),
+        (lambda: investigate_asn(15169), False),
+        (lambda: investigate_domain("example.test"), True),
+    ],
+    ids=["ip", "asn", "domain"],
+)
+async def test_every_path_carries_its_warnings_in_data(
+    monkeypatch: pytest.MonkeyPatch, call: Callable[[], Any], resolve_stub: bool
+) -> None:
+    """``cli.py`` hands the console renderers ``res.data`` and nothing else.
+
+    ``investigate_asn`` computed a warnings list that only the JSON branch ever read. A warning
+    that lives solely on the model is a warning the analyst never sees.
+    """
+    if resolve_stub:
+        monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver([]))
+
+    async with respx.mock(assert_all_called=False):
+        result = await call()
+
+    assert result.data["warnings"] == result.warnings
+    assert result.warnings, "a run with no credentials must warn about it"
+    assert any("never asked, no API key configured" in w for w in result.warnings)
+
+
+async def test_the_asn_path_leads_with_coverage_and_keeps_its_legacy_tokens() -> None:
+    """The terse per-provider tokens are parsed by existing JSON consumers, so they stay.
+
+    They are appended AFTER the coverage sentences: a renderer that shows only the first
+    warning must show the load-bearing one, and ``caida_failed`` is not it.
+    """
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_asn(15169)
+
+    assert result.warnings[0].startswith("no provider answered")
+    assert "caida_failed" in result.warnings
+    assert result.warnings.index("caida_failed") > 0
+    assert result.data["warnings"] == result.warnings
+
+
+async def test_a_suppressed_failure_is_still_reported_as_missing_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Suppression is a rendering decision, never a coverage decision (W3.6).
+
+    IPinfo's free tier answers an ASN lookup with 401, which is configuration rather than an
+    incident, so it is deliberately kept out of ``errors``. It is still a provider that did not
+    answer, and the analyst is told so.
+    """
+    monkeypatch.setenv("IPINFO_TOKEN", "ipinfo-token-0123456789")
+
+    async with respx.mock(assert_all_called=False) as router:
+        router.get(url__regex=r"https://ipinfo\.io/.*").respond(401)
+        result = await investigate_asn(15169)
+
+    assert result.data["provider_status"]["ipinfo_asn"]["suppressed"] is True
+    assert not any("ipinfo_asn" in msg for msg in result.errors)
+
+    assert result.coverage is not None
+    assert "ipinfo_asn" in result.coverage.errored
+    assert any("kept out of the error list" in w and "ipinfo_asn" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# 4.4 / 4.5 — coverage and run metadata on every result
+# ---------------------------------------------------------------------------
+
+
+async def test_every_resolved_address_carries_its_own_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One address answered by five providers beside one answered by none is a distinction a
+    single run-level number would flatten, and each address gets its own console panel."""
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["1.1.1.1", "2.2.2.2"]))
+
+    result = await investigate_domain("example.test")
+
+    for entry in result.data["ips"]:
+        # Five per-IP providers answered; cloudflare_asn was never reached, and stays in the
+        # denominator rather than quietly leaving it.
+        assert entry["coverage"]["headline"] == "5 of 6 providers answered"
+
+
+async def test_domain_coverage_spans_both_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two domain-level providers plus six per-address calls for each of two addresses."""
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["1.1.1.1", "2.2.2.2"]))
+
+    result = await investigate_domain("example.test")
+
+    assert result.coverage is not None
+    # 2 domain-level + (6 x 2) per-address. Names are namespaced, so the same provider asked
+    # about two addresses counts twice instead of collapsing to one.
+    assert result.coverage.applicable_count == 14
+    assert result.coverage.answered_count == 10
+    assert "domain:virustotal" in result.coverage.unconfigured
+    assert "1.1.1.1:cloudflare_asn" in result.coverage.skipped
+
+
+@pytest.mark.parametrize(
+    ("call", "resolve_stub"),
+    [
+        (lambda: investigate_ip("8.8.8.8"), False),
+        (lambda: investigate_asn(15169), False),
+        (lambda: investigate_domain("example.test"), True),
+    ],
+    ids=["ip", "asn", "domain"],
+)
+async def test_every_path_stamps_run_metadata(
+    monkeypatch: pytest.MonkeyPatch, call: Callable[[], Any], resolve_stub: bool
+) -> None:
+    """W4.5. Before this the header was ``--- IP lookup for {ip} ---`` and nothing else, and
+    ``__version__`` was defined but never reached output."""
+    if resolve_stub:
+        monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver([]))
+
+    async with respx.mock(assert_all_called=False):
+        result = await call()
+
+    assert result.run is not None
+    assert result.run.tool_version == __version__
+    assert result.run.run_id
+    assert result.run.started_at.tzinfo is not None
+
+    stamped = result.data["run"]
+    assert stamped["run_id"] == result.run.run_id
+    # Serialised for rich.print_json, which cannot handle a datetime.
+    assert isinstance(stamped["started_at"], str)
+    assert stamped["started_at"].endswith("Z")
+
+
+async def test_two_targets_in_one_invocation_share_a_run_id() -> None:
+    """A bulk run over forty addresses must produce forty lines that correlate to each other."""
+    async with respx.mock(assert_all_called=False):
+        first = await investigate_ip("8.8.8.8")
+        second = await investigate_ip("1.1.1.1")
+
+    assert first.run is not None and second.run is not None
+    assert first.run.run_id == second.run.run_id
+
+
+# ---------------------------------------------------------------------------
+# Skipped addresses survive the domain path
+# ---------------------------------------------------------------------------
+
+
+async def test_skipped_addresses_are_reported_not_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verified gap: a domain resolving to three internal addresses and one public one
+    returned ONE entry and said nothing about the other three.
+
+    Rendering one address is a claim that the domain resolves to one address, and that claim is
+    false. Each refusal is now a typed record, a wire entry, a count, and a warning.
+    """
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr(
+        "tripper_recon.utils.dns.resolve_domain",
+        _fake_resolver(["10.1.2.3", "192.168.5.5", "224.0.0.1", "8.8.8.8"]),
+    )
+
+    result = await investigate_domain("split-horizon.example.test")
+
+    assert [e["ip"] for e in result.data["ips"]] == ["8.8.8.8"]
+    assert result.data["addresses"] == {"resolved": 4, "investigated": 1, "skipped": 3}
+
+    assert [(s.address, s.reason.value) for s in result.skipped_addresses] == [
+        ("10.1.2.3", "private"),
+        ("192.168.5.5", "private"),
+        ("224.0.0.1", "multicast"),
+    ]
+    # Each one is named on the screen, not just counted.
+    for address in ("10.1.2.3", "192.168.5.5", "224.0.0.1"):
+        assert any(address in w and "was not investigated" in w for w in result.data["warnings"])
+
+
+async def test_skipped_ips_is_present_even_when_nothing_was_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A renderer that sees the key only when something was skipped cannot tell "none were
+    skipped" from "this build does not report skips", and the second reading is the dangerous one."""
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["8.8.8.8"]))
+
+    result = await investigate_domain("example.test")
+
+    assert result.data["skipped_ips"] == []
+    assert result.skipped_addresses == []
+    assert result.data["addresses"] == {"resolved": 1, "investigated": 1, "skipped": 0}
+
+
+async def test_the_skipped_wire_shape_is_what_the_typed_parser_expects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SkippedAddress.from_mapping`` parses ``{'ip', 'source', 'reason'}``. The orchestrator is
+    the only producer of that shape, so a rename here silently breaks every consumer."""
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["10.0.0.5", "8.8.8.8"]))
+
+    result = await investigate_domain("internal.example.test")
+
+    assert result.data["skipped_ips"] == [{"ip": "10.0.0.5", "source": "active", "reason": "private"}]
+    assert skipped_addresses_from_data(result.data["skipped_ips"]) == result.skipped_addresses
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("Private", "private"),
+        ("Loopback", "loopback"),
+        ("Link-local", "link-local"),
+        ("Multicast", "multicast"),
+        ("Reserved", "reserved"),
+        ("Unspecified", "unspecified"),
+    ],
+)
+def test_every_guard_category_maps_to_a_known_skip_reason(label: str, expected: str) -> None:
+    """``_NON_PUBLIC_CATEGORIES`` and ``SkipReason`` are declared in two files and must agree.
+
+    A category that falls through to ``OTHER`` still reports, so this is not a crash risk -- it
+    is a silent downgrade of a precise reason to a vague one, which is exactly the kind of drift
+    that survives review.
+    """
+    record = orchestrators._skipped_address("10.0.0.1", "active", label)
+
+    assert record.reason is not SkipReason.OTHER
+    assert record.reason.value == expected
+    assert record.detail is None
+
+
+def test_the_guard_categories_are_all_covered() -> None:
+    """Guards against a new entry in ``_NON_PUBLIC_CATEGORIES`` slipping past the test above."""
+    labels = {label for _, label in orchestrators._NON_PUBLIC_CATEGORIES}
+
+    for label in labels:
+        assert orchestrators._skipped_address("10.0.0.1", "active", label).reason is not SkipReason.OTHER
+
+
+async def test_a_domain_resolving_only_to_internal_space_is_not_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing was asked about any address and no domain provider answered, so nothing was learned.
+
+    The addresses still appear in the output. "We refused to look" and "we looked and found
+    nothing" must not render the same way.
+    """
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["10.0.0.5", "192.168.1.1"]))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_domain("internal.example.test")
+
+    assert result.ok is False
+    assert result.data["ips"] == []
+    assert result.data["addresses"] == {"resolved": 2, "investigated": 0, "skipped": 2}
+    assert len(result.skipped_addresses) == 2
+    assert result.errors[0].startswith("no provider answered for internal.example.test")
