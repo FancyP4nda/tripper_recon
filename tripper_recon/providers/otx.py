@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 OTX_BASE = "https://otx.alienvault.com/api/v1"
 
 

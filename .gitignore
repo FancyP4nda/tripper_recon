@@ -92,3 +92,22 @@ reports/
 *.txt
 !requirements.txt
 !LICENSE.txt
+
+# Source data that must stay committable
+#
+# The blanket *.json / *.csv / *.tsv / *.txt rules above exist to stop
+# investigation output from ever reaching the remote. They also swallow two
+# kinds of file that are source, not output: recorded provider fixtures under
+# tests/, and a future JSON Schema for the report artifact under schema/.
+# Re-include those two paths, by extension only.
+#
+# This does not weaken the output rule. outputs/, results/ and reports/ are
+# ignored as *directories* (lines 80-82), and git does not descend into an
+# ignored directory, so no negation here can resurrect investigation output.
+# The negations are scoped to two named directories and to data extensions, so
+# a stray dump anywhere else stays ignored.
+!tests/**/*.json
+!tests/**/*.csv
+!tests/**/*.tsv
+!tests/**/*.txt
+!schema/**/*.json

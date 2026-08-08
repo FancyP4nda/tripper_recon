@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 ABUSE_BASE = "https://api.abuseipdb.com/api/v2"
 
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
+
 from rich.console import Group, RenderableType
 from rich.markup import escape
-from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -57,7 +57,7 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
     country = ipinfo.get("country")
     if country:
         table.add_row("country", esc(country))
-    
+
     isp_line = None
     asn_id = asn_meta.get("asn")
     asn_name = asn_meta.get("name")
@@ -67,20 +67,20 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
         isp_line = ipinfo.get("org")
     if isp_line:
         table.add_row("isp", esc(isp_line))
-    
+
     org = asn_meta.get("organization") or ipinfo.get("org")
     if org:
         table.add_row("organization", esc(org))
-    
+
     coords = _fmt_coords(ipinfo.get("coordinates"))
     if coords:
         table.add_row("coordinates", esc(coords))
-    
+
     if ipinfo.get("postal"):
         table.add_row("postal_code", esc(ipinfo.get("postal")))
-        
+
     table.add_row("cloudflare_radar_link", f"https://radar.cloudflare.com/ip/{ip}")
-    
+
     # Absence is not safety. When VirusTotal was never asked, or answered with an error, there
     # are no stats to sum -- rendering the resulting 0/0 in green makes an unset API key look
     # identical to a clean verdict. Say "no data" instead.
@@ -97,12 +97,12 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
     else:
         vt_color = "red" if malicious > 0 else "green"
         table.add_row("virustotal_detections", f"[{vt_color}]{malicious}/{total_engines}[/]")
-    
+
     if vt_reputation is not None:
         table.add_row("virustotal_community_score", esc(vt_reputation))
     if vt_link:
         table.add_row("virustotal_analysis_link", esc(vt_link))
-        
+
     if abuse:
         reports = abuse.get('abuseipdb_reports', 0)
         table.add_row("abuseipdb_reports", esc(reports))
@@ -114,9 +114,9 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
         conf_int = max(0, min(100, conf_int))
         ab_color = "red" if conf_int > 0 else "green"
         table.add_row("abuseipdb_confidence_score", f"[{ab_color}]{conf_int}%[/]")
-        
+
     table.add_row("abuseipdb_analysis_link", f"https://www.abuseipdb.com/check/{ip}")
-    
+
     if otx:
         try:
             pulse_count = int(otx.get("otx_pulse_count", 0) or 0)
@@ -131,7 +131,7 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
                 table.add_row("otx_pulse_titles", joined)
     else:
         table.add_row("otx_pulse_link", f"https://otx.alienvault.com/indicator/ip/{ip}")
-        
+
     if ports:
         ports_sorted = sorted({int(p) for p in ports if isinstance(p, int) or str(p).isdigit()})
         if str(ports_limit).lower() == 'all':
@@ -148,9 +148,9 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
         if more > 0:
             ports_str += f" ... and {more} more"
         table.add_row("open_ports", ports_str)
-        
+
     table.add_row("shodan_link", f"https://www.shodan.io/host/{ip}")
-    
+
     errors = data.get("errors") or {}
     if errors:
         error_table = Table(show_header=False, box=None, padding=(0, 2))
@@ -219,7 +219,7 @@ def render_asn_header(asn: int, meta: Dict[str, Any], use_color: bool = False) -
         table.add_row("AS Reg. date", "──>", esc(alloc))
     if rir_line:
         table.add_row("RIR (Region)", "──>", esc(rir_line))
-        
+
     ixps = meta.get("ixps") or []
     if isinstance(ixps, list) and ixps:
         ixp_names = [i.get("name") for i in ixps if isinstance(i, dict) and i.get("name")]
@@ -244,7 +244,6 @@ def _join_asns(asns: list[int] | None, limit: int = 60) -> str:
 
 
 def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], use_color: bool = False) -> RenderableType:
-    name = meta.get("name") or ""
     panels: List[RenderableType] = []
 
     # Panel 1: BGP informations
@@ -314,7 +313,7 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
         t4 = Table(show_header=False, box=None, padding=(0, 2))
         t4.add_column("Protocol", style="bold yellow")
         t4.add_column("Prefixes")
-        
+
         v4_str = "NONE"
         if v4_list:
             v4_str = "\n".join(str(p) for p in v4_list[:50])

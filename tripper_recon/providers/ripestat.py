@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 RIPE_BASE = "https://stat.ripe.net/data"
 
 

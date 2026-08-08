@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 SHODAN_BASE = "https://api.shodan.io"
 
 
@@ -23,7 +22,7 @@ async def shodan_host(*, client: httpx.AsyncClient, api_key: Optional[str], ip: 
         ports = j.get("ports", [])
         org = j.get("org") or j.get("isp")
         tags = j.get("tags", [])
-        cpe = []
+        cpe: list[str] = []
         for item in j.get("data", []):
             cpe += item.get("cpe", []) or []
         return {"ok": True, "data": {"ports": ports, "org": org, "tags": tags, "cpe": sorted(set(cpe))}}

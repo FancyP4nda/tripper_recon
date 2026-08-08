@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
-from typing import List, Tuple
+from typing import List
 
 
 async def resolve_domain(domain: str) -> List[str]:
@@ -14,8 +14,9 @@ async def resolve_domain(domain: str) -> List[str]:
                 infos = socket.getaddrinfo(domain, None, family, socket.SOCK_STREAM)
                 for info in infos:
                     sockaddr = info[4]
-                    ip = sockaddr[0]
-                    addrs.add(ip)
+                    # sockaddr[0] is typed str | int (AF_INET6 tuples carry ints); the host is
+                    # always the first element and always a string in practice.
+                    addrs.add(str(sockaddr[0]))
             except socket.gaierror:
                 continue
         return list(addrs)

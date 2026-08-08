@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 CF_BASE = "https://api.cloudflare.com/client/v4/radar"
 
 

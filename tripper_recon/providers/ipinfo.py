@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 IPINFO_BASE = "https://ipinfo.io"
 
 

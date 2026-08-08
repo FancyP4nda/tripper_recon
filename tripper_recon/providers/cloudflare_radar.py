@@ -7,7 +7,6 @@ import httpx
 from tripper_recon.utils.backoff import with_exponential_backoff
 from tripper_recon.utils.redact import redact_text
 
-
 RADAR_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/radar/graphql"
 
 

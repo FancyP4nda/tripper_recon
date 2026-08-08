@@ -2,15 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Dict, List
 from ipaddress import ip_address
+from typing import Any, Dict, List
 
 import httpx
 
 from tripper_recon.providers.abuseipdb import abuseipdb_check
+from tripper_recon.providers.caida import caida_asrank
 from tripper_recon.providers.cloudflare_radar import fetch_asn_metadata
-from tripper_recon.providers.ipinfo import ipinfo_ip, ipinfo_asn
+from tripper_recon.providers.cloudflare_rest import bgp_incidents
+from tripper_recon.providers.ipinfo import ipinfo_asn, ipinfo_ip
 from tripper_recon.providers.otx import otx_domain_pulses, otx_ip_pulses
+from tripper_recon.providers.peeringdb import peeringdb_ixps_for_asn
+from tripper_recon.providers.ripestat import (
+    abuse_contact,
+    announced_prefixes,
+    as_overview,
+    asn_neighbours,
+    routing_status,
+)
 from tripper_recon.providers.shodan_api import shodan_host
 from tripper_recon.providers.virustotal import vt_domain_summary, vt_ip_summary
 from tripper_recon.types.models import ApiKeys, InvestigationResult
@@ -18,13 +28,24 @@ from tripper_recon.utils.http import RateLimiter, create_client
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
-from tripper_recon.providers.ripestat import as_overview, abuse_contact, routing_status, asn_neighbours, announced_prefixes
-from tripper_recon.providers.caida import caida_asrank
-from tripper_recon.providers.peeringdb import peeringdb_ixps_for_asn
-from tripper_recon.providers.cloudflare_rest import bgp_incidents
-
 
 log = logger("orchestrators")
+
+
+def _safe_request_url(obj: Any) -> str | None:
+    """Read a request URL without trusting the attribute to exist or behave.
+
+    httpx implements `.request` as a property that raises RuntimeError when unset, and
+    getattr's default only swallows AttributeError -- so the naive getattr(obj, "request", None)
+    made the error handler itself crash on a RequestError built without a request.
+    """
+    try:
+        req = getattr(obj, "request", None)
+        if req is None:
+            return None
+        return redact_url(str(req.url))
+    except Exception:  # noqa: BLE001 - the error path must never raise
+        return None
 
 
 def _error_payload(err: Exception) -> Dict[str, Any]:
@@ -33,21 +54,19 @@ def _error_payload(err: Exception) -> Dict[str, Any]:
     # this payload reaches console output and -o json.
     if isinstance(err, httpx.HTTPStatusError):
         resp = err.response
-        req = getattr(resp, "request", None)
         return {
             "ok": False,
             "error": "http_error",
             "status_code": resp.status_code if resp else None,
             "reason": resp.reason_phrase if resp else None,
-            "url": redact_url(str(req.url)) if req else None,
+            "url": _safe_request_url(resp),
             "message": redact_text(str(err)),
         }
     if isinstance(err, httpx.RequestError):
-        req = getattr(err, "request", None)
         return {
             "ok": False,
             "error": "network_error",
-            "url": redact_url(str(req.url)) if req else None,
+            "url": _safe_request_url(err),
             "message": redact_text(str(err)),
         }
     return {"ok": False, "error": type(err).__name__, "message": redact_text(str(err))}
@@ -94,9 +113,7 @@ def _should_suppress(provider: str, payload: Dict[str, Any]) -> bool:
             return True
         if err == "http_error" and status == 400:
             return True
-    if provider.startswith("ripe_") and err == "network_error":
-        return True
-    return False
+    return bool(provider.startswith("ripe_") and err == "network_error")
 
 
 def _env_keys() -> ApiKeys:
@@ -140,29 +157,29 @@ async def investigate_ip(ip: str) -> InvestigationResult:
 
         # Ensure provider failures don't crash the whole investigation
         try:
-            vt = await vt_task  # type: ignore[assignment]
+            vt = await vt_task
         except Exception as e:  # noqa: BLE001
             vt = _error_payload(e)
         try:
-            ipi = await ipi_task  # type: ignore[assignment]
+            ipi = await ipi_task
         except Exception as e:  # noqa: BLE001
             ipi = _error_payload(e)
         try:
-            sh = await sh_task  # type: ignore[assignment]
+            sh = await sh_task
         except Exception as e:  # noqa: BLE001
             sh = _error_payload(e)
         try:
-            ab = await ab_task  # type: ignore[assignment]
+            ab = await ab_task
         except Exception as e:  # noqa: BLE001
             ab = _error_payload(e)
         try:
-            otx = await otx_task  # type: ignore[assignment]
+            otx = await otx_task
         except Exception as e:  # noqa: BLE001
             otx = _error_payload(e)
 
         asn_meta: Dict[str, Any] = {}
         if ipi.get("ok") and ipi["data"].get("asn"):
-            asn = int(ipi["data"]["asn"])  # type: ignore[arg-type]
+            asn = int(ipi["data"]["asn"])
             cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
             if cf.get("ok"):
                 asn_meta = cf["data"]
@@ -303,7 +320,7 @@ async def investigate_domain(domain: str) -> InvestigationResult:
 
             asn_meta: Dict[str, Any] = {}
             if ipi.get("ok") and ipi["data"].get("asn"):
-                asn = int(ipi["data"]["asn"])  # type: ignore[arg-type]
+                asn = int(ipi["data"]["asn"])
                 try:
                     cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
                 except Exception as e:  # noqa: BLE001
@@ -363,28 +380,28 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             cf_task = asyncio.create_task(fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int))
 
         try:
-            ipi = await ipi_task  # type: ignore[assignment]
+            ipi = await ipi_task
         except Exception as e:  # noqa: BLE001
             ipi = _error_payload(e)
         try:
-            ripe = await ripe_overview_task  # type: ignore[assignment]
+            ripe = await ripe_overview_task
         except Exception as e:  # noqa: BLE001
             ripe = _error_payload(e)
         try:
-            rp_abuse = await ripe_abuse_task  # type: ignore[assignment]
+            rp_abuse = await ripe_abuse_task
         except Exception as e:  # noqa: BLE001
             rp_abuse = _error_payload(e)
         try:
-            caida = await caida_task  # type: ignore[assignment]
+            caida = await caida_task
         except Exception as e:  # noqa: BLE001
             caida = _error_payload(e)
         try:
-            pdb = await pdb_task  # type: ignore[assignment]
+            pdb = await pdb_task
         except Exception as e:  # noqa: BLE001
             pdb = _error_payload(e)
         if cf_bgp_task:
             try:
-                cf_bgp = await cf_bgp_task  # type: ignore[assignment]
+                cf_bgp = await cf_bgp_task
             except Exception as e:  # noqa: BLE001
                 cf_bgp = _error_payload(e)
         else:
@@ -394,20 +411,20 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
         nb_task = asyncio.create_task(asn_neighbours(client=client, asn=asn_int))
         ap_task = asyncio.create_task(announced_prefixes(client=client, asn=asn_int))
         try:
-            rs = await rs_task  # type: ignore[assignment]
+            rs = await rs_task
         except Exception as e:  # noqa: BLE001
             rs = _error_payload(e)
         try:
-            nb = await nb_task  # type: ignore[assignment]
+            nb = await nb_task
         except Exception as e:  # noqa: BLE001
             nb = _error_payload(e)
         try:
-            ap = await ap_task  # type: ignore[assignment]
+            ap = await ap_task
         except Exception as e:  # noqa: BLE001
             ap = _error_payload(e)
         if cf_task:
             try:
-                cf = await cf_task  # type: ignore[assignment]
+                cf = await cf_task
             except Exception as e:  # noqa: BLE001
                 cf = _error_payload(e)
         else:
@@ -442,10 +459,10 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
         meta: Dict[str, Any] = {}
         # Prefer Cloudflare values when present; fall back to IPinfo
         if cf.get("ok"):
-            meta.update(cf["data"])  # type: ignore[index]
+            meta.update(cf["data"])
         if ipi.get("ok"):
             # Only set fields that are missing from CF
-            for k, v in ipi["data"].items():  # type: ignore[index]
+            for k, v in ipi["data"].items():
                 if k not in meta or meta.get(k) in (None, ""):
                     meta[k] = v
         if ripe.get("ok"):
@@ -469,7 +486,7 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             existing = meta.get("ixps") or []
             existing_names = {i.get("name") for i in existing if isinstance(i, dict) and i.get("name")}
             new_names = {i.get("name") for i in ixps if isinstance(i, dict) and i.get("name")}
-            names = sorted(existing_names | new_names)
+            names = sorted(str(n) for n in (existing_names | new_names) if n)
             if names:
                 meta["ixps"] = [{"name": n} for n in names]
 
@@ -509,7 +526,7 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
                 name_map: Dict[int, str] = {}
                 tasks = [asyncio.create_task(as_overview(client=client, asn=int(a))) for a in to_resolve]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                for a, reso in zip(to_resolve, results):
+                for a, reso in zip(to_resolve, results, strict=False):
                     if isinstance(reso, dict) and reso.get("ok"):
                         holder = reso.get("data", {}).get("holder")
                         if holder:

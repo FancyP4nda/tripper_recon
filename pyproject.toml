@@ -51,6 +51,29 @@ tripper-recon = "tripper_recon.cli:main"
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.lint]
+# Selected explicitly. Without a `select` key ruff walks up the filesystem and can inherit a
+# config from outside the repo, so a clean local run says nothing about CI. Pinning it here
+# makes the check reproducible on any machine.
+#
+# E/W/F  pycodestyle + pyflakes  - real defects: unused imports and names, undefined names
+# I      isort                   - deterministic import order, keeps diffs small
+# B      flake8-bugbear          - mutable defaults, loop-variable capture, and similar traps
+# SIM    flake8-simplify         - genuine simplifications
+# UP (pyupgrade) is deliberately NOT selected. It would rewrite 132 typing.Dict/Optional
+# annotations across every file. The codebase is internally consistent in the typing.* style,
+# and churning it buys nothing while destroying blame history. Revisit as one deliberate commit.
+select = ["E", "W", "F", "I", "B", "SIM"]
+ignore = [
+  "E501",    # line length is enforced by the formatter, not the linter
+  "SIM105",  # contextlib.suppress is not clearer than try/except on the error paths here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately import fixtures they do not directly reference, and assert on constructs
+# the linter reads as redundant.
+"tests/*" = ["B011", "SIM117"]
+
 [tool.mypy]
 python_version = "3.10"
 warn_unused_ignores = true

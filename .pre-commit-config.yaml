@@ -1,0 +1,94 @@
+---
+# Local gate. Runs the cheap half of .github/workflows/ci.yml before a commit
+# is written, so lint and formatting drift never reach a PR.
+#
+# Install once per clone:
+#     pre-commit install
+#     pre-commit install --hook-type pre-push   # optional; runs the same set
+#
+# Run against everything (first time, or after changing this file):
+#     pre-commit run --all-files
+#
+# CAUTION on --all-files while W1 is open: ruff-format rewrites in place, and
+# the package source has never been formatted (20 files under tripper_recon/
+# are non-conforming as of 2026-08-08). A blanket --all-files run therefore
+# reformats the whole package in one unreviewed sweep, which is exactly the
+# change W1 is barred from making. Until the source-cleanup workstream lands,
+# prefer the default staged-files behaviour, or scope it:
+#     pre-commit run --files tests/*.py
+#
+# The normal per-commit path is safe: hooks receive only the staged files, so
+# committing a test never touches package source.
+#
+# Revs are pinned deliberately. ruff's default rule set and its formatter both
+# change between releases, so an unpinned rev turns "CI went red overnight"
+# into a recurring event. Bump with: pre-commit autoupdate
+
+repos:
+  # ---------------------------------------------------------------------
+  # Lint and format. Same tool and same version CI runs.
+  # ---------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.2
+    hooks:
+      # Lint. --fix applies the safe autofixes; anything left is a real finding.
+      - id: ruff-check
+        args: [--fix]
+      # Format. Unlike CI (which only checks), this one rewrites in place.
+      - id: ruff-format
+
+  # ---------------------------------------------------------------------
+  # Hygiene and accident guards.
+  # ---------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # An investigation dump that slipped past .gitignore is usually large.
+      # 500 KB is generous for source and fixtures and small for a JSON dump.
+      - id: check-added-large-files
+        args: [--maxkb=500]
+
+      # A private key in a commit is unrecoverable once pushed.
+      - id: detect-private-key
+
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+
+      # Both config formats this repo actually uses.
+      - id: check-yaml
+      - id: check-toml
+
+      # Cheap, and catches the two mistakes that produce corrupt commits.
+      - id: check-merge-conflict
+      - id: check-case-conflict
+
+  # ---------------------------------------------------------------------
+  # Secret scanning.
+  # ---------------------------------------------------------------------
+  # This repo holds paid provider credentials in a .env alongside the working
+  # tree (docs/OPSEC.md section 4), and provider keys travel in query strings
+  # (shodan_api.py, ipinfo.py). A pasted example URL is a plausible leak path,
+  # so scanning happens locally as well as in CI.
+  #
+  # The hook is used with its upstream default arguments. Note for whoever
+  # tunes this next: the default entry scans the staged content, but it does
+  # NOT pass --redact, so a match can echo the matched string into the
+  # terminal and into the hook output. Add `args: [--redact]` if that output
+  # is ever captured into a log or a pasted bug report. Left at the default
+  # here so the behaviour matches the documented upstream hook rather than a
+  # local variant nobody expects.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+# Investigation output is gitignored, but exclude it explicitly so a locally
+# retained outputs/ directory can never be rewritten by a formatting hook.
+exclude: |
+  (?x)^(
+    outputs/|
+    results/|
+    reports/|
+    tripper_recon\.egg-info/
+  )

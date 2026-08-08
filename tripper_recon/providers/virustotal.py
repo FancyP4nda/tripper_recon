@@ -6,7 +6,6 @@ import httpx
 
 from tripper_recon.utils.backoff import with_exponential_backoff
 
-
 VT_BASE = "https://www.virustotal.com/api/v3"
 
 

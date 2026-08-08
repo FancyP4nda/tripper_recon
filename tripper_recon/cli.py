@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import os
-from typing import Any, Dict, List
 from pathlib import Path
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from rich.console import Console
-from rich.panel import Panel
 
 from tripper_recon import __version__
 from tripper_recon.orchestrators import investigate_asn, investigate_domain, investigate_ip
-from tripper_recon.reporting.console import render_ip_analysis, render_asn_header, render_asn_bgp_panels
+from tripper_recon.reporting.console import esc, render_asn_bgp_panels, render_asn_header, render_ip_analysis
+from tripper_recon.utils.env import load_env
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
-from tripper_recon.utils.env import load_env
 
 log = logger("cli")
 console = Console()
@@ -85,7 +82,7 @@ def _print_whois_block(whois: Any) -> None:
         target = key.lower()
         for k, v in entries:
             if k.lower() == target:
-                console.print(f"  [cyan]{k}[/]: {v}")
+                console.print(f"  [cyan]{esc(k)}[/]: {esc(v)}")
     console.print()
 
 
@@ -94,7 +91,7 @@ def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
         return
     console.print("[bold white]Last HTTPS Certificate[/]")
     if jarm:
-        console.print(f"  [cyan]JARM fingerprint[/]: {jarm}")
+        console.print(f"  [cyan]JARM fingerprint[/]: {esc(jarm)}")
     for key, label in [
         ("version", "Version"),
         ("serial_number", "Serial Number"),
@@ -103,21 +100,21 @@ def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
     ]:
         val = cert.get(key)
         if val:
-            console.print(f"  [cyan]{label}[/]: {val}")
-    
+            console.print(f"  [cyan]{label}[/]: {esc(val)}")
+
     issuer = cert.get("issuer")
     if issuer:
-        console.print(f"  [cyan]Issuer[/]: {_fmt_dn(issuer)}")
-        
+        console.print(f"  [cyan]Issuer[/]: {esc(_fmt_dn(issuer))}")
+
     validity = cert.get("validity") or {}
     if validity.get("not_before"):
-        console.print(f"  [cyan]Not Before[/]: {validity.get('not_before')}")
+        console.print(f"  [cyan]Not Before[/]: {esc(validity.get('not_before'))}")
     if validity.get("not_after"):
-        console.print(f"  [cyan]Not After[/]: {validity.get('not_after')}")
-        
+        console.print(f"  [cyan]Not After[/]: {esc(validity.get('not_after'))}")
+
     subject = cert.get("subject")
     if subject:
-        console.print(f"  [cyan]Subject[/]: {_fmt_dn(subject)}")
+        console.print(f"  [cyan]Subject[/]: {esc(_fmt_dn(subject))}")
     console.print()
 
 
@@ -154,16 +151,23 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
     failed = 0
     succeeded = 0
 
-    for target, item in zip(targets, gathered):
-        if isinstance(item, Exception):
+    for target, item in zip(targets, gathered, strict=True):
+        # BaseException, not Exception. asyncio.CancelledError has inherited from BaseException
+        # since 3.8, so an `isinstance(item, Exception)` test lets a cancelled target fall
+        # through to `res.ok` and raise AttributeError. That is currently unreachable, but a
+        # per-target deadline (roadmap 3.7) makes cancellation routine -- narrow it now.
+        if isinstance(item, BaseException):
+            # An interrupt is the operator asking to stop, not a target that failed to resolve.
+            if isinstance(item, (KeyboardInterrupt, SystemExit)):
+                raise item
             err = item
             msg = f"{type(err).__name__}: {err}"
             log["error"]("IP investigation crashed", ip=target, error=msg)
             failed += 1
             results.append({"target": target, "ok": False, "warnings": [], "errors": [msg], "data": {}})
             if output == "console":
-                console.print(f"[bold red]IP: {target}[/]")
-                console.print(f"  error: {msg}\n")
+                console.print(f"[bold red]IP: {esc(target)}[/]")
+                console.print(f"  error: {esc(msg)}\n")
             continue
 
         res = item
@@ -173,10 +177,10 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
             failed += 1
             results.append({"target": target, **res.model_dump()})
             if output == "console":
-                console.print(f"[bold red]IP: {target}[/]")
-                console.print(f"  error: {'; '.join(res.errors) if res.errors else 'Investigation failed'}\n")
+                console.print(f"[bold red]IP: {esc(target)}[/]")
+                console.print(f"  error: {esc('; '.join(res.errors)) if res.errors else 'Investigation failed'}\n")
             continue
-            
+
         succeeded += 1
         results.append({"target": target, **res.model_dump()})
         if output == "console":
@@ -220,14 +224,14 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
         hint = " It looks defanged - refang it first." if _looks_defanged(domain) else ""
         log["error"]("Could not parse target", domain=domain)
         if output == "console":
-            console.print(f"[bold red]Could not parse target:[/] {domain}.{hint}")
+            console.print(f"[bold red]Could not parse target:[/] {esc(domain)}.{hint}")
         return 2
 
     if _looks_defanged(norm_domain):
         log["error"]("Target looks defanged", domain=norm_domain)
         if output == "console":
             console.print(
-                f"[bold red]Target looks defanged:[/] {norm_domain}\n"
+                f"[bold red]Target looks defanged:[/] {esc(norm_domain)}\n"
                 "Refang it first, e.g. hxxps://evil[.]com -> evil.com"
             )
         return 2
@@ -236,7 +240,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
     if not res.ok:
         log["error"]("Domain investigation failed", domain=domain, errors=res.errors)
         if output == "console":
-            console.print(f"[bold red]Domain investigation failed:[/] {'; '.join(res.errors)}")
+            console.print(f"[bold red]Domain investigation failed:[/] {esc('; '.join(res.errors))}")
         return 1
 
     if output == "json":
@@ -251,7 +255,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
     console.print(f"\n[bold white]--- Domain lookup for {norm_domain} ---[/]")
     console.print("\n[bold]domain_intelligence:[/]")
     console.print(f"  [cyan]cloudflare_radar_link[/]: https://radar.cloudflare.com/domain/{norm_domain}")
-    
+
     vt_dom = domain_intel.get("virustotal", {}) if isinstance(domain_intel, dict) else {}
     if vt_dom:
         vt_stats = vt_dom.get("vt_last_analysis_stats", {}) or {}
@@ -259,26 +263,26 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
         if isinstance(vt_stats, dict):
             vt_total = sum(int(v or 0) for v in vt_stats.values() if str(v).isdigit())
         vt_mal = int(vt_stats.get("malicious", 0) or 0)
-        
+
         vt_color = "red" if vt_mal > 0 else "green"
         console.print(f"  [cyan]virustotal_detections[/]: [{vt_color}]{vt_mal}/{vt_total}[/]")
-        
+
         if vt_dom.get("vt_reputation") is not None:
             console.print(f"  [cyan]virustotal_community_score[/]: {vt_dom.get('vt_reputation')}")
-            
+
         cats = vt_dom.get("vt_categories") or {}
         if isinstance(cats, dict) and cats:
             j_cats = ", ".join(sorted({str(val) for val in cats.values() if val}))
             if j_cats:
                 console.print(f"  [cyan]virustotal_categories[/]: {j_cats}")
-                
+
         dns_records = vt_dom.get("vt_dns_records") or []
         passive_ips = [str(r.get("value")) for r in dns_records if isinstance(r, dict) and r.get("type") in {"A", "AAAA"} and r.get("value")]
         if passive_ips:
             preview = ", ".join(passive_ips[:5])
             suffix = "" if len(passive_ips) <= 5 else f" ... (+{len(passive_ips) - 5} more)"
             console.print(f"  [cyan]virustotal_passive_ips[/]: {preview}{suffix}")
-            
+
     vt_link = (vt_dom.get("vt_link") if isinstance(vt_dom, dict) else None) or f"https://www.virustotal.com/gui/domain/{norm_domain}"
     console.print(f"  [cyan]virustotal_analysis_link[/]: {vt_link}")
     console.print(f"  [cyan]abuseipdb_analysis_link[/]: https://www.abuseipdb.com/check/{norm_domain}")
@@ -294,7 +298,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             console.print(f"  [cyan]otx_pulse_titles[/]: {'; '.join(str(t) for t in titles)}")
     else:
         console.print(f"  [cyan]otx_pulse_link[/]: {otx_link}")
-        
+
     console.print()
 
     if vt_dom:
@@ -304,7 +308,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
     if domain_errors:
         console.print("[bold red]domain_provider_errors:[/]")
         for name, detail in domain_errors.items():
-            console.print(f"  - [bold]{name}[/]: {_fmt_provider_error(detail)}")
+            console.print(f"  - [bold]{esc(name)}[/]: {esc(_fmt_provider_error(detail))}")
         console.print()
 
     console.print(f'\n[bold]- Resolving "{norm_domain}"... {len(ips)} IP addresses found:[/]\n\n')
@@ -343,9 +347,9 @@ async def _cmd_asn(
     if not res.ok:
         log["error"]("ASN lookup failed", asn=asn, errors=res.errors)
         if output == "console":
-            console.print(f"[bold red]ASN lookup failed:[/] {'; '.join(res.errors)}")
+            console.print(f"[bold red]ASN lookup failed:[/] {esc('; '.join(res.errors))}")
         return 1
-        
+
     if output == "json":
         console.print_json(data=res.model_dump())
     else:
@@ -355,34 +359,41 @@ async def _cmd_asn(
 
         if not meta:
             console.print("[yellow]Note: Cloudflare Radar API token missing or request failed. Set CLOUDFLARE_API_TOKEN in .env for full ASN details.[/]\n")
-            
+
         bgp = res.data.get("bgp", {})
         if bgp:
             console.print(render_asn_bgp_panels(asn, meta, bgp, use_color=not monochrome))
-            
+
         errors = res.data.get("errors") or {}
         if errors:
             console.print("\n[bold red]provider_errors:[/]")
             for name, detail in errors.items():
-                console.print(f"  - [bold]{name}[/]: {_fmt_provider_error(detail)}")
+                console.print(f"  - [bold]{esc(name)}[/]: {esc(_fmt_provider_error(detail))}")
 
         if prefixes_out:
             v4_full = (res.data.get("bgp", {}) or {}).get("ripe_prefixes_v4") or []
             v6_full = (res.data.get("bgp", {}) or {}).get("ripe_prefixes_v6") or []
-            
+
             out_lines: list[str] = []
             name = meta.get("name") or ""
             title = f"--- Aggregated IP resources for AS{asn} ({name}) ---" if name else f"--- Aggregated IP resources for AS{asn} ---"
             out_lines.append(title)
             out_lines.append("")
-            
+
             if prefixes in ("v4", "both"):
                 out_lines.append("───── IPv4 ─────")
-                out_lines.extend(str(p) for p in v4_full) if v4_full else out_lines.append("NONE")
-                if prefixes == "both": out_lines.append("")
+                if v4_full:
+                    out_lines.extend(str(p) for p in v4_full)
+                else:
+                    out_lines.append("NONE")
+                if prefixes == "both":
+                    out_lines.append("")
             if prefixes in ("v6", "both"):
                 out_lines.append("───── IPv6 ─────")
-                out_lines.extend(str(p) for p in v6_full) if v6_full else out_lines.append("NONE")
+                if v6_full:
+                    out_lines.extend(str(p) for p in v6_full)
+                else:
+                    out_lines.append("NONE")
 
             out_path = Path(prefixes_out)
             if not out_path.parent or str(out_path.parent) == ".":
