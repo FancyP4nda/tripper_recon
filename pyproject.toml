@@ -9,14 +9,20 @@ description = "Passive async OSINT IP/Domain/ASN investigation tool"
 requires-python = ">=3.10"
 authors = [{ name = "FancyP4nda" }]
 readme = "README.md"
-license = { text = "MIT" }
+# PEP 639 SPDX expression. The older `license = { text = "MIT" }` table form is rejected outright
+# by setuptools once `license-files` is also present -- `pip wheel .` failed with
+# "`project.license` must be string" -- so the two keys could not both stand. The build was
+# broken before this change and nothing downstream noticed, because no CI job builds the package.
+license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["osint", "threat-intelligence", "security", "dfir", "soc", "passive-recon"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Intended Audience :: Information Technology",
-  "License :: OSI Approved :: MIT License",
+  # No "License :: OSI Approved :: MIT License" classifier. PEP 639 supersedes it with the SPDX
+  # `license` key above, and setuptools now hard-errors when both are present rather than
+  # warning. The licence is declared once, in one place.
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -27,6 +33,12 @@ dependencies = [
   "httpx[http2]>=0.27.0",
   "pydantic>=2.6.0",
   "python-dotenv>=1.0.1",
+  # The verdict ruleset and the known-infrastructure catalogue are YAML, not Python, because a
+  # scoring constant living in a .py file is a defect (docs/review/design-verdict-engine.md §8.1).
+  # verdict/config.py guards the import so a missing PyYAML fails with an actionable message
+  # instead of an import traceback -- but it is a hard runtime requirement, not an extra: without
+  # it no verdict can be computed at all.
+  "pyyaml>=6.0",
   "rich>=13.0.0",
 ]
 
@@ -94,5 +106,14 @@ package-dir = {"" = "."}
 [tool.setuptools.packages.find]
 include = ["tripper_recon*"]
 exclude = ["tests*", "examples*", "docs*"]
+
+[tool.setuptools.package-data]
+# scoring.yaml and known_infrastructure.yaml are loaded through importlib.resources at runtime,
+# so an installed wheel that omits them produces a tool that imports fine and then refuses to
+# adjudicate anything. Declared explicitly rather than relying on include-package-data, which is
+# MANIFEST/VCS-driven and silently drops files a plugin does not know about.
+# Checked: .gitignore has no *.yaml or *.yml rule, so neither file is swallowed
+# (`git check-ignore` on both exits 1).
+"tripper_recon.verdict" = ["*.yaml"]
 
 

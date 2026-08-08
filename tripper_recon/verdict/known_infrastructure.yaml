@@ -1,0 +1,551 @@
+# Known-infrastructure override catalogue -- roadmap 5.6.
+#
+# This file is DATA. Nothing here is tuned, fitted, or inferred: every address range and every
+# ASN below was retrieved from the party that publishes it, on the date recorded in the entry,
+# and the URL that produced it is recorded beside it. An entry that could not be verified against
+# a publisher or a registry is NOT in this file -- it is listed under `deliberately_omitted` with
+# the reason, because an unsourced allowlist entry is a silent false-negative generator and that
+# is the worst failure this tool has available to it.
+#
+# WHAT THE THREE TIERS DO, AND WHY THE B/A DISTINCTION IS THE IMPORTANT ONE
+#
+#   Tier A -- absolute. Public DNS resolvers and root nameservers. FORCES the verdict to
+#     KNOWN_INFRASTRUCTURE and short-circuits scoring. This is the ONLY path in the whole engine
+#     to a benign conclusion, and it is a human decision with a citation rather than anything
+#     scoring can reach. These addresses carry permanent nonzero VirusTotal and AbuseIPDB residue
+#     from DNS tunnelling and scanning reports; a tool that calls 1.1.1.1 malicious even once is
+#     finished, because the analyst stops believing every other verdict it ever produces.
+#
+#   Tier B -- CDN and major cloud. Does NOT force benign, and the difference from Tier A is the
+#     whole design. Shared hosting is where malware actually lives. Tier B zeroes the signals
+#     that describe the *edge* rather than the *tenant* (ASN reputation, ASN hijack history,
+#     Shodan exposure), caps the IP-level verdict at SUSPICIOUS, attaches an attribution warning,
+#     and leaves DOMAIN-level scoring completely untouched. Both failure modes are real and this
+#     is the only shape that avoids both: too strong and every phishing site behind Cloudflare
+#     reads clean; too weak and every CDN address reads suspicious.
+#
+#   Tier C -- vendor scanners and known benign crawlers. Suppresses the abuse-report signals that
+#     these hosts accumulate *as a property of what they do*, attaches a note, and forces nothing.
+#     An internet-wide scanner collects abuse reports by definition; that is not evidence about
+#     the scanner, and it is also not a reason to call the scanner safe.
+#
+# STALENESS IS THE FAILURE MODE THIS FILE IS BUILT AROUND.
+# A range that a publisher has since returned or reassigned keeps matching here forever and
+# silently suppresses signal on whatever moved in. There is no way to prevent that in a shipped
+# snapshot, so the design goal is that it is DETECTABLE instead: every entry carries `retrieved`,
+# the loader carries the oldest retrieval date of the entries that actually matched into every
+# verdict, and `max_age_days` below turns that into a visible `stale: true` flag. Read the flag.
+#
+# NO LIVE FETCH ON THE ANALYSIS PATH. These lists are published at machine-readable endpoints and
+# it is tempting to refresh them at lookup time. Do not: it is an outbound request per
+# investigation, it fails open in exactly the situation where the analyst is under pressure, and
+# it puts a third party on the critical path of a verdict. Refresh is a deliberate maintenance
+# action that edits this file and bumps `version`.
+
+version: "2026-08-08.1"
+
+# When this snapshot was assembled. Individual entries carry their own `retrieved` date; this is
+# the catalogue-level date reported when a lookup matches nothing, so an old file is still
+# visible on a miss.
+retrieved: 2026-08-08
+
+# Beyond this age an entry is reported as stale in the verdict that used it. 180 days is a
+# maintenance cadence, not a measurement -- it is the point at which a CDN range list should be
+# assumed to have drifted, and it is deliberately shorter than the entries whose contents almost
+# never change (root nameservers) would need.
+max_age_days: 180
+
+# ---------------------------------------------------------------------------------------------
+# Tier policy -- what a match in each tier does
+# ---------------------------------------------------------------------------------------------
+# Signal ids referenced here are the ones defined in scoring.yaml `signals:`. They are names, not
+# numbers; no weight, threshold or decay constant lives in this file or in known_infrastructure.py.
+#
+# PRECEDENCE NOTE. Where the packaged scoring.yaml `overrides:` block also states tier policy
+# (cap verdict, zeroed signals, precedence order), scoring.yaml is the ruleset and wins. This
+# block is the default so that the catalogue is usable on its own and so that its meaning is
+# legible next to the data it governs.
+tiers:
+  A:
+    label: absolute allowlist
+    # The one verdict label that means "this is fine", reachable only from here.
+    forces_verdict: KNOWN_INFRASTRUCTURE
+    caps_verdict: null
+    zeroed_signals: []
+    suppressed_signals: []
+    # IP scope only. A domain that happens to resolve to a public resolver is not thereby a
+    # public resolver, and forcing a domain verdict from an address match would be exactly the
+    # transfer-of-verdict error Tier B exists to prevent.
+    applies_to: [ip]
+    attribution_warning: null
+    note: >-
+      Address is published infrastructure whose operator is not the adversary. Adverse reports
+      against it describe traffic that passed through it, not the operator of it.
+
+  B:
+    label: CDN and major cloud
+    forces_verdict: null
+    caps_verdict: SUSPICIOUS
+    # The ASN describes the CDN, not the tenant; the Shodan surface is the edge, not the origin.
+    zeroed_signals: [asn.reputation, asn.bgp_incidents, shodan.exposure]
+    suppressed_signals: []
+    applies_to: [ip]
+    attribution_warning: >-
+      Shared infrastructure. This verdict does not transfer between the address and the domains
+      hosted on it -- do not block the address on the strength of a domain-level finding, and do
+      not read a clean address as clearing the domain.
+    note: >-
+      Address belongs to a shared CDN or cloud provider. Reputation attached to the address is
+      attributable to a tenant that cannot be identified from the address alone.
+
+  C:
+    label: vendor scanner or benign crawler
+    forces_verdict: null
+    caps_verdict: null
+    zeroed_signals: []
+    # Default for the tier; an entry may narrow or widen it with its own `suppresses:` list.
+    # Only the abuse-report signals are suppressed. VirusTotal detections and OTX pulses are NOT
+    # suppressed: a scanner range that starts serving malware is a real event and must still
+    # score.
+    suppressed_signals: [abuseipdb.confidence, abuseipdb.volume_recency]
+    applies_to: [ip]
+    attribution_warning: null
+    note: >-
+      Address belongs to declared scanning or crawling infrastructure. Abuse reports against it
+      are an expected consequence of that activity and are not evidence of compromise. This is
+      not a statement that the address is safe.
+
+# ---------------------------------------------------------------------------------------------
+# Entries
+# ---------------------------------------------------------------------------------------------
+# Every entry carries:
+#   source        the URL the values came from
+#   source_type   publisher_endpoint | publisher_doc | rir_rdap  -- how much the source is worth
+#   retrieved     the date it was read
+# `cidrs` accepts bare addresses; they are normalised to /32 or /128 on load.
+entries:
+
+  # -- Tier A -------------------------------------------------------------------------------
+  - id: allowlist.public_resolver.google
+    tier: A
+    name: Google Public DNS
+    operator: Google LLC
+    category: public_resolver
+    source: "https://developers.google.com/speed/public-dns/docs/using"
+    source_type: publisher_doc
+    retrieved: 2026-08-08
+    cidrs:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 2001:4860:4860::8888
+      - 2001:4860:4860::8844
+    asns: []
+    note: >-
+      The four anycast addresses documented by Google. AS15169 as a whole is NOT Tier A -- it is
+      Google's production network and is listed under cloud.google at Tier B.
+
+  - id: allowlist.public_resolver.cloudflare
+    tier: A
+    name: Cloudflare 1.1.1.1
+    operator: Cloudflare, Inc.
+    category: public_resolver
+    source: "https://developers.cloudflare.com/1.1.1.1/setup/"
+    source_type: publisher_doc
+    retrieved: 2026-08-08
+    cidrs:
+      - 1.1.1.1
+      - 1.0.0.1
+      - 2606:4700:4700::1111
+      - 2606:4700:4700::1001
+      # 1.1.1.1 for Families -- malware blocking
+      - 1.1.1.2
+      - 1.0.0.2
+      - 2606:4700:4700::1112
+      - 2606:4700:4700::1002
+      # 1.1.1.1 for Families -- malware and adult content
+      - 1.1.1.3
+      - 1.0.0.3
+      - 2606:4700:4700::1113
+      - 2606:4700:4700::1003
+    asns: []
+    note: >-
+      The IPv6 resolver addresses sit inside 2606:4700::/32, which is also listed at Tier B under
+      cdn.cloudflare. Tier A outranks Tier B, so the resolver is allowlisted and the edge range is
+      capped -- that overlap is intentional and is covered by a precedence test.
+
+  - id: allowlist.public_resolver.quad9
+    tier: A
+    name: Quad9
+    operator: Quad9 Foundation
+    category: public_resolver
+    source: "https://www.quad9.net/service/service-addresses-and-features/"
+    source_type: publisher_doc
+    retrieved: 2026-08-08
+    cidrs:
+      # Secured: malware blocking, DNSSEC validation
+      - 9.9.9.9
+      - 149.112.112.112
+      - 2620:fe::fe
+      - 2620:fe::9
+      # Secured with ECS
+      - 9.9.9.11
+      - 149.112.112.11
+      - 2620:fe::11
+      - 2620:fe::fe:11
+      # Unsecured: no malware blocking
+      - 9.9.9.10
+      - 149.112.112.10
+      - 2620:fe::10
+      - 2620:fe::fe:10
+    asns: []
+    note: All three published service variants, since an analyst may meet any of them in a log.
+
+  - id: allowlist.public_resolver.opendns
+    tier: A
+    name: OpenDNS
+    operator: Cisco Systems, Inc.
+    category: public_resolver
+    source: "https://www.opendns.com/setupguide/"
+    source_type: publisher_doc
+    retrieved: 2026-08-08
+    cidrs:
+      - 208.67.222.222
+      - 208.67.220.220
+      # FamilyShield
+      - 208.67.222.123
+      - 208.67.220.123
+    asns: []
+    note: >-
+      IPv4 only. The OpenDNS setup guide publishes no IPv6 resolver addresses, and the
+      2620:119::/48 addresses in wide circulation could not be traced to a Cisco-published page
+      during this retrieval, so they are omitted rather than guessed.
+
+  - id: allowlist.root_nameservers
+    tier: A
+    name: DNS root nameservers
+    operator: the twelve root server operators (IANA root zone)
+    category: root_nameserver
+    source: "https://www.internic.net/domain/named.root"
+    source_type: publisher_endpoint
+    retrieved: 2026-08-08
+    # Root hints file, root zone version 2026072901, stated last update 2026-07-29.
+    cidrs:
+      - 198.41.0.4            # a.root-servers.net
+      - 2001:503:ba3e::2:30
+      - 170.247.170.2         # b.root-servers.net
+      - 2801:1b8:10::b
+      - 192.33.4.12           # c.root-servers.net
+      - 2001:500:2::c
+      - 199.7.91.13           # d.root-servers.net
+      - 2001:500:2d::d
+      - 192.203.230.10        # e.root-servers.net
+      - 2001:500:a8::e
+      - 192.5.5.241           # f.root-servers.net
+      - 2001:500:2f::f
+      - 192.112.36.4          # g.root-servers.net
+      - 2001:500:12::d0d
+      - 198.97.190.53         # h.root-servers.net
+      - 2001:500:1::53
+      - 192.36.148.17         # i.root-servers.net
+      - 2001:7fe::53
+      - 192.58.128.30         # j.root-servers.net
+      - 2001:503:c27::2:30
+      - 193.0.14.129          # k.root-servers.net
+      - 2001:7fd::1
+      - 199.7.83.42           # l.root-servers.net
+      - 2001:500:9f::42
+      - 202.12.27.33          # m.root-servers.net
+      - 2001:dc3::35
+    asns: []
+    note: >-
+      Root server addresses change rarely but they do change -- b.root-servers.net moved to
+      170.247.170.2 in 2023. Re-read named.root and bump `retrieved` rather than assuming.
+
+  # -- Tier B -------------------------------------------------------------------------------
+  - id: cdn.cloudflare
+    tier: B
+    name: Cloudflare edge
+    operator: Cloudflare, Inc.
+    category: cdn
+    source: "https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6"
+    source_type: publisher_endpoint
+    retrieved: 2026-08-08
+    cidrs:
+      - 173.245.48.0/20
+      - 103.21.244.0/22
+      - 103.22.200.0/22
+      - 103.31.4.0/22
+      - 141.101.64.0/18
+      - 108.162.192.0/18
+      - 190.93.240.0/20
+      - 188.114.96.0/20
+      - 197.234.240.0/22
+      - 198.41.128.0/17
+      - 162.158.0.0/15
+      - 104.16.0.0/13
+      - 104.24.0.0/14
+      - 172.64.0.0/13
+      - 131.0.72.0/22
+      - 2400:cb00::/32
+      - 2606:4700::/32
+      - 2803:f800::/32
+      - 2405:b500::/32
+      - 2405:8100::/32
+      - 2a06:98c0::/29
+      - 2c0f:f248::/32
+    asns:
+      - 13335   # CLOUDFLARENET, Cloudflare, Inc. -- rdap.arin.net/registry/autnum/13335, 2026-08-08
+    note: >-
+      Complete published edge ranges as served by Cloudflare's own endpoints. Cloudflare is the
+      single most common way a phishing domain reaches a benign-looking address, which is exactly
+      why this is a cap and not an allowlist.
+
+  - id: cdn.fastly
+    tier: B
+    name: Fastly edge
+    operator: Fastly, Inc.
+    category: cdn
+    source: "https://api.fastly.com/public-ip-list"
+    source_type: publisher_endpoint
+    retrieved: 2026-08-08
+    cidrs:
+      - 23.235.32.0/20
+      - 43.249.72.0/22
+      - 103.244.50.0/24
+      - 103.245.222.0/23
+      - 103.245.224.0/24
+      - 104.156.80.0/20
+      - 140.248.64.0/18
+      - 140.248.128.0/17
+      - 146.75.0.0/17
+      - 151.101.0.0/16
+      - 157.52.64.0/18
+      - 167.82.0.0/17
+      - 167.82.128.0/20
+      - 167.82.160.0/20
+      - 167.82.224.0/20
+      - 172.111.64.0/18
+      - 185.31.16.0/22
+      - 199.27.72.0/21
+      - 199.232.0.0/16
+      - 2a04:4e40::/32
+      - 2a04:4e42::/32
+    asns:
+      - 54113   # FASTLY, Fastly, Inc. -- rdap.arin.net/registry/autnum/54113, 2026-08-08
+    note: Complete published list from Fastly's own API endpoint.
+
+  - id: cdn.akamai
+    tier: B
+    name: Akamai edge
+    operator: Akamai Technologies, Inc.
+    category: cdn
+    source: "https://rdap.arin.net/registry/autnum/16625 and https://rdap.db.ripe.net/autnum/20940"
+    source_type: rir_rdap
+    retrieved: 2026-08-08
+    cidrs: []
+    asns:
+      - 16625   # AKAMAI-AS, Akamai Technologies, Inc. -- rdap.arin.net, 2026-08-08
+      - 20940   # AKAMAI-ASN1, Akamai International B.V. -- rdap.db.ripe.net, 2026-08-08
+    note: >-
+      ASN-only by necessity. Akamai publishes no public machine-readable edge range list -- the
+      documented mechanism is a customer-specific origin ACL behind authentication. Two ASNs were
+      verified against the registries and nothing else was included; this under-matches Akamai
+      rather than guessing at ranges, which is the correct direction for a suppression list.
+
+  - id: cdn.aws
+    tier: B
+    name: Amazon Web Services
+    operator: Amazon.com, Inc.
+    category: cloud
+    source: "https://rdap.arin.net/registry/autnum/16509 and https://rdap.arin.net/registry/autnum/14618"
+    source_type: rir_rdap
+    retrieved: 2026-08-08
+    cidrs: []
+    asns:
+      - 16509   # AMAZON-02, Amazon.com, Inc. -- rdap.arin.net, 2026-08-08
+      - 14618   # AMAZON-AES, Amazon.com, Inc. -- rdap.arin.net, 2026-08-08
+    note: >-
+      ASN-only on purpose. ip-ranges.amazonaws.com/ip-ranges.json carries several thousand
+      prefixes and changes most days; a snapshot of it in this file would be wrong within a week
+      and would still be silently authoritative. Two verified ASNs cover the bulk of EC2 and are
+      the right granularity for a cap. AWS ASNs registered outside ARIN are not included.
+
+  - id: cdn.gcp
+    tier: B
+    name: Google and Google Cloud
+    operator: Google LLC
+    category: cloud
+    source: "https://rdap.arin.net/registry/autnum/15169 and https://rdap.arin.net/registry/autnum/396982"
+    source_type: rir_rdap
+    retrieved: 2026-08-08
+    cidrs: []
+    asns:
+      - 15169   # GOOGLE, Google LLC -- rdap.arin.net, 2026-08-08
+      - 396982  # GOOGLE-CLOUD-PLATFORM, Google LLC -- rdap.arin.net, 2026-08-08
+    note: >-
+      AS396982 carries Google Cloud customer traffic; AS15169 is Google's own production network
+      and also holds the Public DNS resolvers. The resolvers are Tier A by address and Tier A
+      outranks Tier B, so 8.8.8.8 is allowlisted rather than merely capped. Ranges are omitted
+      for the same reason as AWS: gstatic.com/ipranges/cloud.json churns and a snapshot rots.
+
+  - id: cdn.azure
+    tier: B
+    name: Microsoft and Azure
+    operator: Microsoft Corporation
+    category: cloud
+    source: "https://rdap.arin.net/registry/autnum/8075"
+    source_type: rir_rdap
+    retrieved: 2026-08-08
+    cidrs: []
+    asns:
+      # ARIN returns one autnum object spanning 8068-8075: MICROSOFT-CORP-MSN-AS-BLOCK,
+      # Microsoft Corporation -- rdap.arin.net/registry/autnum/8075, 2026-08-08. The range is
+      # recorded as the registry states it rather than expanded to the single ASN that was
+      # queried.
+      - "8068-8075"
+    note: >-
+      ASN-only. Azure publishes service tags as a weekly download behind a JavaScript page rather
+      than a stable machine-readable URL, so there is no snapshot here worth trusting. Azure ASNs
+      outside the ARIN block are not included.
+
+  # -- Tier C -------------------------------------------------------------------------------
+  - id: scanner.censys
+    tier: C
+    name: Censys scanning infrastructure
+    operator: Censys, Inc.
+    category: scanner
+    source: "https://docs.censys.com/docs/opt-out-of-data-collection"
+    source_type: publisher_doc
+    retrieved: 2026-08-08
+    cidrs:
+      - 66.132.148.0/24
+      - 66.132.153.0/24
+      - 66.132.159.0/24
+      - 66.132.172.0/24
+      - 66.132.186.0/24
+      - 66.132.195.0/24
+      - 66.132.224.0/24
+      - 162.142.125.0/24
+      - 167.94.138.0/24
+      - 167.94.145.0/24
+      - 167.94.146.0/24
+      - 167.248.133.0/24
+      - 199.45.154.0/24
+      - 199.45.155.0/24
+      - 206.168.34.0/24
+      - 206.168.35.0/24
+      - 2602:80d:1000:b0cc:e::/80
+      - 2620:96:e000:b0cc:e::/80
+      - 2602:80d:1003::/112
+      - 2602:80d:1004::/112
+    asns:
+      # Published by Censys on the same page as its scanning ASNs. Not independently confirmed
+      # against a registry, which is acceptable here: the publisher is the authority on which of
+      # its own ASNs it scans from, and a Tier C match suppresses two signals rather than forcing
+      # anything.
+      - 398324
+      - 398705
+      - 398722
+    suppresses: [abuseipdb.confidence, abuseipdb.volume_recency]
+    note: >-
+      Censys scans the whole address space and therefore accumulates abuse reports as a direct
+      consequence. Those reports say nothing about whether the range is compromised, so they are
+      suppressed with a note -- and nothing else is, so a Censys range serving malware still
+      scores on VirusTotal and OTX.
+
+  - id: crawler.bingbot
+    tier: C
+    name: Bingbot
+    operator: Microsoft Corporation
+    category: crawler
+    source: "https://www.bing.com/toolbox/bingbot.json"
+    source_type: publisher_endpoint
+    retrieved: 2026-08-08
+    # Publisher's own creationTime on this file is 2024-01-03T10:00:00.121331, which is older
+    # than the retrieval date. The retrieval date is what this catalogue reports, because it is
+    # what is true about this snapshot; the publisher's stamp is recorded here so the gap is
+    # visible to anyone auditing the entry.
+    cidrs:
+      - 13.66.139.0/24
+      - 13.66.144.0/24
+      - 13.67.10.16/28
+      - 13.69.66.240/28
+      - 13.71.172.224/28
+      - 20.15.133.160/27
+      - 20.36.108.32/28
+      - 20.43.120.16/28
+      - 20.74.197.0/28
+      - 20.79.107.240/28
+      - 20.125.163.80/28
+      - 40.77.139.0/25
+      - 40.77.167.0/24
+      - 40.77.177.0/24
+      - 40.77.178.0/23
+      - 40.77.188.0/22
+      - 40.77.202.0/24
+      - 40.79.131.208/28
+      - 40.79.186.176/28
+      - 51.105.67.0/28
+      - 52.167.144.0/24
+      - 52.231.148.0/28
+      - 65.55.210.0/24
+      - 139.217.52.0/28
+      - 157.55.39.0/24
+      - 191.233.204.224/28
+      - 199.30.24.0/23
+      - 207.46.13.0/24
+    asns: []
+    suppresses: [abuseipdb.confidence, abuseipdb.volume_recency]
+    note: >-
+      Several of these prefixes sit inside Azure, which is also Tier B by ASN. Both matches are
+      reported; the Tier C suppression and the Tier B cap compose rather than competing.
+
+# ---------------------------------------------------------------------------------------------
+# Deliberately omitted, with the reason
+# ---------------------------------------------------------------------------------------------
+# Read this before adding anything. Each of these was considered and left out on the merits, and
+# every one of them is a case where a longer list would have been a worse list.
+deliberately_omitted:
+  - what: TLD nameservers (gtld-servers.net and the ccTLD sets)
+    why: >-
+      Named in the roadmap for Tier A, but no single publisher endpoint enumerates them. Deriving
+      them means parsing the root zone, which is a build-time pipeline rather than a retrieval,
+      and a partial hand-copied list is worse than none because the gaps are invisible.
+    source_if_added: "https://www.internic.net/domain/root.zone"
+
+  - what: AWS, GCP and Azure IP ranges
+    why: >-
+      Each publisher offers a machine-readable list, and each list is thousands of prefixes that
+      change on a weekly or daily cadence. A snapshot in this file would be stale within days and
+      would keep suppressing signal on ranges the provider had already handed back. ASN matching
+      gives the same cap with a fraction of the rot.
+    source_if_added: >-
+      https://ip-ranges.amazonaws.com/ip-ranges.json, https://www.gstatic.com/ipranges/cloud.json,
+      Azure service tag download
+
+  - what: Googlebot published ranges
+    why: >-
+      The published file carried a creationTime one day before retrieval and holds over three
+      hundred prefixes, so it is a list that genuinely churns. Vendoring a fast-moving snapshot to
+      suppress abuse signals is the exact stale-allowlist failure this catalogue is built to avoid,
+      and Googlebot's ASN is Google's whole production network so ASN matching is not a substitute.
+    source_if_added: "https://developers.google.com/static/search/apis/ipranges/googlebot.json"
+
+  - what: Shodan scanner ranges
+    why: >-
+      Widely circulated as community gists and blocklists, with no publisher-maintained list to
+      check them against. Unsourced, so excluded.
+    source_if_added: null
+
+  - what: OpenDNS IPv6 resolver addresses
+    why: >-
+      In wide circulation but not found on a Cisco- or OpenDNS-published page during retrieval.
+      Excluded rather than carried on the strength of third-party repetition.
+    source_if_added: null
+
+  - what: A denylist of named low-quality VirusTotal engines
+    why: >-
+      Out of scope here and explicitly refused for the project: no measured basis exists, and
+      shipping an unsourced list of named vendors is both wrong and a liability. Engine weighting
+      comes from a labelled corpus or it does not exist.
+    source_if_added: null

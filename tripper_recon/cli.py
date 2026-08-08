@@ -22,6 +22,14 @@ Code  Meaning
 The ``ok`` rule itself belongs to :mod:`tripper_recon.orchestrators`; see the ``ok`` contract in
 its module docstring. Code ``1`` versus code ``2`` is the only distinction this module adds:
 ``2`` means no request ever left, ``1`` means requests left and taught us nothing.
+
+**The exit code is not the verdict.** It reports whether the lookup worked, not what the lookup
+found: a ``MALICIOUS`` indicator with every provider answering exits ``0``. Read
+``data['verdict']`` -- printed as the first line of every console block and carried whole in
+``-o json`` -- for the answer. A pipeline that wants to branch on maliciousness reads that
+field. ``docs/review/design-verdict-engine.md`` §7.1 proposes a ``--fail-on`` flag that would
+fold the verdict into the exit code; it is not implemented, and until it is, the codes above
+mean exactly what this table says and nothing more.
 """
 
 from __future__ import annotations
@@ -53,6 +61,12 @@ from tripper_recon.utils.logging import logger
 
 log = logger("cli")
 console = Console()
+
+#: ``--explain``. The flag exists because a verdict an analyst cannot audit is a verdict a SOC
+#: learns to ignore: it prints every signal, the points it was worth out of its own ceiling, the
+#: ruleset key that set that ceiling, the provider values behind it, and every confidence
+#: criterion the engine asked. Console output only -- ``-o json`` already carries all of it.
+_EXPLAIN_HELP = "Show the full signal breakdown behind the verdict: every weight, its ruleset key, and its evidence"
 
 
 def _fmt_provider_error(detail: Any) -> str:
@@ -212,7 +226,7 @@ def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
     return list(dict.fromkeys(targets)), str(p)
 
 
-async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") -> int:
+async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25", explain: bool = False) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
         log["error"]("IP list file is empty", file=source_file)
@@ -262,7 +276,7 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
         succeeded += 1
         results.append({"target": target, **res.model_dump()})
         if output == "console":
-            panel = render_ip_analysis(target, res.data, ports_limit=ports_limit)
+            panel = render_ip_analysis(target, res.data, ports_limit=ports_limit, explain=explain)
             console.print(panel)
             console.print()
 
@@ -291,7 +305,7 @@ def _looks_defanged(value: str) -> bool:
     return any(marker in lowered for marker in _DEFANG_MARKERS)
 
 
-async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str = "25") -> int:
+async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str = "25", explain: bool = False) -> int:
     # urlparse raises on some malformed input -- notably a defanged indicator such as
     # `hxxps://evil[.]com`, which reads as an invalid IPv6 literal. Analysts paste defanged
     # indicators routinely, so fail with an instruction instead of a traceback.
@@ -350,6 +364,12 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             run_id=run_id,
             generated_at=started_at,
             version=tool_version,
+            # The domain's OWN verdict. Each address's verdict rides on its own panel below;
+            # the two are never merged, because a phishing kit on a CDN is a malicious domain
+            # on a shared address and both statements have to survive to the screen.
+            verdict=data.get("verdict"),
+            verdict_error=data.get("verdict_error"),
+            explain=explain,
         )
     )
 
@@ -472,6 +492,7 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
             run_id=run_id,
             generated_at=started_at,
             show_run_line=False,
+            explain=explain,
         )
         console.print(panel)
         console.print()
@@ -604,7 +625,10 @@ def main() -> None:
         "--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers"
     )
     parser.add_argument(
-        "--user-agent", type=str, default=None, help="Override the User-Agent sent to providers (default: tripper-recon/<version>)"
+        "--user-agent",
+        type=str,
+        default=None,
+        help="Override the User-Agent sent to providers (default: tripper-recon/<version>)",
     )
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
@@ -617,6 +641,7 @@ def main() -> None:
     p_ip.add_argument(
         "--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)"
     )
+    p_ip.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
@@ -629,6 +654,7 @@ def main() -> None:
         default="25",
         help="Limit number of ports shown per IP in console (use 'all' to show all)",
     )
+    p_domain.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
     p_asn = sub.add_parser("asn", help="Lookup ASN details")
     p_asn.add_argument("asn", type=str)
@@ -657,10 +683,22 @@ def main() -> None:
 
     match args.cmd:
         case "ip":
-            code = asyncio.run(_cmd_ip(args.ip, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
+            code = asyncio.run(
+                _cmd_ip(
+                    args.ip,
+                    output=args.format,
+                    ports_limit=getattr(args, "ports_limit", "25"),
+                    explain=getattr(args, "explain", False),
+                )
+            )
         case "domain":
             code = asyncio.run(
-                _cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25"))
+                _cmd_domain(
+                    args.domain,
+                    output=args.format,
+                    ports_limit=getattr(args, "ports_limit", "25"),
+                    explain=getattr(args, "explain", False),
+                )
             )
         case "asn":
             asn_str = str(args.asn).strip()

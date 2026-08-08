@@ -48,6 +48,18 @@ What changed here and why (roadmap W4):
   ``result.skipped_addresses``, keeps its existing ``data['skipped_ips']`` entry, is counted in
   ``data['addresses']``, and raises a warning naming it.
 
+What changed here and why (roadmap W5):
+
+* **The result carries a verdict.** Collection ends at ``_finalise``; adjudication runs after
+  it, in :func:`_adjudicate_ip` and :func:`_adjudicate_domain`, and publishes the verdict onto
+  ``data['verdict']`` (plus one per address on the domain path). The scoring engine itself is
+  pure -- every load and the clock read happen here.
+* **The domain and its addresses are scored separately and never merged.** A phishing kit on a
+  CDN is a malicious domain on a shared address; both statements are true, and any merge either
+  indicts the CDN's other tenants or clears the kit.
+* **A scoring failure never becomes a clean report.** If the ruleset will not load or the engine
+  raises, ``data['verdict_error']`` and a warning say so and the collected data still stands.
+
 .. _ok-contract:
 
 **The ``ok`` contract, and the exit code that rides on it.**
@@ -81,10 +93,11 @@ something to print.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import os
 import time
 from ipaddress import ip_address
-from typing import Any, Awaitable, Coroutine, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Coroutine, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import httpx
 
@@ -120,6 +133,10 @@ from tripper_recon.utils.http import PassiveBoundaryViolation, create_client, ra
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
+from tripper_recon.verdict import engine as verdict_engine
+from tripper_recon.verdict.config import ScoringConfig, default_config
+from tripper_recon.verdict.known_infrastructure import KnownInfrastructure, load_catalogue
+from tripper_recon.verdict.models import Verdict
 
 log = logger("orchestrators")
 
@@ -524,6 +541,197 @@ def _finalise(
 
 
 # --------------------------------------------------------------------------------------
+# Adjudication (roadmap 5.8, 5.10) -- collection ends, the verdict engine begins
+#
+# The engine is pure: signals, coverage, ruleset and a clock in, one verdict out. Every piece
+# of I/O it needs -- loading the ruleset, loading the known-infrastructure catalogue, reading
+# the wall clock -- happens here, in the caller, which is what keeps the engine exhaustively
+# testable offline and lets a saved case be re-scored later under the ruleset that produced the
+# original answer.
+#
+# Two rules shape everything below.
+#
+# **The engine reads pre-suppression state.** `_should_suppress` drops an unset API key from
+# the error list, which is a reasonable rendering decision and a fatal scoring one: it makes an
+# unconfigured OTX indistinguishable from an OTX that answered "nothing known". The engine is
+# handed `provider_status` and the published `Coverage`, both of which keep every provider that
+# was *applicable* in the denominator whether or not its failure was suppressed.
+#
+# **A verdict failure degrades to "not computed", never to a clean panel.** Adjudication runs
+# after `_finalise`, and if it raises, the collection result still stands, `ok` is untouched,
+# and `data['verdict_error']` plus a warning say plainly that nothing was adjudicated. The
+# alternative -- a report with no verdict line and no explanation -- reads as unremarkable,
+# which is the exact failure mode this workstream exists to remove.
+# --------------------------------------------------------------------------------------
+
+
+class _Adjudicator(NamedTuple):
+    """The ruleset, the allowlist and the clock, loaded once per investigation."""
+
+    cfg: ScoringConfig
+    catalogue: KnownInfrastructure
+    now: dt.datetime
+
+
+def _adjudicator() -> Tuple[Optional[_Adjudicator], Optional[str]]:
+    """Load the scoring inputs, or report why they could not be loaded.
+
+    ``(tools, None)`` on success and ``(None, reason)`` on failure. Both loaders raise loudly
+    by design -- an empty allowlist and a missing ruleset are each indistinguishable from a
+    working one until they produce a wrong answer -- so the failure is caught here exactly once
+    and turned into a stated gap rather than an exception that loses the collected data.
+    """
+    try:
+        return _Adjudicator(default_config(), load_catalogue(), dt.datetime.now(dt.timezone.utc)), None
+    except Exception as exc:  # noqa: BLE001 - a scoring-config fault must not lose the collection
+        reason = f"scoring configuration could not be loaded: {type(exc).__name__}: {exc}"
+        log["error"]("Verdict engine unavailable", error=reason)
+        return None, reason
+
+
+def _announcing_asn(entry: Mapping[str, Any]) -> Optional[int]:
+    """The ASN IPinfo reported for this address, when it reported one.
+
+    Passed to the catalogue because CIDR coverage for AWS, GCP, Azure and Akamai is deliberately
+    partial and ASN matching is the only thing that catches them. A missing ASN degrades the
+    lookup to CIDR-only; it is never an error.
+    """
+    for source in (entry.get("ipinfo"), entry.get("asn_meta")):
+        if not isinstance(source, Mapping):
+            continue
+        raw = source.get("asn")
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _ip_verdict(
+    entry: Mapping[str, Any],
+    *,
+    ip: str,
+    tools: _Adjudicator,
+    coverage: Optional[Coverage] = None,
+) -> Verdict:
+    """Adjudicate one address. ``coverage`` overrides the entry's own, for the standalone path."""
+    decision = tools.catalogue.evaluate(
+        indicator=ip,
+        indicator_type="ip",
+        asn=_announcing_asn(entry),
+        as_of=tools.now.date(),
+    )
+    return verdict_engine.evaluate_ip_analysis(
+        entry,
+        cfg=tools.cfg,
+        now=tools.now,
+        coverage=coverage,
+        infrastructure=decision,
+    )
+
+
+def _record_verdict_failure(result: InvestigationResult, reason: str) -> None:
+    """State the gap everywhere a consumer might look for a verdict, including per address.
+
+    The per-address stamp matters on the domain path: each resolved address gets its own panel,
+    and a panel with no verdict line and no explanation reads as a panel with nothing to
+    report. Every scope that would have carried a verdict carries the reason it does not.
+    """
+    result.data["verdict_error"] = reason
+    for entry in result.data.get("ips") or []:
+        if isinstance(entry, dict) and entry.get("verdict") is None:
+            entry["verdict_error"] = reason
+    warning = f"no verdict was computed: {reason}"
+    result.warnings.append(warning)
+    result.data["warnings"] = list(result.warnings)
+
+
+def _attach_verdicts(
+    result: InvestigationResult,
+    *,
+    verdict: Optional[Verdict],
+    ip_verdicts: Sequence[Verdict] = (),
+) -> InvestigationResult:
+    """Publish verdicts onto the result, on ``data`` and on the typed fields when they exist.
+
+    ``data`` is written unconditionally: the console renderers are handed ``result.data`` and
+    nothing else, and ``-o json`` dumps it, so this is the path that actually reaches both
+    consumers today. The per-address verdicts live on their own entries in ``data['ips']``
+    rather than in a parallel list, so a verdict cannot drift away from the evidence it
+    adjudicates.
+
+    The typed fields are the published W5.1 interface (``InvestigationResult.verdict`` and
+    ``.ip_verdicts``) and are set only when the model declares them. That model is not this
+    lane's file; setting them conditionally means the wiring is already correct on the day the
+    field lands, and setting them unconditionally would drop the values silently until then --
+    pydantic ignores an unknown key in ``model_copy(update=...)`` rather than raising.
+    """
+    if verdict is not None:
+        result.data["verdict"] = verdict.to_json_dict()
+
+    declared = set(InvestigationResult.model_fields)
+    if not {"verdict", "ip_verdicts"} <= declared:
+        return result
+    return result.model_copy(update={"verdict": verdict, "ip_verdicts": list(ip_verdicts)})
+
+
+def _adjudicate_ip(result: InvestigationResult, *, ip: str) -> InvestigationResult:
+    """Score one standalone address and attach the verdict.
+
+    The scoring view adds ``ip`` to the published payload rather than changing that payload's
+    shape: ``data`` for the ``ip`` subcommand has never carried the address as a key, JSON
+    consumers parse it as it stands, and the engine only needs the address to name the
+    indicator it is adjudicating.
+    """
+    tools, reason = _adjudicator()
+    if tools is None:
+        _record_verdict_failure(result, reason or "the verdict engine is unavailable")
+        return result
+    try:
+        entry: Dict[str, Any] = {**result.data, "ip": ip}
+        verdict = _ip_verdict(entry, ip=ip, tools=tools, coverage=result.coverage_or_unknown)
+    except Exception as exc:  # noqa: BLE001 - a scoring fault must not lose the collection
+        log["error"]("Verdict computation failed", target=ip, error=f"{type(exc).__name__}: {exc}")
+        _record_verdict_failure(result, f"the scoring engine raised {type(exc).__name__}: {exc}")
+        return result
+    return _attach_verdicts(result, verdict=verdict)
+
+
+def _adjudicate_domain(result: InvestigationResult, *, domain: str) -> InvestigationResult:
+    """Score the domain and each of its addresses, separately and never merged.
+
+    A phishing kit on a CDN is a ``MALICIOUS`` domain on a ``KNOWN_INFRASTRUCTURE`` address and
+    both are true. Merging the two either indicts every other tenant behind that address or
+    clears the phishing kit, so the domain verdict lands on ``data['verdict']`` and each
+    address verdict lands on its own entry in ``data['ips']``.
+    """
+    tools, reason = _adjudicator()
+    if tools is None:
+        _record_verdict_failure(result, reason or "the verdict engine is unavailable")
+        return result
+
+    ip_verdicts: List[Verdict] = []
+    try:
+        verdict = verdict_engine.evaluate_domain_intel(result.data, cfg=tools.cfg, now=tools.now)
+        for entry in result.data.get("ips") or []:
+            if not isinstance(entry, dict):
+                continue
+            address = str(entry.get("ip") or "")
+            if not address:
+                continue
+            address_verdict = _ip_verdict(entry, ip=address, tools=tools)
+            entry["verdict"] = address_verdict.to_json_dict()
+            ip_verdicts.append(address_verdict)
+    except Exception as exc:  # noqa: BLE001 - a scoring fault must not lose the collection
+        log["error"]("Verdict computation failed", target=domain, error=f"{type(exc).__name__}: {exc}")
+        _record_verdict_failure(result, f"the scoring engine raised {type(exc).__name__}: {exc}")
+        return result
+    return _attach_verdicts(result, verdict=verdict, ip_verdicts=ip_verdicts)
+
+
+# --------------------------------------------------------------------------------------
 # Target guards
 # --------------------------------------------------------------------------------------
 
@@ -700,13 +908,16 @@ async def _investigate_ip(ip: str) -> InvestigationResult:
         if provider_errors:
             data["errors"] = provider_errors
 
-        return _finalise(
+        result = _finalise(
             data,
             target=ip,
             run=current_run(),
             errors=result_errors,
             expected=IP_PROVIDERS,
         )
+    # Outside the client block on purpose: adjudication is pure computation over what was
+    # already collected, and holding an HTTP client open across it would suggest otherwise.
+    return _adjudicate_ip(result, ip=ip)
 
 
 # --------------------------------------------------------------------------------------
@@ -881,7 +1092,7 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
     if domain_errors:
         data["domain_errors"] = domain_errors
 
-    return _finalise(
+    result = _finalise(
         data,
         target=domain,
         run=current_run(),
@@ -890,6 +1101,7 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
         domain_expected=DOMAIN_PROVIDERS,
         skipped_addresses=skipped,
     )
+    return _adjudicate_domain(result, domain=domain)
 
 
 # --------------------------------------------------------------------------------------

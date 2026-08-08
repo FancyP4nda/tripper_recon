@@ -26,6 +26,7 @@ output reads as a clean indicator. The tests below assert the three properties t
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 import sys
 from collections.abc import Callable
@@ -44,8 +45,24 @@ from tripper_recon.reporting.console import (
     render_ip_analysis,
     render_run_header,
     render_skipped_ips,
+    render_verdict,
+    render_verdict_explanation,
+    render_verdict_unavailable,
     render_warnings,
     summarize_coverage,
+    verdict_from_payload,
+)
+from tripper_recon.types.models import Coverage
+from tripper_recon.verdict.models import (
+    AllowlistProvenance,
+    Confidence,
+    ConfidenceCriterion,
+    Contradiction,
+    OverrideApplied,
+    Signal,
+    SignalDirection,
+    Verdict,
+    VerdictLabel,
 )
 
 # ANSI SGR fragments rich emits for the named colours used by this module.
@@ -1388,3 +1405,683 @@ def test_coverage_and_run_contract_against_the_real_models() -> None:
     assert "run 20260808T120000Z-abcd1234" in out
     for missing in coverage.missing:
         assert missing in out
+
+
+# --------------------------------------------------------------------------------------------
+# W5.8 — the verdict block: the answer first, in words
+#
+# The measured failure this section locks out: `rich` strips every ANSI sequence the moment
+# stdout is not a terminal (verification probe R5), which is exactly the
+# `tripper-recon ip X > incident.md` workflow the tool exists to feed. A renderer whose only
+# malice signal is colour says nothing at all on that path. Every assertion below therefore runs
+# through the shared `render` fixture, which is a NON-terminal console with colour off — if a
+# fact is only visible in colour, these tests do not see it either.
+#
+# The second rule under test is the one the whole workstream defends: absent data never scores
+# as clean. A verdict that cannot be read back, a verdict the engine failed to produce, and a
+# verdict with LOW confidence all have to be visibly different from a clean answer.
+# --------------------------------------------------------------------------------------------
+
+EVALUATED_AT = dt.datetime(2026, 8, 8, 14, 3, 11, tzinfo=dt.timezone.utc)
+
+#: A coverage figure below the 0.5 floor: the realistic two-of-six run.
+TWO_OF_SIX_COVERAGE = Coverage(
+    answered=["virustotal", "abuseipdb"],
+    errored=["shodan"],
+    unconfigured=["ipinfo", "otx"],
+    skipped=["cloudflare_asn"],
+)
+
+FULL_COVERAGE = Coverage(answered=["virustotal", "abuseipdb", "otx", "shodan", "ipinfo", "cloudflare_asn"])
+
+
+def _signal(**overrides: Any) -> Signal:
+    """One scored signal in the shape ``verdict.signals`` extractors emit."""
+    fields: dict[str, Any] = {
+        "id": "vt.weighted_detections",
+        "provider": "virustotal",
+        "family": "multiscanner",
+        "direction": SignalDirection.ADVERSE,
+        "magnitude": 0.4,
+        "points": 14.0,
+        "max_points": 35.0,
+        "observation": "VirusTotal: 5 of 91 engines adverse; weighted 2.10 of 8.00",
+        "evidence": {"adverse_engine_count": 5, "total_engines": 91},
+        "weight_source": "package:tripper_recon.verdict/scoring.yaml#signals.vt.weighted_detections",
+        "observed_at": "2026-08-01T00:00:00+00:00",
+    }
+    fields.update(overrides)
+    return Signal(**fields)
+
+
+def _verdict(**overrides: Any) -> Verdict:
+    """A verdict in the shape the engine emits. Every structural rule is still enforced."""
+    fields: dict[str, Any] = {
+        "indicator": IP,
+        "indicator_type": "ip",
+        "verdict": VerdictLabel.SUSPICIOUS,
+        "score": 71,
+        "raw_score": 71.5,
+        "score_band": VerdictLabel.MALICIOUS,
+        "adjusted_from": VerdictLabel.MALICIOUS,
+        "adjustment_reasons": ["demoted from MALICIOUS: coverage below the 0.5 floor"],
+        "confidence": Confidence.LOW,
+        "confidence_score": 0.25,
+        "coverage": TWO_OF_SIX_COVERAGE,
+        "coverage_floor": 0.5,
+        "corroborating_families": ["multiscanner"],
+        "signals": [_signal()],
+        "summary": f"{IP}: SUSPICIOUS -- score 71/100, confidence LOW, 2 of 6 providers answered",
+        "rationale": ["score 71 of 100 falls in the MALICIOUS band"],
+        "ruleset_version": "0.1.0-draft",
+        "ruleset_source": "package:tripper_recon.verdict/scoring.yaml",
+        "calibration_statement": "Heuristic. Informed priors, not measurements; no held-out evaluation has been run.",
+        "engine_version": "1.0.0",
+        "evaluated_at": EVALUATED_AT,
+    }
+    fields.update(overrides)
+    return Verdict(**fields)
+
+
+# --- the word, not the colour ----------------------------------------------------------------
+
+
+def test_the_verdict_word_survives_output_being_redirected(render: Callable[..., str]) -> None:
+    """The whole point of 5.8. Non-terminal, colour stripped, and the answer is still readable."""
+    out = render(render_verdict(_verdict()))
+
+    assert "VERDICT: SUSPICIOUS" in out
+
+
+def test_the_verdict_is_the_first_line_of_its_block(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict()))
+
+    assert out.strip().splitlines()[0].startswith("VERDICT: SUSPICIOUS")
+
+
+@pytest.mark.parametrize(
+    "label,extra",
+    [
+        (VerdictLabel.MALICIOUS, {"confidence": Confidence.HIGH, "coverage": FULL_COVERAGE}),
+        (VerdictLabel.SUSPICIOUS, {}),
+        (VerdictLabel.INSUFFICIENT_DATA, {}),
+    ],
+)
+def test_every_verdict_label_is_spelled_out_in_text(
+    render: Callable[..., str], label: VerdictLabel, extra: dict[str, Any]
+) -> None:
+    out = render(render_verdict(_verdict(verdict=label, **extra)))
+
+    assert f"VERDICT: {label.value}" in out
+
+
+def test_colour_reinforces_the_word_and_does_not_carry_it() -> None:
+    """With colour on, MALICIOUS is red. With colour off, it is still the word MALICIOUS."""
+    verdict = _verdict(verdict=VerdictLabel.MALICIOUS, confidence=Confidence.HIGH, coverage=FULL_COVERAGE)
+
+    coloured = _ansi(render_verdict(verdict))
+    plain = _plain(render_verdict(verdict))
+
+    assert RED_BOLD in coloured
+    assert "VERDICT: MALICIOUS" in coloured
+    assert "\x1b[" not in plain
+    assert "VERDICT: MALICIOUS" in plain
+
+
+def test_insufficient_data_never_renders_in_the_clean_colour() -> None:
+    """Not knowing must not look like having looked and found nothing."""
+    out = _ansi(render_verdict(_verdict(verdict=VerdictLabel.INSUFFICIENT_DATA)))
+
+    assert GREEN not in out and GREEN_BOLD not in out
+    assert YELLOW_BOLD in out
+
+
+def test_an_unknown_verdict_label_is_not_dressed_up_as_clean() -> None:
+    """A label this renderer has no style for falls back to the warning colour, never green."""
+    from tripper_recon.reporting.console import _VERDICT_STYLE_UNKNOWN, _VERDICT_STYLES
+
+    assert _VERDICT_STYLE_UNKNOWN == "bold yellow"
+    assert set(_VERDICT_STYLES) == {label.value for label in VerdictLabel}
+    assert "green" not in _VERDICT_STYLES[VerdictLabel.INSUFFICIENT_DATA.value]
+    assert "green" not in _VERDICT_STYLES[VerdictLabel.SUSPICIOUS.value]
+
+
+# --- the second axis, and the coverage behind it ----------------------------------------------
+
+
+def test_score_confidence_and_coverage_share_the_headline(render: Callable[..., str]) -> None:
+    """Score 71 at LOW confidence on 2 of 6 providers is one fact and has to be read as one."""
+    out = render(render_verdict(_verdict()))
+    banner = out.strip().splitlines()[0]
+
+    assert "score 71" in banner
+    assert "raw 71.5" in banner
+    assert "confidence LOW" in banner
+    assert "2 of 6 providers answered" in banner
+
+
+def test_the_providers_that_did_not_answer_are_named(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict()))
+
+    for name in TWO_OF_SIX_COVERAGE.missing:
+        assert name in out
+    assert "not answered:" in out
+
+
+def test_raw_score_is_shown_so_clamp_saturation_stays_visible(render: Callable[..., str]) -> None:
+    """140 points and 100 points are different findings that clamp to the same score."""
+    out = render(render_verdict(_verdict(score=100, raw_score=143.2)))
+
+    assert "score 100" in out and "raw 143.2" in out
+
+
+def test_adjustments_are_marked_and_explained(render: Callable[..., str]) -> None:
+    """Where the tool overruled its own arithmetic, an analyst has to see it before the evidence."""
+    out = render(render_verdict(_verdict()))
+
+    assert "! demoted from MALICIOUS: coverage below the 0.5 floor" in out
+    assert out.index("! demoted from MALICIOUS") < out.index("why:")
+
+
+# --- the evidence ------------------------------------------------------------------------------
+
+
+def test_the_signals_that_justify_the_verdict_are_shown_with_their_evidence(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict()))
+
+    assert "why:" in out
+    assert "vt.weighted_detections" in out
+    assert "5 of 91 engines adverse" in out
+    assert "+14.0 of 35.0" in out
+
+
+def test_only_the_top_signals_are_shown_and_the_remainder_is_counted(render: Callable[..., str]) -> None:
+    signals = [_signal(id=f"signal.{index}", points=float(10 - index), max_points=20.0) for index in range(6)]
+    out = render(render_verdict(_verdict(signals=signals)))
+
+    assert "signal.0" in out and "signal.2" in out
+    assert "signal.5" not in out
+    assert "and 3 more scoring signal(s)" in out
+    assert "--explain" in out
+
+
+def test_signals_are_ordered_by_contribution(render: Callable[..., str]) -> None:
+    signals = [
+        _signal(id="small", points=1.0, max_points=20.0),
+        _signal(id="large", points=19.0, max_points=20.0),
+    ]
+    out = render(render_verdict(_verdict(signals=signals)))
+
+    assert out.index("large") < out.index("small")
+
+
+def test_an_affirmative_negative_is_shown_as_the_justification(render: Callable[..., str]) -> None:
+    """A clean verdict has to show WHY it is clean, and the reason is a provider that answered."""
+    clean = _signal(
+        id="vt.no_detections",
+        direction=SignalDirection.EXCULPATORY,
+        magnitude=0.0,
+        points=0.0,
+        max_points=0.0,
+        observation="VirusTotal: 0 of 94 engines flagged this indicator. An answer, not an absence",
+    )
+    out = render(
+        render_verdict(
+            _verdict(
+                verdict=VerdictLabel.NO_ADVERSE_FINDINGS,
+                score=0,
+                raw_score=0.0,
+                score_band=VerdictLabel.NO_ADVERSE_FINDINGS,
+                adjusted_from=None,
+                adjustment_reasons=[],
+                confidence=Confidence.MEDIUM,
+                coverage=FULL_COVERAGE,
+                signals=[clean],
+            )
+        )
+    )
+
+    assert "VERDICT: NO_ADVERSE_FINDINGS" in out
+    assert "An answer, not an absence" in out
+
+
+# --- contradictions, surfaced and never averaged -----------------------------------------------
+
+
+def test_contradictions_are_named_with_what_to_do_about_them(render: Callable[..., str]) -> None:
+    contradiction = Contradiction(
+        rule_id="vt_vs_abuseipdb",
+        summary="VirusTotal reports 5 detections while AbuseIPDB holds 0% confidence over 3 reports",
+        left="vt.weighted_detections",
+        right="abuseipdb.confidence",
+        analyst_hint="Check whether the VT hits are generic-heuristic",
+        both_material=True,
+    )
+    out = render(render_verdict(_verdict(contradictions=[contradiction], requires_analyst_review=True)))
+
+    assert "contradictions (1)" in out
+    assert "vt_vs_abuseipdb" in out
+    assert "while AbuseIPDB holds 0% confidence" in out
+    assert "what to do: Check whether the VT hits are generic-heuristic" in out
+
+
+def test_the_review_flag_is_prominent_and_readable_without_colour(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict(requires_analyst_review=True)))
+
+    assert "ANALYST REVIEW REQUIRED" in out
+
+
+def test_no_review_flag_when_none_is_set(render: Callable[..., str]) -> None:
+    assert "ANALYST REVIEW REQUIRED" not in render(render_verdict(_verdict()))
+
+
+def test_the_attribution_warning_reaches_the_screen(render: Callable[..., str]) -> None:
+    warning = "This address is shared CDN infrastructure; detections describe the tenant, not the address"
+    out = render(render_verdict(_verdict(attribution_warning=warning)))
+
+    assert warning in out
+
+
+# --- collection mode and provenance -------------------------------------------------------------
+
+
+def test_passive_collection_is_stated_explicitly(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict()))
+
+    assert "collection: passive only" in out
+
+
+def test_active_collection_is_named_not_merely_flagged(render: Callable[..., str]) -> None:
+    """A verdict built partly on active collection is a different artefact and has to say so."""
+    out = render(render_verdict(_verdict(passive_only=False, active_collection=["system_dns_resolution"])))
+
+    assert "ACTIVE COLLECTION contributed: system_dns_resolution" in out
+    assert "passive only" not in out
+
+
+def test_the_ruleset_version_and_source_travel_with_the_verdict(render: Callable[..., str]) -> None:
+    """A verdict in a six-month-old ticket stays interpretable only if it says what scored it."""
+    out = render(render_verdict(_verdict()))
+
+    assert "ruleset 0.1.0-draft" in out
+    assert "package:tripper_recon.verdict/scoring.yaml" in out
+    assert "engine 1.0.0" in out
+    assert "2026-08-08T14:03:11Z" in out
+
+
+def test_a_stale_allowlist_is_visible(render: Callable[..., str]) -> None:
+    allowlist = AllowlistProvenance(
+        list_version="2025-01-01.1",
+        list_retrieved="2025-01-01",
+        stale=True,
+        staleness_note="catalogue retrieved 2025-01-01, 585 days old (refresh age 180)",
+    )
+    out = render(render_verdict(_verdict(allowlist=allowlist)))
+
+    assert "allowlist 2025-01-01.1 retrieved 2025-01-01" in out
+    assert "585 days old" in out
+
+
+def test_the_calibration_statement_appears_at_least_once(render: Callable[..., str]) -> None:
+    """No accuracy claim exists, and the artefact has to carry that on its face."""
+    out = render(render_verdict(_verdict()))
+
+    assert "calibration:" in out
+    assert "no held-out evaluation has been run" in out
+
+
+def test_calibration_can_be_suppressed_for_a_nested_panel(render: Callable[..., str]) -> None:
+    out = render(render_verdict(_verdict(), show_calibration=False))
+
+    assert "calibration:" not in out
+    assert "VERDICT: SUSPICIOUS" in out
+
+
+# --- the failure cases: absent is never clean -----------------------------------------------------
+
+
+def test_no_verdict_renders_nothing_rather_than_a_clean_word() -> None:
+    """A caller with no verdict at all has made no claim, and must not appear to have made one."""
+    assert render_verdict(None) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"verdict": "MALICIOUS"},
+        {"not": "a verdict"},
+        "MALICIOUS",
+        42,
+        [],
+    ],
+)
+def test_an_unreadable_verdict_says_not_computed(render: Callable[..., str], payload: Any) -> None:
+    """A truncated or hand-edited payload must not print a verdict word it cannot substantiate."""
+    out = render(render_verdict(payload))
+
+    assert "VERDICT: NOT COMPUTED" in out
+    assert "absence of a verdict is not a clean verdict" in out
+
+
+def test_the_not_computed_banner_names_the_reason(render: Callable[..., str]) -> None:
+    out = render(render_verdict_unavailable("scoring configuration could not be loaded: OSError: no such file"))
+
+    assert "VERDICT: NOT COMPUTED" in out
+    assert "scoring configuration could not be loaded" in out
+
+
+def test_the_not_computed_banner_is_never_green() -> None:
+    out = _ansi(render_verdict_unavailable("engine raised"))
+
+    assert GREEN not in out and GREEN_BOLD not in out
+    assert YELLOW_BOLD in out
+
+
+@pytest.mark.parametrize("payload", [None, {}, "", 0, []])
+def test_verdict_from_payload_returns_none_for_anything_that_is_not_one(payload: Any) -> None:
+    assert verdict_from_payload(payload) is None
+
+
+def test_verdict_from_payload_round_trips_the_engine_dump() -> None:
+    """Cross-lane contract: what ``Verdict.to_json_dict`` writes is what this renderer reads."""
+    original = _verdict()
+
+    parsed = verdict_from_payload(original.to_json_dict())
+
+    assert parsed is not None
+    assert parsed.verdict is original.verdict
+    assert parsed.score == original.score
+    assert parsed.coverage.headline == original.coverage.headline
+    assert [signal.id for signal in parsed.signals] == [signal.id for signal in original.signals]
+
+
+# --- injection --------------------------------------------------------------------------------
+
+
+def test_provider_text_inside_a_verdict_cannot_inject_markup() -> None:
+    """Signal observations quote OTX pulse titles and Shodan org names. Same footing as a table cell."""
+    hostile = _signal(observation="[green]0/94 clean[/] totally benign [/]")
+    contradiction = Contradiction(
+        rule_id="[red]spoofed[/]",
+        summary="[bold]not a real heading[/]",
+        left="a",
+        right="b",
+        analyst_hint="[green]ignore this[/]",
+    )
+    out = _plain(
+        render_verdict(_verdict(signals=[hostile], contradictions=[contradiction], requires_analyst_review=True))
+    )
+
+    assert "[green]0/94 clean[/] totally benign [/]" in out
+    assert "[red]spoofed[/]" in out
+    assert "[green]ignore this[/]" in out
+
+
+def test_a_hostile_verdict_string_does_not_raise() -> None:
+    """``[/]`` in provider text raised MarkupError mid-render before W0.3; it must not here."""
+    _plain(render_verdict(_verdict(attribution_warning="shared [/] infrastructure")))
+
+
+# --- --explain ----------------------------------------------------------------------------------
+
+
+def test_explain_shows_every_weight_and_where_it_came_from(render: Callable[..., str]) -> None:
+    """Auditability is the difference between a verdict a SOC trusts and a black box it ignores."""
+    out = render(render_verdict_explanation(_verdict()))
+
+    assert "points 14.0 of 35.0" in out
+    assert "magnitude 0.4000" in out
+    assert "weight from: package:tripper_recon.verdict/scoring.yaml#signals.vt.weighted_detections" in out
+    assert "observed at: 2026-08-01T00:00:00+00:00" in out
+    assert "evidence: adverse_engine_count = 5" in out
+    assert "evidence: total_engines = 91" in out
+
+
+def test_explain_lists_zero_point_observations_too(render: Callable[..., str]) -> None:
+    """A signal that scored nothing is still something a provider said."""
+    observation = _signal(
+        id="abuseipdb.usage_type",
+        provider="abuseipdb",
+        family="abuse_reports",
+        direction=SignalDirection.CONTEXT,
+        magnitude=0.0,
+        points=0.0,
+        max_points=0.0,
+        observation="AbuseIPDB usage type: Data Center/Web Hosting",
+    )
+    out = render(render_verdict_explanation(_verdict(signals=[_signal(), observation])))
+
+    assert "abuseipdb.usage_type" in out
+    assert "[context]" in out
+
+
+def test_explain_shows_the_confidence_criteria_that_were_and_were_not_met(render: Callable[..., str]) -> None:
+    criteria = [
+        ConfidenceCriterion(name="coverage_floor", met=False, detail="ratio 0.3333 against floor 0.5"),
+        ConfidenceCriterion(name="decisive_signal", met=True, detail="1 signal at or above 0.8 of its ceiling"),
+    ]
+    out = render(render_verdict_explanation(_verdict(confidence_criteria=criteria)))
+
+    assert "[ ] coverage_floor: ratio 0.3333 against floor 0.5" in out
+    assert "[x] decisive_signal: 1 signal at or above 0.8 of its ceiling" in out
+
+
+def test_explain_records_the_overrides_that_actually_fired(render: Callable[..., str]) -> None:
+    override = OverrideApplied(
+        rule_id="cdn.cloudflare",
+        tier="B",
+        effect="verdict_capped",
+        source_list="known_infrastructure.yaml",
+        source_retrieved_at="2026-08-08",
+        note="shared infrastructure",
+    )
+    out = render(render_verdict_explanation(_verdict(overrides_applied=[override])))
+
+    assert "cdn.cloudflare: tier B, effect verdict_capped" in out
+    assert "retrieved 2026-08-08" in out
+    assert "shared infrastructure" in out
+
+
+def test_explain_reproduces_the_full_ordered_rationale(render: Callable[..., str]) -> None:
+    out = render(render_verdict_explanation(_verdict(rationale=["first reason", "second reason"])))
+
+    assert out.index("first reason") < out.index("second reason")
+
+
+def test_explain_says_so_when_no_signal_was_extracted(render: Callable[..., str]) -> None:
+    out = render(render_verdict_explanation(_verdict(signals=[], score=0, raw_score=0.0)))
+
+    assert "nothing scored either way" in out
+
+
+def test_explain_is_off_by_default_and_on_with_the_flag(render: Callable[..., str]) -> None:
+    assert "verdict explanation" not in render(render_verdict(_verdict()))
+    assert "verdict explanation" in render(render_verdict(_verdict(), explain=True))
+
+
+# --- wiring into the IP panel --------------------------------------------------------------------
+
+
+def _ip_data_with_verdict(**overrides: Any) -> dict[str, Any]:
+    data = _ip_data(provider_status=TWO_OF_SIX, virustotal={"vt_last_analysis_stats": REAL_DIRTY_STATS})
+    data["verdict"] = _verdict().to_json_dict()
+    data.update(overrides)
+    return data
+
+
+def test_the_ip_panel_leads_with_the_verdict(render: Callable[..., str]) -> None:
+    """Line one is the answer. An analyst under time pressure reads line one."""
+    out = render(render_ip_analysis(IP, _ip_data_with_verdict()))
+
+    assert "VERDICT: SUSPICIOUS" in out
+    assert out.index("VERDICT: SUSPICIOUS") < out.index("provider_coverage")
+    assert out.index("VERDICT: SUSPICIOUS") < out.index("virustotal_detections")
+
+
+def test_the_ip_panel_still_renders_without_a_verdict(render: Callable[..., str]) -> None:
+    """Payloads that predate the engine, and every stubbed caller, must keep working."""
+    out = render(render_ip_analysis(IP, _ip_data(provider_status=TWO_OF_SIX)))
+
+    assert "VERDICT" not in out
+    assert "provider_coverage" in out
+
+
+def test_a_verdict_the_engine_could_not_compute_is_stated_on_the_panel(render: Callable[..., str]) -> None:
+    data = _ip_data(provider_status=TWO_OF_SIX)
+    data["verdict_error"] = "the scoring engine raised KeyError: 'signals'"
+
+    out = render(render_ip_analysis(IP, data))
+
+    assert "VERDICT: NOT COMPUTED" in out
+    assert "the scoring engine raised KeyError" in out
+
+
+def test_the_panel_explains_itself_when_asked(render: Callable[..., str]) -> None:
+    out = render(render_ip_analysis(IP, _ip_data_with_verdict(), explain=True))
+
+    assert "verdict explanation (--explain)" in out
+    assert "weight from:" in out
+
+
+def test_a_nested_panel_does_not_repeat_the_calibration_statement(render: Callable[..., str]) -> None:
+    """The domain header already printed it; three sentences per address teaches the eye to skip."""
+    top = render(render_ip_analysis(IP, _ip_data_with_verdict()))
+    nested = render(render_ip_analysis(IP, _ip_data_with_verdict(), show_run_line=False))
+
+    assert "calibration:" in top
+    assert "calibration:" not in nested
+    assert "VERDICT: SUSPICIOUS" in nested
+
+
+def test_the_domain_header_carries_the_domain_s_own_verdict(render: Callable[..., str]) -> None:
+    """The domain and its addresses are scored separately and must never be merged on screen."""
+    domain_verdict = _verdict(
+        indicator="evil.example",
+        indicator_type="domain",
+        verdict=VerdictLabel.MALICIOUS,
+        confidence=Confidence.HIGH,
+        coverage=FULL_COVERAGE,
+    )
+    out = render(
+        render_domain_header(
+            "evil.example",
+            coverage=TWO_OF_SIX,
+            verdict=domain_verdict.to_json_dict(),
+        )
+    )
+
+    assert "VERDICT: MALICIOUS" in out
+    assert out.index("VERDICT: MALICIOUS") < out.index("provider_coverage")
+
+
+def test_the_domain_header_without_a_verdict_is_unchanged(render: Callable[..., str]) -> None:
+    out = render(render_domain_header("example.com", coverage=TWO_OF_SIX))
+
+    assert "VERDICT" not in out
+    assert "provider_coverage" in out
+
+
+# --- geolocation below the fold --------------------------------------------------------------
+
+
+def test_geolocation_sits_below_the_evidence_it_used_to_outrank(render: Callable[..., str]) -> None:
+    """``postal_code`` two rows above ``virustotal_detections`` taught the eye they weigh the same."""
+    data = _ip_data(
+        provider_status=_status(virustotal="ok"),
+        virustotal={"vt_last_analysis_stats": REAL_DIRTY_STATS},
+        ipinfo={"city": "Ashburn", "country": "US", "postal": "20147", "coordinates": {"lat": 39.0, "lon": -77.5}},
+    )
+    out = render(render_ip_analysis(IP, data))
+
+    assert out.index("virustotal_detections") < out.index("city")
+    assert out.index("virustotal_detections") < out.index("postal_code")
+    assert out.index("virustotal_detections") < out.index("coordinates")
+    assert out.index("abuseipdb_confidence_score") < out.index("country")
+
+
+def test_geolocation_is_labelled_as_context_not_evidence(render: Callable[..., str]) -> None:
+    data = _ip_data(provider_status=_status(virustotal="ok"), ipinfo={"city": "Ashburn"})
+
+    out = render(render_ip_analysis(IP, data))
+
+    assert "IPinfo registry data - context, not evidence" in out
+
+
+def test_no_geolocation_marker_when_ipinfo_supplied_nothing(render: Callable[..., str]) -> None:
+    out = render(render_ip_analysis(IP, _ip_data(provider_status=_status(virustotal="ok"), ipinfo={})))
+
+    assert "geolocation" not in out
+
+
+def test_verdict_contract_against_the_real_engine(render: Callable[..., str]) -> None:
+    """Cross-lane contract: render what the engine actually emits, not a hand-built copy.
+
+    Everything else in this section builds a ``Verdict`` directly, which tests the renderer but
+    not the seam. This one runs the real ruleset, the real catalogue and the real extractors
+    over an orchestrator-shaped payload, serialises the result exactly as ``-o json`` does, and
+    renders it back. If a field is renamed, retyped or dropped upstream, this is where the
+    renderer finds out -- rather than an analyst finding a report with no answer on it.
+
+    No network, no credentials, no clock dependence beyond ``now``: the engine is pure and the
+    payload is a literal.
+    """
+    import json
+
+    from tripper_recon.types.models import Coverage as _Coverage
+    from tripper_recon.verdict import engine as engine_module
+    from tripper_recon.verdict.config import default_config
+    from tripper_recon.verdict.known_infrastructure import load_catalogue
+
+    expected = ("virustotal", "ipinfo", "shodan", "abuseipdb", "otx", "cloudflare_asn")
+    status = _status(virustotal="ok", shodan="error", ipinfo="not_configured")
+    entry: dict[str, Any] = {
+        "ip": "93.184.216.34",
+        "virustotal": {
+            "vt_last_analysis_stats": REAL_DIRTY_STATS,
+            "vt_reputation": -37,
+            "vt_last_analysis_date_iso": "2026-08-01T00:00:00+00:00",
+        },
+        "shodan": {},
+        "ipinfo": {},
+        "abuseipdb": {},
+        "otx": {},
+        "asn_meta": {},
+        "provider_status": status,
+        "coverage": _Coverage.from_status_map(status, expected=expected).model_dump(),
+    }
+    now = dt.datetime(2026, 8, 8, 14, 3, 11, tzinfo=dt.timezone.utc)
+    catalogue = load_catalogue()
+    verdict = engine_module.evaluate_ip_analysis(
+        entry,
+        cfg=default_config(),
+        now=now,
+        infrastructure=catalogue.evaluate(indicator=entry["ip"], indicator_type="ip", as_of=now.date()),
+    )
+
+    # Exactly the round trip `-o json` performs before a console in another process reads it.
+    entry["verdict"] = json.loads(json.dumps(verdict.to_json_dict()))
+    out = render(render_ip_analysis(entry["ip"], entry))
+
+    assert f"VERDICT: {verdict.verdict.value}" in out
+    assert verdict.confidence.value in out
+    assert verdict.coverage.headline in out
+    assert f"ruleset {verdict.ruleset_version}" in out
+    # The engine makes no accuracy claim, and the claim it does not make has to be on the page.
+    assert verdict.calibration_statement.split(".")[0] in out
+    # Absence still never reads as clean: three providers contributed nothing and are named.
+    for missing in verdict.coverage.missing:
+        assert missing in out
+
+
+def test_the_domain_header_states_a_verdict_the_engine_could_not_compute(render: Callable[..., str]) -> None:
+    """A domain report with no verdict line reads as a domain report with nothing to report."""
+    out = render(
+        render_domain_header(
+            "example.com",
+            coverage=TWO_OF_SIX,
+            verdict_error="scoring configuration could not be loaded: OSError: no such file",
+        )
+    )
+
+    assert "VERDICT: NOT COMPUTED" in out
+    assert "scoring configuration could not be loaded" in out

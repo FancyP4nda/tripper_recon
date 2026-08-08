@@ -1,0 +1,752 @@
+# tripper_recon verdict ruleset -- the packaged default.
+#
+# EVERY tunable in the verdict engine lives in this file. A scoring constant that appears in a
+# .py file is a defect (roadmap 5.2). The reason is not tidiness: a verdict pasted into a ticket
+# six months ago has to stay interpretable, and that is only possible if the numbers that
+# produced it are versioned data rather than a diff buried in a commit.
+#
+# Read `version:` below. It is stamped into every Verdict as `ruleset_version`. Change any number
+# in this file and you MUST bump it -- two verdicts produced by different tunings are different
+# claims and must not be comparable by accident.
+#
+# THE RULE THIS FILE DEFENDS: absent data never scores as clean. Nothing here can be set to make
+# a provider that failed, was rate-limited, or had no API key contribute toward a benign verdict.
+# Several validators in config.py exist purely to reject a configuration that would allow it;
+# they are documented at their check sites.
+#
+# Loading precedence (see config.py:load_scoring_config):
+#   1. an explicit path             -- `--scoring-config PATH`, then $TRIPPER_RECON_SCORING_CONFIG
+#   2. a user override location     -- $XDG_CONFIG_HOME/tripper_recon/scoring.yaml
+#                                      or ~/.config/tripper_recon/scoring.yaml
+#   3. this file, shipped in-package
+# Tier 3 must always work with no configuration at all. Keep it self-sufficient.
+
+version: "0.1.0-draft"
+ruleset_name: "tripper-recon-default"
+
+# ---------------------------------------------------------------------------------------------
+# Calibration honesty
+# ---------------------------------------------------------------------------------------------
+# Every weight below is an informed prior. None of them is a measurement. The loader REJECTS a
+# config that carries a precision or recall figure while `status` is `unvalidated`, because the
+# one thing this engine must never do is state an accuracy it has not earned.
+calibration:
+  status: unvalidated
+  fixture_count: 0
+  held_out: false
+  precision: null
+  recall: null
+  statement: >-
+    Heuristic. The weights, thresholds and decay constants in this ruleset are informed priors,
+    not measurements. No labelled corpus has been built and no held-out evaluation has been run,
+    so this ruleset carries no precision, recall or accuracy claim of any kind. Verdicts are
+    decision support for an analyst, never a decision.
+
+# ---------------------------------------------------------------------------------------------
+# Score arithmetic
+# ---------------------------------------------------------------------------------------------
+score:
+  # Points are summed, then clamped here. `raw_score` keeps the pre-clamp value so an analyst can
+  # see that a 140-point indicator saturated rather than merely reaching the ceiling.
+  clamp_max: 100
+  clamp_min: 0
+
+# ---------------------------------------------------------------------------------------------
+# Verdict bands -- the score-reachable labels only
+# ---------------------------------------------------------------------------------------------
+# Read as: the highest band whose `min_score` the clamped score reaches wins. Bands must be
+# strictly descending and the last one must sit at 0, so every possible score maps to exactly one
+# label with no gap and no overlap.
+#
+# INSUFFICIENT_DATA and KNOWN_INFRASTRUCTURE are deliberately ABSENT and the loader rejects them
+# here. Neither is reachable by scoring: INSUFFICIENT_DATA comes from the coverage floor, and
+# KNOWN_INFRASTRUCTURE comes only from the Tier A allowlist. The engine can earn its way up to
+# MALICIOUS; it can never earn its way down to safe.
+#
+# NO_ADVERSE_FINDINGS is the floor band, and reaching it is NOT sufficient on its own -- see
+# `require_affirmative_negative` below.
+bands:
+  # 70 is deliberately above the largest single signal at full saturation (vt.weighted_detections,
+  # 35 points). No one provider family can reach MALICIOUS alone; corroboration is structural
+  # rather than advisory. `require_corroboration_for_malicious` turns that into a hard validator.
+  - label: MALICIOUS
+    min_score: 70
+  # 35 is one maximal single signal. Read it as: "one family, at full strength, and nothing else"
+  # is exactly the evidence that deserves a look but not a block.
+  - label: SUSPICIOUS
+    min_score: 35
+  - label: NO_ADVERSE_FINDINGS
+    min_score: 0
+
+verdict_rules:
+  # Enforces "absent data never scores as clean": a zero score alone does NOT yield
+  # NO_ADVERSE_FINDINGS. Coverage must clear `confidence.coverage_floor` AND at least one
+  # provider must have returned an affirmative negative ("VT holds a record and 0 of 94 engines
+  # flag it"), not merely have failed to answer. Below the floor, the verdict is INSUFFICIENT_DATA.
+  # The loader rejects `false`. This is not a preference; it is the rule the whole workstream
+  # exists to enforce, and a config file must not be able to switch it off.
+  require_affirmative_negative: true
+
+  # No single signal may be worth enough to reach the MALICIOUS band by itself. Validated against
+  # the `signals` table at load time, so a well-meaning tuning bump to 70 fails loudly instead of
+  # quietly making one provider the whole engine.
+  require_corroboration_for_malicious: true
+
+  # A MALICIOUS score at LOW confidence renders as SUSPICIOUS with the raw score shown beside it,
+  # so the analyst sees the strength and the discount as separate facts (roadmap 5.4).
+  demote_malicious_when_confidence_low: true
+
+  # A signal marked `ceiling_only` may raise a verdict to this label at most, whatever its points.
+  # An exposed RDP box is a risk, not a threat.
+  ceiling_only_cap: SUSPICIOUS
+
+# ---------------------------------------------------------------------------------------------
+# Confidence -- a SEPARATE axis from score
+# ---------------------------------------------------------------------------------------------
+# Confidence answers "how much of the panel did we hear from, and did it agree", and is computed
+# without reference to the score. "High score, low confidence, 2 of 6 answered" is a real and
+# common state and must be expressible.
+confidence:
+  # THE COVERAGE FLOOR. Below this ratio, confidence is forced LOW regardless of every other
+  # input, and the verdict cannot be NO_ADVERSE_FINDINGS. Coverage is answered/applicable, where
+  # a provider with no API key counts in the denominator -- a missing key is missing coverage,
+  # not an excuse. Predicate: types.models.Coverage.is_sufficient(coverage_floor).
+  #
+  # 0.5 is the point at which the panel has been contradicted as often as it has been heard: with
+  # six applicable providers it demands three real answers. It is a floor, not a target.
+  coverage_floor: 0.5
+
+  high:
+    min_coverage: 0.8
+    # Distinct FAMILIES, never distinct providers (see provider_families). Two providers echoing
+    # the same upstream feed is one observation wearing two hats.
+    min_families: 2
+    # An unresolved contradiction caps confidence at MEDIUM. HIGH means the panel agreed.
+    allow_unresolved_contradiction: false
+
+  medium:
+    min_coverage: 0.5
+    min_families: 2
+    # One signal past its own decisiveness threshold substitutes for a second family. This is the
+    # "URLhaus says it is live C2" case: one source, but not a weak one.
+    decisive_signal_substitutes_for_family: true
+
+  # A signal contributing at least this fraction of its own max_points counts as decisive.
+  # 0.8 rather than 1.0 so a signal one point short of saturation is not treated as ordinary.
+  decisive_signal_fraction: 0.8
+
+# ---------------------------------------------------------------------------------------------
+# Recency decay profiles
+# ---------------------------------------------------------------------------------------------
+# Named profiles, referenced by the per-signal blocks below. A band with `max_age_days: null` is
+# the open-ended tail and must come last. Validators: ages strictly ascending, factors within
+# [0, 1] and NON-INCREASING -- older evidence may never weigh more than fresher evidence, and a
+# negative constant is rejected outright.
+#
+# Decay multiplies points. It never adds them, so decay can only ever move a score toward zero.
+decay_profiles:
+  # The default curve for community and reputation data. 90 days is roughly one campaign cycle;
+  # a year is the point past which an address has usually changed hands at least once.
+  standard:
+    - { max_age_days: 90, factor: 1.0 }
+    - { max_age_days: 365, factor: 0.6 }
+    - { max_age_days: null, factor: 0.25 }
+
+  # Abuse reports describe behaviour that was happening at a moment in time, so they go stale
+  # faster than a signature does. 30 days is the window in which "this host is attacking people"
+  # is still a present-tense claim.
+  fast:
+    - { max_age_days: 30, factor: 1.0 }
+    - { max_age_days: 180, factor: 0.5 }
+    - { max_age_days: null, factor: 0.15 }
+
+  # Multi-engine signature verdicts age slowly: a file hash that was malware in 2019 is still
+  # malware. What ages is the association between the malware and this address, which is why even
+  # this profile bottoms out well below 1.0 rather than staying flat.
+  slow:
+    - { max_age_days: 180, factor: 1.0 }
+    - { max_age_days: 730, factor: 0.8 }
+    - { max_age_days: null, factor: 0.5 }
+
+# What an observation is worth when the provider reported no date for it at all. This is a
+# DIFFERENT question from "how much is old evidence worth", which is what the profiles above
+# answer, and it has the opposite answer to the intuitive one.
+#
+# Decay multiplies SCORED signals, and every signal in the `signals:` table below is
+# adverse-capable. The affirmative negatives -- vt.no_detections, abuseipdb.no_reports,
+# otx.no_pulses -- carry zero points by construction and are not weighted here at all, so a decay
+# multiplier has nothing to reduce on the exculpatory side. A sub-1.0 undated factor can therefore
+# only ever move an indicator toward clean.
+#
+# Measured against the engine before this key existed: an AbuseIPDB payload of 100% confidence,
+# 500 reports and 40 distinct reporters scored 35 with `lastReportedAt` present and 5 with the
+# same field absent. Same finding from the same provider; a sevenfold collapse of adverse evidence
+# caused by one missing metadata field. That is the absent-data rule running backwards.
+#
+# 1.0 means a missing timestamp neither strengthens nor weakens what the provider reported. The
+# gap is not swallowed: the signal's observation string says the date was not reported, so the
+# analyst weighs the staleness the engine declines to invent.
+#
+# Lowering this below 1.0 is a deliberate decision to let absent metadata discount adverse
+# evidence. Bump `version:` if you do.
+undated_evidence:
+  factor: 1.0
+  note: >-
+    An observation with no date is not an old observation. Decay only ever reduces adverse
+    points, so discounting undated evidence would let a provider that omits a timestamp argue an
+    indicator clean. The missing date is reported to the analyst instead of being priced in.
+
+# ---------------------------------------------------------------------------------------------
+# Signals -- the weight table
+# ---------------------------------------------------------------------------------------------
+# `max_points` is the CEILING a signal may contribute. How it computes its way toward that ceiling
+# lives in the per-provider blocks further down, so tuning "how much does VT matter" and tuning
+# "how does VT count engines" are separate edits to separate keys.
+#
+# Every id here must be implemented by an extractor in the verdict package; the loader rejects an
+# unknown signal name. `providers` must all belong to the signal's declared `family`.
+signals:
+  vt.weighted_detections:
+    family: multiscanner
+    providers: [virustotal]
+    applies_to: [ip, domain]
+    max_points: 35
+    enabled: true
+    # Highest single weight: it is the only signal with dozens of semi-independent contributors,
+    # which is the closest thing in the panel to an actual sample. Weighted rather than raw --
+    # `5/94` is 94 measurements with a lossy aggregation applied, and five no-name engines and
+    # five major vendors are not the same evidence. Capped below the MALICIOUS band on purpose so
+    # it can never carry a block on its own.
+    notes: >-
+      Weighted per-engine detection ratio over vt_security_results, saturating at
+      virustotal.saturation weighted hits.
+
+  abuseipdb.confidence:
+    family: abuse_reports
+    providers: [abuseipdb]
+    applies_to: [ip]
+    max_points: 25
+    enabled: true
+    # Second-highest because it is behaviourally grounded -- somebody was actually attacked and
+    # said so -- rather than signature-derived, and the vendor's own confidence score already
+    # discounts single-reporter noise. Behaviour outranks signatures for an address; it is the
+    # other way round for a file.
+    notes: AbuseIPDB abuseConfidenceScore, decayed by lastReportedAt.
+
+  otx.pulse_quality:
+    family: community_ti
+    providers: [otx, otx_domain]
+    applies_to: [ip, domain]
+    max_points: 15
+    enabled: true
+    # Modest weight because OTX quality varies enormously and much of it re-ingests other feeds --
+    # counting a pulse that echoes VirusTotal as corroboration of VirusTotal is phantom
+    # confidence. The raw pulse count is not usable: fifty auto-generated clones from one bulk
+    # importer is one observation wearing a large number, which is why this signal consumes the
+    # quality-adjusted count from the `otx` block rather than otx_pulse_count.
+    notes: Author-diversity and recency adjusted effective pulse count.
+
+  domain.age:
+    family: multiscanner
+    providers: [virustotal]
+    applies_to: [domain]
+    max_points: 15
+    enabled: true
+    # The highest-value single domain signal in phishing triage, and the one an analyst is most
+    # likely to skip. Banded, not curved, because the operational meaning is discrete: "registered
+    # this week" is a different object from "registered last quarter". NEVER negative -- an old
+    # domain is not clean, it is compromise-eligible.
+    notes: Age bands from VT whois creation date; see the domain_age block.
+
+  abuseipdb.volume_recency:
+    family: abuse_reports
+    providers: [abuseipdb]
+    applies_to: [ip]
+    max_points: 10
+    enabled: true
+    # Small because it is largely redundant with abuseipdb.confidence. It exists to separate
+    # active from historical: 200 reports last week and 200 reports in 2019 are the same number
+    # and completely different findings. Reporter diversity is folded in here too -- one angry
+    # reporter filing 200 times is one observation.
+    notes: Report volume x reporter diversity x recency decay.
+
+  shodan.exposure:
+    family: exposure
+    providers: [shodan]
+    applies_to: [ip]
+    max_points: 10
+    enabled: true
+    ceiling_only: true
+    # CEILING-ONLY, and that flag matters more than the number. Exposed services describe what a
+    # host IS, not whether it is hostile. This signal may push NO_ADVERSE_FINDINGS to SUSPICIOUS;
+    # it may never contribute to a MALICIOUS verdict. Scoring an unpatched intranet box as
+    # malicious is how a tool teaches its analysts to ignore it.
+    notes: Risky exposed ports plus associated CVEs, decayed by Shodan last_update.
+
+  asn.reputation:
+    family: network_meta
+    providers: [ipinfo, cloudflare_asn, caida]
+    applies_to: [ip]
+    max_points: 10
+    enabled: true
+    # Deliberately small. Bulletproof-hosting ASNs are a genuine prior, but ASN-level
+    # guilt-by-association is exactly where naive scorers manufacture false positives -- a hosting
+    # ASN contains both the C2 and the victim. Note that `bulletproof_asns` ships EMPTY: there is
+    # no measured basis for a list, and an unsourced one is worse than none.
+    notes: >-
+      ASN-level prior. Contributes nothing until asn.bulletproof_asns is populated from a cited
+      source, by design.
+
+  vt.community_reputation:
+    family: multiscanner
+    providers: [virustotal]
+    applies_to: [ip, domain]
+    max_points: 5
+    enabled: true
+    # Directional colour only. Crowd-sourced, gameable, unversioned, and with no way to tell a
+    # researcher's downvote from a competitor's. Worth something; worth very little.
+    notes: VT community reputation score, negative values only.
+
+  asn.bgp_incidents:
+    family: network_meta
+    providers: [cloudflare_bgp]
+    applies_to: [ip]
+    max_points: 5
+    enabled: true
+    # Hijack/leak involvement AS HIJACKER is weak evidence of an ASN that tolerates abuse. Only
+    # the hijacker count may score. Counting victim involvement would penalise the party that was
+    # attacked, which inverts the signal completely.
+    notes: Cloudflare Radar BGP hijack events where this ASN was the hijacker.
+
+  vt.categories:
+    family: multiscanner
+    providers: [virustotal]
+    applies_to: [domain]
+    max_points: 10
+    enabled: true
+    # A direct adverse label from a named vendor, which is stronger evidence than an anonymous
+    # engine hit and weaker than a multi-vendor consensus. The matched category strings live in
+    # the `vt_categories` block so adding one is a config edit.
+    notes: Vendor categorisation matching an adverse category term.
+
+  cert.anomaly:
+    family: multiscanner
+    providers: [virustotal]
+    applies_to: [domain]
+    max_points: 10
+    enabled: true
+    # Composite, and each sub-check emits its own Signal so the console can name which one fired
+    # rather than reporting an unexplained ten points. Individually each sub-check is weak and
+    # has an innocent explanation; together they describe infrastructure stood up in a hurry.
+    notes: Certificate sub-checks; per-check points in the certificate block.
+
+  otx.malware_count:
+    family: community_ti
+    providers: [otx_domain]
+    applies_to: [domain]
+    max_points: 5
+    enabled: true
+    # Direct malware association, already collected on the domain path only. Small because the
+    # association is undated in the payload the tool retains, so it cannot be decayed and an old
+    # association would otherwise weigh like a current one.
+    notes: OTX malware sample count for the domain.
+
+# ---------------------------------------------------------------------------------------------
+# Provider families -- the independence model (roadmap 5.5)
+# ---------------------------------------------------------------------------------------------
+# Corroboration counts distinct FAMILIES, never distinct providers. VirusTotal and OTX both
+# re-ingest public feeds including abuse.ch, so treating them as two independent votes
+# manufactures confidence that the evidence does not support.
+#
+# Names are the orchestrator's own provider keys (orchestrators.IP_PROVIDERS / DOMAIN_PROVIDERS /
+# ASN_PROVIDERS), not display names, so a family map can be checked against what actually ran.
+provider_families:
+  multiscanner: [virustotal]
+  abuse_reports: [abuseipdb]
+  community_ti: [otx, otx_domain]
+  curated_feeds: [urlhaus, threatfox]
+  exposure: [shodan]
+  network_meta:
+    - ipinfo
+    - ipinfo_asn
+    - cloudflare_asn
+    - cloudflare_bgp
+    - caida
+    - peeringdb
+    - ripe_overview
+    - ripe_abuse
+    - ripe_routing_status
+    - ripe_neighbors
+    - ripe_prefixes
+    - ripe_neighbour_overview
+
+# Families that never count toward corroboration however many of their providers answer. Network
+# metadata is context, not evidence: knowing an address is in AS13335 tells you where it lives,
+# not what it did.
+non_corroborating_families: [network_meta]
+
+# ---------------------------------------------------------------------------------------------
+# Provider inventory
+# ---------------------------------------------------------------------------------------------
+# `implemented` are the providers that exist in tripper_recon/providers today. `planned` are
+# named in the design but not written. The loader uses this to catch DEAD CONFIG: an override or
+# escalation rule that depends on a planned-only provider must be `enabled: false`, so a rule
+# that can never fire cannot masquerade as an active control.
+providers:
+  implemented:
+    - virustotal
+    - ipinfo
+    - shodan
+    - abuseipdb
+    - otx
+    - otx_domain
+    - cloudflare_asn
+    - cloudflare_bgp
+    - ipinfo_asn
+    - caida
+    - peeringdb
+    - ripe_overview
+    - ripe_abuse
+    - ripe_routing_status
+    - ripe_neighbors
+    - ripe_prefixes
+    - ripe_neighbour_overview
+  planned:
+    - urlhaus
+    - threatfox
+    - urlscan
+
+# ---------------------------------------------------------------------------------------------
+# Per-signal computation blocks
+# ---------------------------------------------------------------------------------------------
+
+virustotal:
+  # weighted = SUM(w[engine] for malicious engines) + suspicious_multiplier * SUM(w[engine] for
+  # suspicious engines); points = max_points * min(1, weighted / saturation).
+  #
+  # 8.0 weighted hits for full marks: below that, a handful of engines agreeing is a lead rather
+  # than a finding; above it, the marginal 30th engine adds nothing an analyst acts on.
+  saturation: 8.0
+  # A "suspicious" category is a hedge, not a detection. Half credit.
+  suspicious_multiplier: 0.5
+  default_engine_weight: 1.0
+  # DELIBERATELY EMPTY, and it must stay empty until a corpus fills it. Engine-quality weighting
+  # comes from measurement or it does not exist: shipping an unsourced list of named vendors as
+  # "low quality" is both wrong and a liability. The MECHANISM is the deliverable here; the table
+  # is filled in by roadmap 5.9/5.10.
+  engine_weights: {}
+  # Also deliberately empty, same reason. When populated, a MALICIOUS verdict driven by VT alone
+  # requires at least one hit from this set. While it is empty the vt_consensus escalation rule
+  # below is inert, and the loader REQUIRES that rule to be disabled to say so out loud.
+  high_confidence_engines: []
+  consensus_threshold: 3
+  recency_profile: slow
+
+abuseipdb:
+  # Moved here from providers/abuseipdb.py, where it was a hard-coded `maxAgeInDays=365` query
+  # parameter. It is a scoring parameter wearing a provider-module costume: it decides how much
+  # history the confidence score reflects.
+  max_age_days: 365
+  # The vendor already returns 0-100. Anything at or above this is full marks; the vendor's own
+  # documentation treats scores below ~25 as noise, so the low end is not linear-worthy.
+  confidence_saturation: 75
+  # Below this the score is treated as no adverse signal at all rather than a small one.
+  confidence_floor: 25
+  # Report volume for full marks on abuseipdb.volume_recency.
+  volume_saturation: 25
+  # Distinct reporters for full marks. 200 reports from one reporter is one observation; this is
+  # the term that says so.
+  distinct_users_saturation: 5
+  # Weight split within abuseipdb.volume_recency between raw volume and reporter diversity.
+  # Diversity carries more because it is the harder thing to fake.
+  volume_weight: 0.4
+  diversity_weight: 0.6
+  recency_profile: fast
+
+otx:
+  # effective_pulses = SUM over pulses of author_factor * recency_factor * novelty_factor.
+  #
+  # harmonic: the n-th pulse from an author already counted contributes 1/n. The fifty
+  # auto-generated clones in ip_example.md collapse toward the weight of one, which is what they
+  # actually are.
+  author_diversity: harmonic
+  # A pulse whose title near-duplicates one already counted keeps only this fraction.
+  title_novelty_factor: 0.25
+  # Normalised token-overlap ratio at or above which two titles are treated as near-duplicates.
+  near_duplicate_ratio: 0.8
+  # An unattributed pulse must not silently count as its own author -- that is exactly the error
+  # a diversity weighting would then make. It is treated as a further pulse from one shared
+  # "unknown" author instead.
+  unattributed_author_key: "__unattributed__"
+  # Effective (not raw) pulses for full marks. Three genuinely independent, recent pulses is a
+  # strong community signal; the raw count needed to reach it is much larger.
+  effective_pulse_saturation: 3.0
+  recency_profile: standard
+
+shodan:
+  # Ports whose exposure is worth points. This list is exposure risk, not malice -- see the
+  # ceiling_only flag on shodan.exposure. Databases and remote-admin services only; a web server
+  # on 443 is not a finding.
+  risky_ports: [23, 445, 1433, 3306, 3389, 5432, 5900, 6379, 9200, 11211, 27017]
+  points_per_risky_port: 1.5
+  points_per_cve: 1.0
+  max_points_from_cves: 6.0
+  recency_profile: standard
+
+asn:
+  # DELIBERATELY EMPTY. Populating this from recollection or from a blog post would be inventing
+  # evidence: ASN reputation lists exist, they disagree with each other, and none of them is
+  # cited here. Until a sourced list is wired in with a retrieval timestamp, asn.reputation
+  # contributes zero, which is the honest value.
+  bulletproof_asns: []
+  points_if_bulletproof: 10.0
+  # Hijack events (as hijacker) for full marks on asn.bgp_incidents.
+  hijack_saturation: 3
+
+domain_age:
+  # Bands, not a curve. Ages ascending, points non-increasing, and never below zero -- an old
+  # domain earns no discount because compromised legitimate domains are the other half of
+  # phishing. A domain with no retrievable creation date scores `unknown_points`, NOT zero:
+  # absence of a whois date is absence of evidence and must not read as "safely old".
+  bands:
+    - { max_age_days: 7, points: 15 }
+    - { max_age_days: 30, points: 10 }
+    - { max_age_days: 90, points: 5 }
+    - { max_age_days: null, points: 0 }
+  unknown_points: 5
+
+vt_categories:
+  # Substring match, case-folded, against the vendor category strings VT returns. Kept short and
+  # unambiguous on purpose: "suspicious" and "parked" are excluded because both are routinely
+  # applied to benign infrastructure and would be a false-positive engine on their own.
+  adverse_terms: [malware, phishing, malicious, command and control, spam, botnet, cryptojacking]
+  points_per_term: 4.0
+
+certificate:
+  # Each sub-check emits its own Signal. The sum of these is validated at load time against
+  # signals[cert.anomaly].max_points, so a new sub-check cannot silently inflate the composite.
+  short_validity_days: 90
+  points_short_validity: 2.0
+  points_cn_mismatch: 4.0
+  points_self_signed: 3.0
+  points_expired_but_serving: 1.0
+
+# ---------------------------------------------------------------------------------------------
+# Overrides (roadmap 5.6)
+# ---------------------------------------------------------------------------------------------
+# Precedence, highest first. Tier A beats escalation deliberately: if a feed reports that a public
+# resolver is serving malware, the feed is wrong far more often than the resolver is compromised,
+# and an engine that flips on feed error is worse than one that is stubborn. But it is never
+# silent -- the conflict is emitted as a contradiction and sets requires_analyst_review.
+overrides:
+  precedence: [tier_a, escalation, tier_b, score]
+
+  # -- Tier A: absolute allowlist. The ONLY path to KNOWN_INFRASTRUCTURE. -------------------
+  # These addresses carry permanent nonzero VT and AbuseIPDB residue from DNS tunnelling and
+  # scanning reports. A tool that returns MALICIOUS for 1.1.1.1 even once is finished; the
+  # analyst stops believing every other verdict it ever produces.
+  #
+  # Note the asymmetry this encodes: an allowlist is the only thing that can produce a "this is
+  # fine" answer, and an allowlist is a human decision with a citation. Scoring cannot get there.
+  tier_a:
+    enabled: true
+    verdict: KNOWN_INFRASTRUCTURE
+    short_circuit: true
+    rules:
+      - id: allowlist.public_resolver.google
+        description: Google Public DNS anycast resolvers.
+        source: "https://developers.google.com/speed/public-dns/docs/using"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: ["8.8.8.8/32", "8.8.4.4/32", "2001:4860:4860::8888/128", "2001:4860:4860::8844/128"]
+      - id: allowlist.public_resolver.cloudflare
+        description: Cloudflare 1.1.1.1 public resolvers.
+        source: "https://developers.cloudflare.com/1.1.1.1/setup/"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: ["1.1.1.1/32", "1.0.0.1/32", "2606:4700:4700::1111/128", "2606:4700:4700::1001/128"]
+      - id: allowlist.public_resolver.quad9
+        description: Quad9 public resolvers.
+        source: "https://www.quad9.net/service/service-addresses-and-features"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: ["9.9.9.9/32", "149.112.112.112/32", "2620:fe::fe/128", "2620:fe::9/128"]
+      - id: allowlist.public_resolver.opendns
+        description: Cisco OpenDNS public resolvers.
+        source: "https://www.opendns.com/setupguide/"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: ["208.67.222.222/32", "208.67.220.220/32"]
+      # Root and TLD nameservers belong here and are NOT shipped. The root-servers.net addresses
+      # change, and a hard-coded copy that goes stale is its own defect class. Populate from
+      # https://www.iana.org/domains/root/servers with a retrieval timestamp, then enable.
+      - id: allowlist.root_nameservers
+        description: Root nameservers. Not populated -- fetch from IANA with a retrieval timestamp.
+        source: "https://www.iana.org/domains/root/servers"
+        source_retrieved_at: null
+        enabled: false
+        cidrs: []
+
+  # -- Tier B: CDN / cloud. CAP AND ANNOTATE. Does NOT force benign. ------------------------
+  # This is where naive engines get it wrong in both directions at once. A phishing kit on
+  # Cloudflare Pages is real and must still render red at the DOMAIN level; scoring the shared
+  # edge IP as malicious would indict every other tenant behind it. Both halves of that sentence
+  # are failure modes and only capping-with-annotation avoids both.
+  #
+  # The rules ship with EMPTY cidr lists on purpose. These ranges change weekly and each publisher
+  # offers a machine-readable endpoint; a hard-coded copy in this file would silently suppress a
+  # reassigned range and there would be no way to notice. The fetcher writes the ranges and the
+  # retrieval timestamp together, and the timestamp is stamped into every verdict that used them.
+  tier_b:
+    enabled: true
+    cap_verdict: SUSPICIOUS
+    # IP scope only. Domain-level and URL-level scoring are untouched, which is the whole point.
+    scopes_capped: [ip]
+    zero_signals: [asn.reputation, asn.bgp_incidents, shodan.exposure]
+    attribution_warning: >-
+      Shared infrastructure. This verdict does not transfer between the address and the domains
+      hosted on it -- do not block the address on the strength of a domain-level finding.
+    rules:
+      - id: cdn.cloudflare
+        description: Cloudflare edge ranges.
+        source: "https://www.cloudflare.com/ips-v4"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+      - id: cdn.aws
+        description: AWS public ranges.
+        source: "https://ip-ranges.amazonaws.com/ip-ranges.json"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+      - id: cdn.gcp
+        description: Google Cloud public ranges.
+        source: "https://www.gstatic.com/ipranges/cloud.json"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+      - id: cdn.azure
+        description: Azure service tag ranges.
+        source: "https://www.microsoft.com/en-us/download/details.aspx?id=56519"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+      - id: cdn.akamai
+        description: Akamai edge ranges.
+        source: "https://techdocs.akamai.com/property-mgr/docs/origin-ip-access-control-list"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+      - id: cdn.fastly
+        description: Fastly edge ranges.
+        source: "https://api.fastly.com/public-ip-list"
+        source_retrieved_at: null
+        enabled: true
+        cidrs: []
+
+  # -- Tier C: vendor-supplied suppression. Demotes, never short-circuits. ------------------
+  # A vendor saying "we consider this whitelisted" is worth something and is not worth a
+  # short-circuit: the vendor is one opinion, and this tier exists so that opinion is visible in
+  # the confidence rather than silently absent.
+  tier_c:
+    enabled: true
+    effect: demote_confidence
+    rules:
+      - id: vendor.abuseipdb_whitelisted
+        description: AbuseIPDB reports isWhitelisted true for this address.
+        provider: abuseipdb
+        # Key on the provider payload, so the extractor lane does not have to guess the spelling.
+        payload_key: abuseipdb_is_whitelisted
+        enabled: true
+      - id: vendor.abuseipdb_tor_exit
+        description: >-
+          AbuseIPDB reports isTor true. An exit node attracts reports as a property of being an
+          exit node; this does not exculpate, it reframes what the reports mean.
+        provider: abuseipdb
+        payload_key: abuseipdb_is_tor
+        enabled: true
+
+  # -- Escalation: forces MALICIOUS. ---------------------------------------------------------
+  escalation:
+    enabled: true
+    rules:
+      # DEAD CONFIG UNTIL THE PROVIDERS EXIST, and disabled so it cannot pretend otherwise.
+      # urlhaus and threatfox are in providers.planned, not providers.implemented; the loader
+      # rejects this rule being enabled while that is true.
+      - id: escalation.curated_feed_hit
+        description: >-
+          A live URLhaus or ThreatFox entry is a specific, current, actor-attributed observation
+          with a payload hash or a C2 role behind it. Nothing else in the panel carries that
+          quality of evidence.
+        enabled: false
+        requires_providers: [urlhaus, threatfox]
+        verdict: MALICIOUS
+        confidence: HIGH
+      # Also inert: virustotal.high_confidence_engines is empty, and the loader requires this
+      # rule to be disabled while it is. Enable it in the same commit that populates the list
+      # from the corpus.
+      - id: escalation.vt_consensus
+        description: >-
+          At least `virustotal.consensus_threshold` high-confidence engines flagged the
+          indicator.
+        enabled: false
+        requires_providers: [virustotal]
+        requires_high_confidence_engines: true
+        verdict: MALICIOUS
+        confidence: HIGH
+      - id: escalation.multi_family_corroboration
+        description: >-
+          Adverse signals from at least `min_families` independent provider families, each above
+          its own decisiveness threshold. Corroboration across independent families is the one
+          thing a six-provider panel buys that no single provider can.
+        enabled: true
+        requires_providers: []
+        min_families: 3
+        verdict: MALICIOUS
+        confidence: HIGH
+
+# ---------------------------------------------------------------------------------------------
+# Contradictions (roadmap 5.7)
+# ---------------------------------------------------------------------------------------------
+# Surfaced, never averaged. A contradiction NEVER cancels points -- the score keeps its full raw
+# value and the disagreement is expressed in the confidence and the review flag. Cancelling would
+# reproduce the averaging failure in slower motion: averaging VT 5/91 with AbuseIPDB 0% produces
+# a number that describes neither.
+contradictions:
+  enabled: true
+  # Any unresolved contradiction caps confidence here.
+  cap_confidence: MEDIUM
+  # When BOTH sides are above their own high-materiality threshold, the verdict drops one band
+  # and the analyst is told to look.
+  demote_verdict_when_both_material: true
+  material_fraction: 0.5
+  rules:
+    - id: vt_vs_abuseipdb
+      enabled: true
+      description: >-
+        VirusTotal weighted detections are material while AbuseIPDB returns confidence 0 with at
+        least one report on file.
+      analyst_hint: >-
+        Signature detection without corroborating abuse reports. Check whether the VT hits are
+        generic heuristics before acting.
+    - id: stale_vs_fresh
+      enabled: true
+      description: >-
+        The newest adverse observation is over a year old while another family reports activity
+        within 30 days.
+      analyst_hint: >-
+        Historical badness with current activity. The address was likely re-used or reassigned;
+        the old finding may not describe the current tenant.
+      stale_days: 365
+      fresh_days: 30
+    - id: cdn_vs_detection
+      enabled: true
+      description: A Tier B range carries adverse domain-level signals.
+      analyst_hint: >-
+        The detection is about the tenant, not the address. Do not block the address.
+    - id: age_vs_reputation
+      enabled: true
+      description: A domain under 30 days old with a clean VirusTotal record.
+      analyst_hint: >-
+        Too new to have been evaluated. Absence of detection here is expected, not reassuring.
+      max_age_days: 30

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
+from pydantic import ValidationError
 from rich.console import Group, RenderableType
 from rich.markup import escape
+from rich.padding import Padding
 from rich.table import Table
 from rich.text import Text
 
 from tripper_recon import __version__
+from tripper_recon.verdict.models import Signal, Verdict, VerdictLabel
 
 #: How each `source` tag produced by ``orchestrators._tag_ip_sources`` is explained on screen.
 #:
@@ -397,10 +400,10 @@ def compose_report(
 ) -> Group:
     """Assemble one report block in the fixed vertical order every renderer here uses.
 
-    Order: header, verdict, coverage, notices, body. The ``verdict`` slot is deliberately empty
-    today -- W5 computes the verdict word and drops it in above the coverage line without any
-    renderer below having to move. Coverage sits above the body, not in a footer, because a
-    reader who stops after the first screen must still have seen how much was missing.
+    Order: header, verdict, coverage, notices, body. The verdict comes before the coverage line
+    and both come before the body, because a reader who stops after the first screen must have
+    seen the answer and how much of the panel stands behind it. See :func:`render_verdict` for
+    why the answer is a word and not a colour.
     """
     parts: List[RenderableType] = [header]
     if verdict is not None:
@@ -524,6 +527,403 @@ def render_skipped_ips(skipped: Any) -> Optional[RenderableType]:
         style="dim",
     )
     return Group(heading, table, note)
+
+
+# --------------------------------------------------------------------------------------
+# The verdict block (roadmap 5.8) -- the answer, first, in words
+#
+# The layout below is driven by one measured failure. `rich` strips ANSI the moment stdout is
+# not a terminal, which is exactly the `tripper-recon ip X > incident.md` workflow this tool
+# exists to feed. A renderer whose only malice signal is colour says nothing at all on that
+# path, and a flat key/value table gives `virustotal_detections 5/91` no more weight than
+# `postal_code 100000` two rows above it.
+#
+# So: the verdict WORD is text, on the first line, before anything else. Colour reinforces it
+# and never carries it. Everything in this section is built as `rich.text.Text` rather than a
+# markup string -- Text never parses markup, so an OTX pulse title quoted inside a signal
+# observation or an analyst hint has no injection surface at all, which is a stronger guarantee
+# than remembering to call `esc` on each one.
+# --------------------------------------------------------------------------------------
+
+#: Five verdict states folded to three colours, because a screen that uses five is a screen
+#: nobody reads at 02:00. The fold is deliberate and errs one way: ``INSUFFICIENT_DATA`` shares
+#: the warning colour with ``SUSPICIOUS`` rather than the clean colour, because "we do not know"
+#: must never look like "we looked and it was fine". Only the two states an allowlist or an
+#: affirmative negative can produce are green.
+_VERDICT_STYLES: Dict[str, str] = {
+    VerdictLabel.MALICIOUS.value: "bold red",
+    VerdictLabel.SUSPICIOUS.value: "bold yellow",
+    VerdictLabel.INSUFFICIENT_DATA.value: "bold yellow",
+    VerdictLabel.NO_ADVERSE_FINDINGS.value: "bold green",
+    VerdictLabel.KNOWN_INFRASTRUCTURE.value: "bold green",
+}
+
+#: Fallback for a label this renderer does not recognise. Yellow, never green: an unknown
+#: verdict string is unknown coverage of the verdict vocabulary, and the safe reading of
+#: unknown is "look at it".
+_VERDICT_STYLE_UNKNOWN = "bold yellow"
+
+#: How many justifying signals the banner shows before the analyst has to ask for ``--explain``.
+#: Three is the number that fits above the fold beside the coverage line; the full ordered list
+#: is always one flag away and always in the JSON.
+_TOP_SIGNALS = 3
+
+#: Printed in place of the banner when the engine could not produce a verdict at all. It is a
+#: statement of ignorance, in the warning colour, and it is never omitted -- a panel with no
+#: verdict line reads as a panel whose verdict was fine.
+_VERDICT_UNAVAILABLE = "VERDICT: NOT COMPUTED"
+
+
+def verdict_from_payload(value: Any) -> Optional[Verdict]:
+    """Coerce ``data['verdict']`` into a :class:`Verdict`, or ``None`` when it is not one.
+
+    The orchestrators publish the verdict onto ``data`` as its JSON dump, because the console
+    renderers are handed ``result.data`` and nothing else. Parsing it back here rather than
+    reading raw keys buys the model's own invariants -- notably that a benign label cannot exist
+    without an affirmative negative behind it -- on the rendering path too, so a hand-edited or
+    truncated payload fails to parse instead of printing a clean word it did not earn.
+
+    Returns ``None`` rather than raising. A malformed verdict must degrade to "not computed",
+    which the caller renders as a warning; it must never take the rest of the report down.
+    """
+    if isinstance(value, Verdict):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return Verdict.model_validate(dict(value))
+    except ValidationError:
+        return None
+
+
+def _fmt_points(value: float) -> str:
+    """One decimal place. Points are weighted sums, not counts, and rounding to int hides work."""
+    return f"{value:.1f}"
+
+
+def _signal_line(signal: Signal) -> str:
+    """One justifying signal: what it was worth, out of what, and the evidence for it."""
+    return f"+{_fmt_points(signal.points)} of {_fmt_points(signal.max_points)}  {signal.id}: {signal.observation}"
+
+
+class _IndentedBlock:
+    """A verdict block whose indentation survives line wrapping.
+
+    A single ``rich.Text`` carrying embedded newlines wraps every over-long line back to column
+    zero. At width 100 the demotion reason for a real verdict rendered like this::
+
+        ! SUSPICIOUS rather than NO_ADVERSE_FINDINGS: vt.weighted_detections and 3 other adverse
+        reported something, below the 35-point band but not nothing. The clean label is a ...
+
+    -- and the continuation, sitting flush left with no ``!`` in front of it, reads as a new
+    top-level statement rather than as the rest of the one above. Redirect to a file, drop the
+    colour, hand it to somebody at 3am, and the block structure that makes the panel scannable
+    is gone exactly when it is needed most.
+
+    So each logical line becomes its own renderable under a ``Padding`` left offset. Rich
+    re-applies the offset to every wrapped row, so a continuation lands under its own bullet
+    instead of under the margin. The trade is one ``Group`` where there used to be one ``Text``;
+    callers already accept either, because ``--explain`` has always returned a ``Group``.
+    """
+
+    def __init__(self, first: Text) -> None:
+        self._rows: List[RenderableType] = [first]
+
+    def append(self, text: str, *, style: str = "") -> None:
+        """Extend the most recent row in place, for the headline's trailing detail."""
+        head = self._rows[-1]
+        if isinstance(head, Text):
+            head.append(text, style=style)
+            return
+        self._rows.append(Text(text, style=style))
+
+    def add(self, line: str, *, indent: str = "  ", style: str = "") -> None:
+        """One logical line, indented by ``indent`` on its first row and on every wrapped row.
+
+        Any bullet in ``indent`` (``"    - "``) stays in the text so it prints once; only the
+        leading whitespace becomes the padding, so wrapped rows align under the bullet rather
+        than repeating it.
+        """
+        marker = indent.lstrip()
+        offset = len(indent) - len(marker)
+        self._rows.append(Padding(Text(f"{marker}{line}", style=style), (0, 0, 0, offset)))
+
+    def renderable(self) -> RenderableType:
+        return Group(*self._rows)
+
+
+def _append_lines(
+    block: Union[_IndentedBlock, Text], lines: Iterable[str], *, indent: str = "  ", style: str = ""
+) -> None:
+    """Append one logical line per entry, to either block flavour.
+
+    ``_IndentedBlock`` keeps the indent through wrapping; a plain ``Text`` does not. Both are in
+    use: the verdict banner is the block an analyst reads under time pressure and has been
+    converted, while the renderers that emit short lines still build a ``Text`` and gain nothing
+    from the change. Accepting both keeps that a per-renderer decision rather than a flag day.
+    """
+    if isinstance(block, Text):
+        for line in lines:
+            block.append("\n")
+            block.append(f"{indent}{line}", style=style)
+        return
+    for line in lines:
+        block.add(line, indent=indent, style=style)
+
+
+def render_verdict_explanation(verdict: Verdict) -> Text:
+    """The full audit trail behind one verdict: every signal, every weight, every criterion.
+
+    This is what ``--explain`` prints, and it is the difference between a verdict a SOC will
+    act on and a black box they will learn to ignore. Every number on screen is traceable to
+    the ruleset key that set it (``weight_source``), the provider value it was computed from
+    (``evidence``), and the date the provider observed it -- so an analyst can disagree with the
+    tool specifically rather than generally.
+
+    Zero-point observations are listed too. A signal that scored nothing is still a thing a
+    provider said, and omitting it would make the breakdown a summary of the score rather than
+    a record of the evidence.
+    """
+    block = Text("verdict explanation (--explain)", style="bold white")
+
+    block.append("\n")
+    block.append(f"  indicator: {verdict.indicator} ({verdict.indicator_type})", style="dim")
+    block.append("\n")
+    block.append(
+        f"  score {verdict.score} (raw {_fmt_points(verdict.raw_score)}), "
+        f"band from score alone: {verdict.score_band.value}",
+        style="dim",
+    )
+
+    if verdict.signals:
+        block.append("\n")
+        block.append(f"  signals ({len(verdict.signals)}), highest contribution first:", style="bold")
+        for signal in sorted(verdict.signals, key=lambda item: item.points, reverse=True):
+            block.append("\n")
+            block.append(
+                f"    {signal.id}  [{signal.direction.value}]  {signal.provider} / {signal.family}",
+                style="bold",
+            )
+            _append_lines(
+                block,
+                [
+                    f"points {_fmt_points(signal.points)} of {_fmt_points(signal.max_points)} "
+                    f"(magnitude {signal.magnitude:.4f})" + ("  [ceiling-only]" if signal.ceiling_only else ""),
+                    f"observation: {signal.observation}",
+                    f"weight from: {signal.weight_source}",
+                    f"observed at: {signal.observed_at or 'not reported by the provider'}",
+                ],
+                indent="      ",
+                style="dim",
+            )
+            if signal.evidence:
+                _append_lines(
+                    block,
+                    [f"evidence: {key} = {value!r}" for key, value in signal.evidence.items()],
+                    indent="        ",
+                    style="dim",
+                )
+            if signal.source_url:
+                _append_lines(block, [f"source: {signal.source_url}"], indent="      ", style="dim")
+    else:
+        block.append("\n")
+        block.append("  signals: none were extracted; nothing scored either way", style="yellow")
+
+    if verdict.confidence_criteria:
+        block.append("\n")
+        block.append(
+            f"  confidence criteria (score {verdict.confidence_score:.4f} -- a transparency aid, not a probability):",
+            style="bold",
+        )
+        _append_lines(
+            block,
+            [
+                f"[{'x' if criterion.met else ' '}] {criterion.name}: {criterion.detail}"
+                for criterion in verdict.confidence_criteria
+            ],
+            indent="    ",
+            style="dim",
+        )
+
+    if verdict.overrides_applied:
+        block.append("\n")
+        block.append(f"  overrides applied ({len(verdict.overrides_applied)}):", style="bold")
+        for override in verdict.overrides_applied:
+            detail = f"tier {override.tier}, effect {override.effect}"
+            if override.source_list:
+                detail += f", list {override.source_list}"
+            if override.source_retrieved_at:
+                detail += f", retrieved {override.source_retrieved_at}"
+            _append_lines(block, [f"{override.rule_id}: {detail}"], indent="    ", style="dim")
+            if override.note:
+                _append_lines(block, [override.note], indent="      ", style="dim")
+
+    if verdict.rationale:
+        block.append("\n")
+        block.append("  rationale, in order:", style="bold")
+        _append_lines(block, verdict.rationale, indent="    - ", style="dim")
+
+    block.append("\n")
+    block.append(
+        f"  ruleset {verdict.ruleset_version} from {verdict.ruleset_source} • "
+        f"engine {verdict.engine_version} • schema {verdict.schema_version} • "
+        f"evaluated {verdict.evaluated_at_rfc3339}",
+        style="dim",
+    )
+    return block
+
+
+def render_verdict_unavailable(reason: Any = None) -> Text:
+    """The banner for a verdict that could not be computed.
+
+    Rendered instead of, never in addition to, silence. A missing verdict is a gap in the
+    report; a report with no verdict line at all is one an analyst reads as unremarkable.
+    """
+    block = Text(_VERDICT_UNAVAILABLE, style="bold yellow")
+    detail = str(reason).strip() if reason is not None else ""
+    block.append("\n")
+    block.append(
+        f"  {detail}" if detail else "  the scoring engine did not produce a verdict for this indicator",
+        style="yellow",
+    )
+    block.append("\n")
+    block.append(
+        "  nothing below has been adjudicated; absence of a verdict is not a clean verdict",
+        style="yellow",
+    )
+    return block
+
+
+def render_verdict(
+    verdict: Any,
+    *,
+    explain: bool = False,
+    show_calibration: bool = True,
+) -> Optional[RenderableType]:
+    """The answer, first, in words: verdict, confidence, coverage, and what justifies them.
+
+    ``verdict`` takes a :class:`Verdict` or the dumped mapping the orchestrators publish on
+    ``data['verdict']``. Returns ``None`` for ``None`` -- a caller with no verdict at all
+    renders nothing here and says so elsewhere -- and the "not computed" banner for a payload
+    that is present but unparseable.
+
+    Section order is fixed and is the reading order under time pressure:
+
+    1. the verdict word, with the score, the confidence band and the coverage ratio beside it,
+       because "MALICIOUS at LOW confidence on 2 of 6 providers" is one fact, not three;
+    2. the adjustments, each marked ``!`` -- these are the places the tool overruled its own
+       arithmetic, and an analyst who disagrees needs to see them before the evidence;
+    3. the two or three signals that justify the call, each with its own evidence sentence;
+    4. contradictions and the analyst-review flag, which are the reason to stop and look;
+    5. provenance -- collection mode, allowlist freshness, ruleset version, calibration.
+
+    ``show_calibration`` exists for nested per-address panels under a domain report that has
+    already printed the statement once. The statement itself is not optional anywhere: the
+    engine makes no accuracy claim and the artefact has to say so on its face.
+    """
+    if verdict is None:
+        return None
+    parsed = verdict_from_payload(verdict)
+    if parsed is None:
+        return render_verdict_unavailable("the recorded verdict could not be read back")
+
+    label = parsed.verdict.value
+    style = _VERDICT_STYLES.get(label, _VERDICT_STYLE_UNKNOWN)
+
+    block = _IndentedBlock(Text(f"VERDICT: {label}", style=style))
+    block.append(
+        f"   score {parsed.score} (raw {_fmt_points(parsed.raw_score)})"
+        f"   confidence {parsed.confidence.value}"
+        f"   {parsed.coverage.headline}",
+        style=style,
+    )
+
+    # 2 -- where the tool overruled its own arithmetic.
+    _append_lines(block, [f"! {reason}" for reason in parsed.adjustment_reasons], style="yellow")
+    if parsed.coverage.missing:
+        _append_lines(block, ["not answered: " + ", ".join(parsed.coverage.missing)], style="yellow")
+
+    # 3 -- the evidence, ordered by contribution.
+    top = parsed.top_signals(_TOP_SIGNALS)
+    if top:
+        block.add("why:", style="bold")
+        _append_lines(block, [_signal_line(signal) for signal in top], indent="    - ")
+        hidden = len(parsed.scored_signals) - len(top)
+        if hidden > 0:
+            _append_lines(
+                block,
+                [f"and {hidden} more scoring signal(s); run with --explain for the full breakdown"],
+                indent="    ",
+                style="dim",
+            )
+    elif parsed.affirmative_negatives:
+        block.add("why:", style="bold")
+        _append_lines(
+            block,
+            [signal.observation for signal in parsed.affirmative_negatives],
+            indent="    - ",
+        )
+
+    # 4 -- the disagreements, never averaged away.
+    if parsed.requires_analyst_review:
+        block.add("ANALYST REVIEW REQUIRED", style="bold red")
+    if parsed.contradictions:
+        block.add(f"contradictions ({len(parsed.contradictions)}), reported and not reconciled:", style="bold")
+        for contradiction in parsed.contradictions:
+            _append_lines(block, [f"{contradiction.rule_id}: {contradiction.summary}"], indent="    - ")
+            _append_lines(block, [f"what to do: {contradiction.analyst_hint}"], indent="      ", style="yellow")
+    if parsed.attribution_warning:
+        _append_lines(block, [f"attribution: {parsed.attribution_warning}"], style="yellow")
+
+    # 5 -- provenance. A verdict whose ruleset and collection mode are unrecorded is a verdict
+    # nobody can re-derive six months later, which is the whole point of stamping them.
+    if parsed.passive_only:
+        collection = "passive only - no traffic was sent to the target or its infrastructure"
+    else:
+        named = ", ".join(parsed.active_collection) or "unnamed active steps"
+        collection = f"ACTIVE COLLECTION contributed: {named}"
+    _append_lines(block, [f"collection: {collection}"], style="" if parsed.passive_only else "yellow")
+
+    if parsed.allowlist is not None:
+        provenance = (
+            f"allowlist {parsed.allowlist.list_version} retrieved {parsed.allowlist.list_retrieved}"
+            f" - {parsed.allowlist.staleness_note}"
+        )
+        _append_lines(block, [provenance], style="yellow" if parsed.allowlist.stale else "dim")
+
+    _append_lines(
+        block,
+        [
+            f"ruleset {parsed.ruleset_version} ({parsed.ruleset_source}) • engine {parsed.engine_version}"
+            f" • evaluated {parsed.evaluated_at_rfc3339}"
+        ],
+        style="dim",
+    )
+    if show_calibration:
+        _append_lines(block, [f"calibration: {parsed.calibration_statement}"], style="dim")
+
+    if not explain:
+        return block.renderable()
+    return Group(block.renderable(), Text(""), render_verdict_explanation(parsed))
+
+
+def _verdict_slot(data: Any, *, explain: bool, show_calibration: bool = True) -> Optional[RenderableType]:
+    """The verdict renderable for a payload, including the honest failure case.
+
+    Three states, and the third is the one that matters: a verdict was computed (render it), no
+    verdict was attempted (render nothing -- this payload predates the engine or came from a
+    caller that does not score), or the engine was asked and failed (say so loudly). Only the
+    middle case is silent, and it is silent because a stub payload with no verdict key has made
+    no claim either way.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    if data.get("verdict") is not None:
+        return render_verdict(data.get("verdict"), explain=explain, show_calibration=show_calibration)
+    error = data.get("verdict_error")
+    if error:
+        return render_verdict_unavailable(error)
+    return None
 
 
 def _fmt_ports(ports: Iterable[int]) -> str:
@@ -651,8 +1051,9 @@ def render_ip_analysis(
     run_id: Any = None,
     generated_at: Any = None,
     show_run_line: bool = True,
+    explain: bool = False,
 ) -> RenderableType:
-    """Render one IP analysis block: header, coverage, then the field table.
+    """Render one IP analysis block: header, verdict, coverage, then the field table.
 
     ``data`` is the mapping ``orchestrators.investigate_ip`` builds, or one element of
     ``investigate_domain``'s ``data['ips']``. Both carry ``provider_status``, which is what
@@ -660,8 +1061,18 @@ def render_ip_analysis(
     from an empty payload, because ``{}`` means "never asked" and "asked, found nothing"
     equally and only one of those is evidence.
 
+    **Row order is part of the output, not an accident of when each block was written.** The
+    adjudicated evidence -- VirusTotal, AbuseIPDB, OTX, Shodan -- comes first, then network
+    identity, and geolocation goes last. A city and a postal code almost never decide an
+    escalation, and printing them two rows above the detection count taught the eye that the
+    two carry the same weight.
+
     ``show_run_line=False`` suppresses the version/timestamp/run-id line for blocks nested
-    under a report that has already printed one; the coverage line is never suppressible.
+    under a report that has already printed one, and suppresses the calibration sentence for
+    the same reason; the coverage line and the verdict are never suppressible.
+
+    ``explain=True`` appends the full signal breakdown -- every weight, its ruleset key and the
+    provider values behind it -- under the verdict banner.
     """
     vt = data.get("virustotal", {})
     vt_stats = vt.get("vt_last_analysis_stats", {})
@@ -686,36 +1097,6 @@ def render_ip_analysis(
     source_cell = _fmt_source_cell(data.get("source"))
     if source_cell:
         table.add_row("address_source", source_cell)
-
-    city = ipinfo.get("city")
-    if city:
-        table.add_row("city", esc(city))
-    country = ipinfo.get("country")
-    if country:
-        table.add_row("country", esc(country))
-
-    isp_line = None
-    asn_id = asn_meta.get("asn")
-    asn_name = asn_meta.get("name")
-    if asn_id and asn_name:
-        isp_line = f"AS{asn_id} {asn_name}"
-    elif ipinfo.get("org"):
-        isp_line = ipinfo.get("org")
-    if isp_line:
-        table.add_row("isp", esc(isp_line))
-
-    org = asn_meta.get("organization") or ipinfo.get("org")
-    if org:
-        table.add_row("organization", esc(org))
-
-    coords = _fmt_coords(ipinfo.get("coordinates"))
-    if coords:
-        table.add_row("coordinates", esc(coords))
-
-    if ipinfo.get("postal"):
-        table.add_row("postal_code", esc(ipinfo.get("postal")))
-
-    table.add_row("cloudflare_radar_link", f"https://radar.cloudflare.com/ip/{ip}")
 
     # Absence is not safety. When VirusTotal was never asked, or answered with an error, there
     # are no stats to sum -- rendering the resulting 0/0 in green makes an unset API key look
@@ -837,6 +1218,40 @@ def render_ip_analysis(
 
     table.add_row("shodan_link", f"https://www.shodan.io/host/{ip}")
 
+    # Network identity: who announces this address. Below the evidence, above the map.
+    isp_line = None
+    asn_id = asn_meta.get("asn")
+    asn_name = asn_meta.get("name")
+    if asn_id and asn_name:
+        isp_line = f"AS{asn_id} {asn_name}"
+    elif ipinfo.get("org"):
+        isp_line = ipinfo.get("org")
+    if isp_line:
+        table.add_row("isp", esc(isp_line))
+
+    org = asn_meta.get("organization") or ipinfo.get("org")
+    if org:
+        table.add_row("organization", esc(org))
+
+    table.add_row("cloudflare_radar_link", f"https://radar.cloudflare.com/ip/{ip}")
+
+    # Below the fold. Geolocation is IPinfo's guess about where a registry says an address
+    # lives; it is context for a report and it is almost never what decides an escalation.
+    city = ipinfo.get("city")
+    country = ipinfo.get("country")
+    coords = _fmt_coords(ipinfo.get("coordinates"))
+    postal = ipinfo.get("postal")
+    if city or country or coords or postal:
+        table.add_row("geolocation", "[dim]IPinfo registry data - context, not evidence[/]")
+    if city:
+        table.add_row("city", esc(city))
+    if country:
+        table.add_row("country", esc(country))
+    if coords:
+        table.add_row("coordinates", esc(coords))
+    if postal:
+        table.add_row("postal_code", esc(postal))
+
     errors = data.get("errors") or {}
     if errors:
         error_table = Table(show_header=False, box=None, padding=(0, 2))
@@ -883,6 +1298,10 @@ def render_ip_analysis(
     return compose_report(
         header,
         [table, Text("")],
+        # The calibration sentence rides with the run line: a nested per-address panel sits
+        # under a domain report that has already stated it once, and repeating three sentences
+        # of caveat per address is how a reader learns to skip the caveat.
+        verdict=_verdict_slot(data, explain=explain, show_calibration=show_run_line),
         coverage=render_coverage(data.get("coverage") or provider_status),
         notices=notices,
     )
@@ -899,8 +1318,20 @@ def render_domain_header(
     generated_at: Any = None,
     version: Optional[str] = None,
     show_run_line: bool = True,
+    verdict: Any = None,
+    verdict_error: Any = None,
+    explain: bool = False,
 ) -> RenderableType:
-    """The domain report's opening block: run provenance, coverage, warnings, skipped addresses.
+    """The domain report's opening block: run provenance, verdict, coverage, warnings, skips.
+
+    ``verdict`` is the **domain's own** verdict, never a merge of its addresses'. A phishing kit
+    on a CDN is a malicious domain on a shared address and both statements are true at once;
+    merging them would either indict every other tenant behind that address or clear the
+    phishing kit. Each address carries its own verdict on its own panel.
+
+    ``verdict_error`` is the honest alternative when the engine could not produce one: it
+    renders the "not computed" banner instead of nothing, because a domain report with no
+    verdict line reads as a domain report with nothing to report.
 
     Feed it ``result.data['coverage']`` (or ``result.data['domain_provider_status']``),
     ``result.warnings`` and ``result.data.get('skipped_ips')``. Each IP panel below carries its
@@ -937,6 +1368,7 @@ def render_domain_header(
     return compose_report(
         header,
         [Text("")],
+        verdict=_verdict_slot({"verdict": verdict, "verdict_error": verdict_error}, explain=explain),
         coverage=render_coverage(coverage, label=coverage_label),
         notices=notices,
     )
