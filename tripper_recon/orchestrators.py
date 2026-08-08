@@ -1,9 +1,37 @@
+"""Per-indicator orchestration: fan out to the providers, assemble one result.
+
+Three entry points -- :func:`investigate_ip`, :func:`investigate_domain`, :func:`investigate_asn`
+-- and one shared shape underneath them.
+
+What changed here and why (roadmap W2/W3):
+
+* **One call helper.** ``_call_provider`` replaced 23 hand-copied ``try / await / except``
+  blocks. Every provider call is now timed, rate-limited, error-classified and wrapped in a
+  :class:`ProviderCall` envelope by the same code path.
+* **The ok/error distinction survives assembly.** The renderer still receives ``{}`` for a
+  provider that did not answer, because that is the shape it consumes -- but ``provider_status``
+  now carries the outcome, the redacted error and the elapsed time for every provider, so
+  "never asked" and "asked, came back clean" stop being indistinguishable downstream.
+* **The limiter bounds real work.** It wraps the await, not ``asyncio.create_task``.
+* **Every path is one wave.** The domain path awaited five providers serially per IP and then
+  looped IPs serially; the ASN path fully drained one wave before creating the next. Both now
+  gather, with an explicit ceiling so a domain with many A records cannot fan out without
+  limit.
+* **A wall-clock deadline exists.** Nothing had elapsed-time awareness and OTX alone carries a
+  worst case near 84 seconds per provider.
+* **Non-public addressing is refused on both paths.** The IP path checked ``is_private`` only,
+  which covers neither 224/4 nor 240/4, and the domain path checked nothing at all -- so a
+  split-horizon or sinkholed domain forwarded internal addressing to five third parties under
+  the operator's own API keys.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from ipaddress import ip_address
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Coroutine, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 import httpx
 
@@ -23,13 +51,46 @@ from tripper_recon.providers.ripestat import (
 )
 from tripper_recon.providers.shodan_api import shodan_host
 from tripper_recon.providers.virustotal import vt_domain_summary, vt_ip_summary
-from tripper_recon.types.models import ApiKeys, InvestigationResult
-from tripper_recon.utils.http import RateLimiter, create_client
+from tripper_recon.types.models import ApiKeys, InvestigationResult, ProviderCall, ProviderOutcome
+from tripper_recon.utils.http import PassiveBoundaryViolation, create_client, rate_limited
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
 
 log = logger("orchestrators")
+
+# --------------------------------------------------------------------------------------
+# Budgets
+# --------------------------------------------------------------------------------------
+
+#: Wall-clock ceiling for one indicator, applied by :func:`_with_deadline`.
+#:
+#: There was no elapsed-time awareness anywhere before this. A single provider can take ~84
+#: seconds in its worst case (OTX, four attempts at a 20-second timeout), and a domain with
+#: several A records multiplied that. The ceiling is generous rather than tight -- the point
+#: is that a run terminates and says why, not that it terminates quickly.
+DEFAULT_TARGET_DEADLINE_SECONDS = 180.0
+
+#: How many resolved IPs of one domain are enriched at once. The global rate limiter bounds
+#: requests in flight; this bounds how many coroutine trees exist, so a domain with 40 A
+#: records does not create 200 pending provider calls before the first one returns.
+MAX_CONCURRENT_IPS = 8
+
+#: How many neighbour ASNs are resolved to names at once. ``--neighbors N`` resolves up to 3N
+#: (upstream, downstream, uncertain) and previously gathered all of them unbounded.
+MAX_CONCURRENT_NEIGHBOUR_LOOKUPS = 8
+
+#: Provider error values that mean "no credential, so nothing was asked". Shared by
+#: :func:`_should_suppress` and the envelope builder so the two cannot disagree about which
+#: failures are configuration rather than incidents.
+NOT_CONFIGURED_ERRORS: FrozenSet[str] = frozenset(
+    {"missing_api_key", "missing_api_token", "missing_token", "API key not configured"}
+)
+
+
+# --------------------------------------------------------------------------------------
+# Error payloads (unchanged semantics -- tests pin these)
+# --------------------------------------------------------------------------------------
 
 
 def _safe_request_url(obj: Any) -> str | None:
@@ -104,7 +165,7 @@ def _should_suppress(provider: str, payload: Dict[str, Any]) -> bool:
     status = payload.get("status") or payload.get("status_code")
     if not isinstance(status, (int, str, type(None))):
         status = None
-    if err in {"missing_api_key", "missing_api_token", "missing_token", "API key not configured"}:
+    if err in NOT_CONFIGURED_ERRORS:
         return True
     if provider == "ipinfo_asn" and err in {"unauthorized", "http_error"} and status in {401, 403}:
         return True
@@ -127,89 +188,276 @@ def _env_keys() -> ApiKeys:
     )
 
 
-async def investigate_ip(ip: str) -> InvestigationResult:
+# --------------------------------------------------------------------------------------
+# The one provider call helper
+# --------------------------------------------------------------------------------------
+
+
+def _envelope(provider: str, payload: Dict[str, Any], elapsed: float) -> ProviderCall:
+    """Wrap one provider payload, preserving the ok/error/not-configured distinction."""
+    if payload.get("ok"):
+        data = payload.get("data")
+        return ProviderCall(
+            provider=provider,
+            outcome=ProviderOutcome.OK,
+            elapsed_seconds=elapsed,
+            data=data if isinstance(data, dict) else {},
+        )
+
+    err = payload.get("error")
+    outcome = (
+        ProviderOutcome.NOT_CONFIGURED
+        if isinstance(err, str) and err in NOT_CONFIGURED_ERRORS
+        else ProviderOutcome.ERROR
+    )
+    return ProviderCall(
+        provider=provider,
+        outcome=outcome,
+        elapsed_seconds=elapsed,
+        error=_error_details(payload),
+        summary=_error_summary(provider, payload),
+        suppressed=_should_suppress(provider, payload),
+    )
+
+
+async def _call_provider(provider: str, call: Awaitable[Dict[str, Any]]) -> ProviderCall:
+    """Await one provider under the concurrency limiter and wrap whatever comes back.
+
+    This is the only place in the package that awaits a provider. Everything it guarantees --
+    the limiter actually bounding in-flight requests, the elapsed time being recorded, a raised
+    exception being redacted rather than escaping -- holds for every provider because there is
+    no second code path.
+
+    The bare ``except Exception`` is deliberate and is the reason this function exists: one
+    provider raising must not take the other four down with it. Two things are NOT absorbed:
+
+    * ``BaseException``, so a deadline cancellation reaches :func:`_with_deadline` rather than
+      being filed as a provider failure.
+    * :class:`PassiveBoundaryViolation`, because it means this tool tried to contact a host
+      nobody approved -- most plausibly the target itself. Recording that as one more line in
+      an error list would turn the loudest signal the codebase has into routine noise. It is a
+      defect in the tool, and it is meant to stop the run.
+    """
+    started = time.monotonic()
+    try:
+        async with rate_limited():
+            payload = await call
+    except PassiveBoundaryViolation:
+        raise
+    except Exception as exc:  # noqa: BLE001 - converted to a redacted payload, never swallowed
+        payload = _error_payload(exc)
+    elapsed = time.monotonic() - started
+
+    if not isinstance(payload, dict):
+        payload = {
+            "ok": False,
+            "error": "invalid_provider_payload",
+            "message": f"{provider} returned {type(payload).__name__}, expected dict",
+        }
+    return _envelope(provider, payload, elapsed)
+
+
+def _collect_errors(
+    calls: Mapping[str, ProviderCall], *, prefix: str = ""
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Split provider failures into the per-provider detail map and the human summary lines.
+
+    Suppressed failures (an unset API key, IPinfo's free tier refusing ASN lookups) are left
+    out of both, exactly as before -- but unlike before they remain visible in
+    :func:`_status_map`, so nothing is actually lost.
+    """
+    provider_errors: Dict[str, Dict[str, Any]] = {}
+    messages: List[str] = []
+    for key, call in calls.items():
+        if call.ok or call.suppressed:
+            continue
+        if call.error:
+            provider_errors[key] = call.error
+        messages.append(f"{prefix}{call.summary}")
+    return provider_errors, messages
+
+
+def _status_map(calls: Mapping[str, ProviderCall]) -> Dict[str, Dict[str, Any]]:
+    """Per-provider outcome, cost and error, for every provider that was considered.
+
+    This is the record that stops absence from reading as safety. ``data['virustotal'] == {}``
+    is ambiguous; ``provider_status['virustotal']['outcome'] == 'not_configured'`` is not.
+    """
+    status: Dict[str, Dict[str, Any]] = {}
+    for key, call in calls.items():
+        entry: Dict[str, Any] = {
+            "outcome": call.outcome.value,
+            "elapsed_seconds": round(call.elapsed_seconds, 3),
+        }
+        if call.error:
+            entry["error"] = call.error
+        if call.suppressed:
+            entry["suppressed"] = True
+        status[key] = entry
+    return status
+
+
+# --------------------------------------------------------------------------------------
+# Target guards
+# --------------------------------------------------------------------------------------
+
+# Checked in order, and the order matters: 127.0.0.1 is both loopback and private, and the
+# private label is the one the operator already knows. ``is_private`` alone -- the only check
+# that existed -- covers neither 224/4 (multicast) nor 240/4 (reserved).
+_NON_PUBLIC_CATEGORIES: Tuple[Tuple[str, str], ...] = (
+    ("is_private", "Private"),
+    ("is_loopback", "Loopback"),
+    ("is_link_local", "Link-local"),
+    ("is_multicast", "Multicast"),
+    ("is_reserved", "Reserved"),
+    ("is_unspecified", "Unspecified"),
+)
+
+
+def non_public_ip_reason(ip: str) -> Optional[str]:
+    """Label the reason ``ip`` must not be sent to a third party, or ``None`` if it is public.
+
+    Forwarding internal addressing to VirusTotal, Shodan, IPinfo, AbuseIPDB and OTX under the
+    operator's own API keys discloses the operator's network to five vendors, and the answer
+    would be worthless anyway. Split-horizon DNS and sinkholed domains make this a routine
+    case on the domain path, not a hypothetical one.
+    """
+    try:
+        parsed = ip_address(ip)
+    except ValueError:
+        return None
+    for attribute, label in _NON_PUBLIC_CATEGORIES:
+        if getattr(parsed, attribute, False):
+            return label
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# Deadline
+# --------------------------------------------------------------------------------------
+
+
+async def _with_deadline(
+    work: Coroutine[Any, Any, InvestigationResult],
+    *,
+    target: str,
+    deadline: Optional[float],
+) -> InvestigationResult:
+    """Run ``work`` under a wall-clock ceiling, reporting a breach rather than raising.
+
+    Only ``asyncio.TimeoutError`` is caught. A ``CancelledError`` -- the operator interrupting,
+    or an outer deadline firing -- propagates, which is what ``cli.py`` expects: it narrows on
+    ``BaseException`` precisely because this deadline makes cancellation reachable.
+    """
+    limit = DEFAULT_TARGET_DEADLINE_SECONDS if deadline is None else deadline
+    if limit <= 0:
+        return await work
+    try:
+        return await asyncio.wait_for(work, limit)
+    except asyncio.TimeoutError:
+        log["error"]("Investigation exceeded its deadline", target=target, deadline_seconds=limit)
+        return InvestigationResult(
+            ok=False,
+            errors=[f"Investigation of {target} exceeded the {limit:g}s wall-clock deadline"],
+            data={},
+        )
+
+
+# --------------------------------------------------------------------------------------
+# Shared fan-outs
+# --------------------------------------------------------------------------------------
+
+
+async def _ip_provider_wave(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str) -> Dict[str, ProviderCall]:
+    """The five per-IP providers, in one wave."""
+    virustotal, ipinfo, shodan, abuseipdb, otx = await asyncio.gather(
+        _call_provider("virustotal", vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip)),
+        _call_provider("ipinfo", ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip)),
+        _call_provider("shodan", shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip)),
+        _call_provider("abuseipdb", abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip)),
+        _call_provider("otx", otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip)),
+    )
+    return {
+        "virustotal": virustotal,
+        "ipinfo": ipinfo,
+        "shodan": shodan,
+        "abuseipdb": abuseipdb,
+        "otx": otx,
+    }
+
+
+async def _asn_meta_for_ip(
+    *, client: httpx.AsyncClient, keys: ApiKeys, ipinfo: ProviderCall
+) -> Tuple[Dict[str, Any], Optional[ProviderCall]]:
+    """Cloudflare Radar metadata for the ASN IPinfo reported, when it reported one.
+
+    Second wave by necessity, not by oversight: the ASN is not known until IPinfo answers.
+    """
+    if not ipinfo.ok:
+        return {}, None
+    raw_asn = ipinfo.data.get("asn")
+    if not raw_asn:
+        return {}, None
+    try:
+        asn = int(raw_asn)
+    except (TypeError, ValueError):
+        return {}, None
+
+    call = await _call_provider(
+        "cloudflare_asn", fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
+    )
+    return (call.data if call.ok else {}), call
+
+
+def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """The per-IP analysis dict ``reporting.console.render_ip_analysis`` consumes."""
+    return {
+        "ip": ip,
+        "ptr": None,
+        "virustotal": calls["virustotal"].data,
+        "shodan": calls["shodan"].data,
+        "ipinfo": calls["ipinfo"].data,
+        "abuseipdb": calls["abuseipdb"].data,
+        "otx": calls["otx"].data,
+        "asn_meta": asn_meta,
+        "provider_status": _status_map(calls),
+    }
+
+
+# --------------------------------------------------------------------------------------
+# IP
+# --------------------------------------------------------------------------------------
+
+
+async def investigate_ip(ip: str, *, deadline: Optional[float] = None) -> InvestigationResult:
     if not is_valid_ip(ip):
         return InvestigationResult(ok=False, errors=["Invalid IP address"], data={})
 
-    try:
-        ip_obj = ip_address(ip)
-        if ip_obj.is_private:
-            return InvestigationResult(ok=False, errors=[f"Private IP address {ip} cannot be investigated."], data={})
-    except ValueError:
-        # This should be caught by is_valid_ip, but as a fallback.
-        return InvestigationResult(ok=False, errors=[f"Invalid IP address format: {ip}"], data={})
+    reason = non_public_ip_reason(ip)
+    if reason is not None:
+        return InvestigationResult(ok=False, errors=[f"{reason} IP address {ip} cannot be investigated."], data={})
 
+    return await _with_deadline(_investigate_ip(ip), target=ip, deadline=deadline)
+
+
+async def _investigate_ip(ip: str) -> InvestigationResult:
     keys = _env_keys()
     async with create_client() as client:
-        limiter = RateLimiter(rate=5)
-        vt_task = ipi_task = sh_task = ab_task = otx_task = None
+        calls = await _ip_provider_wave(client=client, keys=keys, ip=ip)
+        asn_meta, cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
+        if cloudflare is not None:
+            calls["cloudflare_asn"] = cloudflare
 
-        async with limiter:
-            vt_task = asyncio.create_task(vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip))
-        async with limiter:
-            ipi_task = asyncio.create_task(ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip))
-        async with limiter:
-            sh_task = asyncio.create_task(shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip))
-        async with limiter:
-            ab_task = asyncio.create_task(abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip))
-        async with limiter:
-            otx_task = asyncio.create_task(otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip))
-
-        # Ensure provider failures don't crash the whole investigation
-        try:
-            vt = await vt_task
-        except Exception as e:  # noqa: BLE001
-            vt = _error_payload(e)
-        try:
-            ipi = await ipi_task
-        except Exception as e:  # noqa: BLE001
-            ipi = _error_payload(e)
-        try:
-            sh = await sh_task
-        except Exception as e:  # noqa: BLE001
-            sh = _error_payload(e)
-        try:
-            ab = await ab_task
-        except Exception as e:  # noqa: BLE001
-            ab = _error_payload(e)
-        try:
-            otx = await otx_task
-        except Exception as e:  # noqa: BLE001
-            otx = _error_payload(e)
-
-        asn_meta: Dict[str, Any] = {}
-        if ipi.get("ok") and ipi["data"].get("asn"):
-            asn = int(ipi["data"]["asn"])
-            cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
-            if cf.get("ok"):
-                asn_meta = cf["data"]
-
-        providers = {
-            "virustotal": vt,
-            "ipinfo": ipi,
-            "shodan": sh,
-            "abuseipdb": ab,
-            "otx": otx,
-        }
-        provider_errors: Dict[str, Dict[str, Any]] = {}
-        result_errors: List[str] = []
-        for name, payload in providers.items():
-            if not payload or payload.get("ok"):
-                continue
-            if _should_suppress(name, payload):
-                continue
-            details = _error_details(payload)
-            if details:
-                provider_errors[name] = details
-            result_errors.append(_error_summary(name, payload))
+        provider_errors, result_errors = _collect_errors(calls)
 
         data: Dict[str, Any] = {
-            "ipinfo": ipi.get("data", {}) if ipi.get("ok") else {},
-            "virustotal": vt.get("data", {}) if vt.get("ok") else {},
-            "shodan": sh.get("data", {}) if sh.get("ok") else {},
-            "abuseipdb": ab.get("data", {}) if ab.get("ok") else {},
-            "otx": otx.get("data", {}) if otx.get("ok") else {},
+            "ipinfo": calls["ipinfo"].data,
+            "virustotal": calls["virustotal"].data,
+            "shodan": calls["shodan"].data,
+            "abuseipdb": calls["abuseipdb"].data,
+            "otx": calls["otx"].data,
             "asn_meta": asn_meta,
+            "provider_status": _status_map(calls),
         }
         if provider_errors:
             data["errors"] = provider_errors
@@ -217,235 +465,227 @@ async def investigate_ip(ip: str) -> InvestigationResult:
         return InvestigationResult(ok=True, data=data, errors=result_errors)
 
 
-async def investigate_domain(domain: str) -> InvestigationResult:
+# --------------------------------------------------------------------------------------
+# Domain
+# --------------------------------------------------------------------------------------
+
+
+def _tag_ip_sources(active: Sequence[str], passive: Sequence[str]) -> List[Tuple[str, str]]:
+    """Order addresses active-first and record where each one came from.
+
+    ``ips = active_ips + passive_ips`` destroyed a distinction the author's own variable names
+    show he understood. "Resolved now" and "seen historically by VirusTotal" are different
+    evidentiary claims: a passive-only address may be years stale, and an active-only address
+    is one no passive source has ever corroborated. A verdict has to be able to tell them
+    apart, so the label travels with the address rather than being reconstructed later.
+    """
+    active_set = set(active)
+    passive_set = set(passive)
+    tagged: List[Tuple[str, str]] = []
+    for ip in dedupe_preserve_order([*active, *passive]):
+        if ip in active_set and ip in passive_set:
+            source = "active+passive"
+        elif ip in active_set:
+            source = "active"
+        else:
+            source = "passive"
+        tagged.append((ip, source))
+    return tagged
+
+
+def _passive_ips_from_vt(vt_data: Mapping[str, Any]) -> List[str]:
+    records = vt_data.get("vt_dns_records") or []
+    out: List[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record.get("type") not in {"A", "AAAA"}:
+            continue
+        value = record.get("value")
+        if value:
+            out.append(str(value))
+    return out
+
+
+async def _enrich_domain_ip(
+    *, client: httpx.AsyncClient, keys: ApiKeys, ip: str, source: str
+) -> Tuple[Dict[str, Any], List[str]]:
+    """One resolved address of a domain: five providers in one wave, then Cloudflare."""
+    calls = await _ip_provider_wave(client=client, keys=keys, ip=ip)
+    asn_meta, cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
+    if cloudflare is not None:
+        calls["cloudflare_asn"] = cloudflare
+
+    provider_errors, messages = _collect_errors(calls, prefix=f"{ip} :: ")
+
+    entry = _ip_entry(ip, calls, asn_meta)
+    entry["source"] = source
+    if provider_errors:
+        entry["errors"] = provider_errors
+    return entry, messages
+
+
+async def investigate_domain(domain: str, *, deadline: Optional[float] = None) -> InvestigationResult:
     if not is_valid_domain(domain):
         return InvestigationResult(ok=False, errors=["Invalid domain"], data={})
-    ips: List[str] = []
+    return await _with_deadline(_investigate_domain(domain), target=domain, deadline=deadline)
+
+
+async def _investigate_domain(domain: str) -> InvestigationResult:
     keys = _env_keys()
     result_errors: List[str] = []
-    domain_error_msgs: List[str] = []
+    warnings: List[str] = []
     domain_intel: Dict[str, Any] = {}
     domain_errors: Dict[str, Dict[str, Any]] = {}
-    out: List[Dict[str, Any]] = []
+
     async with create_client() as client:
-        vt_domain_task = (
-            asyncio.create_task(vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain))
-            if keys.vt_api_key
-            else None
+        vt_domain, otx_domain = await asyncio.gather(
+            _call_provider(
+                "virustotal_domain", vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)
+            ),
+            _call_provider("otx_domain", otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)),
         )
-        otx_domain_task = (
-            asyncio.create_task(otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain))
-            if keys.otx_api_key
-            else None
-        )
-
-        vt_domain = None
-        if vt_domain_task:
-            try:
-                vt_domain = await vt_domain_task
-            except Exception as e:  # noqa: BLE001
-                vt_domain = _error_payload(e)
-
-        otx_domain = None
-        if otx_domain_task:
-            try:
-                otx_domain = await otx_domain_task
-            except Exception as e:  # noqa: BLE001
-                otx_domain = _error_payload(e)
 
         passive_ips: List[str] = []
+        if vt_domain.ok:
+            domain_intel["virustotal"] = vt_domain.data
+            passive_ips = _passive_ips_from_vt(vt_domain.data)
+        if otx_domain.ok:
+            domain_intel["otx"] = otx_domain.data
 
-        if vt_domain:
-            if vt_domain.get("ok"):
-                vt_data = vt_domain.get("data", {}) or {}
-                domain_intel["virustotal"] = vt_data
-                dns_records = vt_data.get("vt_dns_records") or []
-                for record in dns_records:
-                    if not isinstance(record, dict):
-                        continue
-                    if record.get("type") not in {"A", "AAAA"}:
-                        continue
-                    value = record.get("value")
-                    if value:
-                        passive_ips.append(str(value))
-            elif not _should_suppress("virustotal_domain", vt_domain):
-                domain_errors["virustotal"] = _error_details(vt_domain)
-                domain_error_msgs.append(_error_summary("virustotal_domain", vt_domain))
+        domain_calls = {"virustotal": vt_domain, "otx": otx_domain}
+        domain_errors, domain_error_msgs = _collect_errors(domain_calls)
 
-        if otx_domain:
-            if otx_domain.get("ok"):
-                domain_intel["otx"] = otx_domain.get("data", {}) or {}
-            elif not _should_suppress("otx_domain", otx_domain):
-                domain_errors["otx"] = _error_details(otx_domain)
-                domain_error_msgs.append(_error_summary("otx_domain", otx_domain))
-
+        # utils.dns is the one sanctioned resolution site (docs/OPSEC.md section 3); the import
+        # stays local so tests/test_passivity.py keeps seeing exactly one resolver module.
         from tripper_recon.utils.dns import resolve_domain
 
         active_ips = await resolve_domain(domain)
-        ips = active_ips + passive_ips
-        if ips:
-            ips = dedupe_preserve_order(ips)
 
-        for ip in ips:
-            ptr = None
-            try:
-                vt = await vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip)
-            except Exception as e:  # noqa: BLE001
-                vt = _error_payload(e)
-            try:
-                sh = await shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip)
-            except Exception as e:  # noqa: BLE001
-                sh = _error_payload(e)
-            try:
-                ipi = await ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip)
-            except Exception as e:  # noqa: BLE001
-                ipi = _error_payload(e)
-            try:
-                ab = await abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip)
-            except Exception as e:  # noqa: BLE001
-                ab = _error_payload(e)
-            try:
-                otx_ip = await otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip)
-            except Exception as e:  # noqa: BLE001
-                otx_ip = _error_payload(e)
+        enrichable: List[Tuple[str, str]] = []
+        skipped: List[Dict[str, str]] = []
+        for ip, source in _tag_ip_sources(active_ips, passive_ips):
+            reason = non_public_ip_reason(ip)
+            if reason is None:
+                enrichable.append((ip, source))
+                continue
+            skipped.append({"ip": ip, "source": source, "reason": reason.lower()})
+            warnings.append(f"{ip} ({source}) skipped: {reason.lower()} addressing is never sent to a provider")
 
-            providers = {
-                "virustotal": vt,
-                "shodan": sh,
-                "ipinfo": ipi,
-                "abuseipdb": ab,
-                "otx": otx_ip,
-            }
-            provider_errors: Dict[str, Dict[str, Any]] = {}
-            for name, payload in providers.items():
-                if not payload or payload.get("ok"):
-                    continue
-                if _should_suppress(name, payload):
-                    continue
-                details = _error_details(payload)
-                if details:
-                    provider_errors[name] = details
-                result_errors.append(f"{ip} :: {_error_summary(name, payload)}")
+        gate = asyncio.Semaphore(MAX_CONCURRENT_IPS)
 
-            asn_meta: Dict[str, Any] = {}
-            if ipi.get("ok") and ipi["data"].get("asn"):
-                asn = int(ipi["data"]["asn"])
-                try:
-                    cf = await fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
-                except Exception as e:  # noqa: BLE001
-                    cf = _error_payload(e)
-                if cf.get("ok"):
-                    asn_meta = cf["data"]
-                elif not _should_suppress("cloudflare_asn", cf):
-                    details = _error_details(cf)
-                    if details:
-                        provider_errors["cloudflare_asn"] = details
-                    result_errors.append(f"{ip} :: {_error_summary('cloudflare_asn', cf)}")
+        async def _bounded(ip: str, source: str) -> Tuple[Dict[str, Any], List[str]]:
+            async with gate:
+                return await _enrich_domain_ip(client=client, keys=keys, ip=ip, source=source)
 
-            entry = {
-                "ip": ip,
-                "ptr": ptr,
-                "virustotal": vt.get("data", {}) if vt.get("ok") else {},
-                "shodan": sh.get("data", {}) if sh.get("ok") else {},
-                "ipinfo": ipi.get("data", {}) if ipi.get("ok") else {},
-                "abuseipdb": ab.get("data", {}) if ab.get("ok") else {},
-                "otx": otx_ip.get("data", {}) if otx_ip.get("ok") else {},
-                "asn_meta": asn_meta,
-            }
-            if provider_errors:
-                entry["errors"] = provider_errors
-            out.append(entry)
+        enriched = await asyncio.gather(*(_bounded(ip, source) for ip, source in enrichable))
 
+    out: List[Dict[str, Any]] = []
+    for entry, messages in enriched:
+        out.append(entry)
+        result_errors.extend(messages)
     result_errors.extend(domain_error_msgs)
 
-    data: Dict[str, Any] = {"domain": domain, "ips": out}
+    data: Dict[str, Any] = {
+        "domain": domain,
+        "ips": out,
+        "domain_provider_status": _status_map(domain_calls),
+    }
     if domain_intel:
         data["domain_intel"] = domain_intel
     if domain_errors:
         data["domain_errors"] = domain_errors
+    if skipped:
+        data["skipped_ips"] = skipped
 
-    return InvestigationResult(ok=True, data=data, errors=result_errors)
+    return InvestigationResult(ok=True, data=data, warnings=warnings, errors=result_errors)
+
+
+# --------------------------------------------------------------------------------------
+# ASN
+# --------------------------------------------------------------------------------------
+
+
+async def _resolve_neighbour_names(*, client: httpx.AsyncClient, asns: Sequence[int]) -> Dict[int, str]:
+    """Resolve neighbour ASNs to holder names, at most ``MAX_CONCURRENT_NEIGHBOUR_LOOKUPS`` at a time.
+
+    ``--neighbors 8`` asks for up to 24 lookups and the previous code gathered every one of
+    them at once. Failures are dropped rather than surfaced: a missing neighbour NAME degrades
+    the display to the bare ASN, which is not a finding.
+    """
+    gate = asyncio.Semaphore(MAX_CONCURRENT_NEIGHBOUR_LOOKUPS)
+
+    async def _one(asn: int) -> Tuple[int, ProviderCall]:
+        async with gate:
+            return asn, await _call_provider("ripe_neighbour_overview", as_overview(client=client, asn=asn))
+
+    names: Dict[int, str] = {}
+    for asn, call in await asyncio.gather(*(_one(a) for a in asns)):
+        if not call.ok:
+            continue
+        holder = call.data.get("holder")
+        if holder:
+            names[asn] = holder.split(" - ", 1)[-1] if " - " in holder else holder
+    return names
 
 
 async def investigate_asn(
-    asn: int | str, *, resolve_neighbors: int = 0, enrich: bool = False, enrich_limit: int = 50
+    asn: int | str,
+    *,
+    resolve_neighbors: int = 0,
+    enrich: bool = False,
+    enrich_limit: int = 50,
+    deadline: Optional[float] = None,
 ) -> InvestigationResult:
     if not is_valid_asn(asn):
         return InvestigationResult(ok=False, errors=["Invalid ASN"], data={})
     asn_int = int(asn)
+    return await _with_deadline(
+        _investigate_asn(asn_int, resolve_neighbors=resolve_neighbors, enrich=enrich, enrich_limit=enrich_limit),
+        target=f"AS{asn_int}",
+        deadline=deadline,
+    )
+
+
+async def _investigate_asn(
+    asn_int: int, *, resolve_neighbors: int, enrich: bool, enrich_limit: int
+) -> InvestigationResult:
     keys = _env_keys()
     async with create_client() as client:
-        # Kick off IPinfo ASN in parallel with Cloudflare when possible
-        ipi_task = asyncio.create_task(ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int))
-        ripe_overview_task = asyncio.create_task(as_overview(client=client, asn=asn_int))
-        ripe_abuse_task = asyncio.create_task(abuse_contact(client=client, asn=asn_int))
-        caida_task = asyncio.create_task(caida_asrank(client=client, asn=asn_int))
-        pdb_task = asyncio.create_task(peeringdb_ixps_for_asn(client=client, asn=asn_int))
+        # One wave. The previous code fully drained IPinfo, RIPEstat overview, abuse contact,
+        # CAIDA, PeeringDB and both Cloudflare calls before it even CREATED the routing-status,
+        # neighbours and prefixes tasks, which depend on none of them.
+        (
+            ipi,
+            ripe,
+            rp_abuse,
+            caida,
+            pdb,
+            rs,
+            nb,
+            ap,
+            cf_bgp,
+            cf,
+        ) = await asyncio.gather(
+            _call_provider("ipinfo_asn", ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int)),
+            _call_provider("ripe_overview", as_overview(client=client, asn=asn_int)),
+            _call_provider("ripe_abuse", abuse_contact(client=client, asn=asn_int)),
+            _call_provider("caida", caida_asrank(client=client, asn=asn_int)),
+            _call_provider("peeringdb", peeringdb_ixps_for_asn(client=client, asn=asn_int)),
+            _call_provider("ripe_routing_status", routing_status(client=client, asn=asn_int)),
+            _call_provider("ripe_neighbors", asn_neighbours(client=client, asn=asn_int)),
+            _call_provider("ripe_prefixes", announced_prefixes(client=client, asn=asn_int)),
+            _call_provider(
+                "cloudflare_bgp",
+                bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+            ),
+            _call_provider(
+                "cloudflare_asn",
+                fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+            ),
+        )
 
-        cf_bgp_task = None
-        if keys.cloudflare_api_token:
-            cf_bgp_task = asyncio.create_task(
-                bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int)
-            )
-
-        cf_task = None
-        if keys.cloudflare_api_token:
-            cf_task = asyncio.create_task(
-                fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int)
-            )
-
-        try:
-            ipi = await ipi_task
-        except Exception as e:  # noqa: BLE001
-            ipi = _error_payload(e)
-        try:
-            ripe = await ripe_overview_task
-        except Exception as e:  # noqa: BLE001
-            ripe = _error_payload(e)
-        try:
-            rp_abuse = await ripe_abuse_task
-        except Exception as e:  # noqa: BLE001
-            rp_abuse = _error_payload(e)
-        try:
-            caida = await caida_task
-        except Exception as e:  # noqa: BLE001
-            caida = _error_payload(e)
-        try:
-            pdb = await pdb_task
-        except Exception as e:  # noqa: BLE001
-            pdb = _error_payload(e)
-        if cf_bgp_task:
-            try:
-                cf_bgp = await cf_bgp_task
-            except Exception as e:  # noqa: BLE001
-                cf_bgp = _error_payload(e)
-        else:
-            cf_bgp = {"ok": False, "error": "missing_api_token"}
-
-        rs_task = asyncio.create_task(routing_status(client=client, asn=asn_int))
-        nb_task = asyncio.create_task(asn_neighbours(client=client, asn=asn_int))
-        ap_task = asyncio.create_task(announced_prefixes(client=client, asn=asn_int))
-        try:
-            rs = await rs_task
-        except Exception as e:  # noqa: BLE001
-            rs = _error_payload(e)
-        try:
-            nb = await nb_task
-        except Exception as e:  # noqa: BLE001
-            nb = _error_payload(e)
-        try:
-            ap = await ap_task
-        except Exception as e:  # noqa: BLE001
-            ap = _error_payload(e)
-        if cf_task:
-            try:
-                cf = await cf_task
-            except Exception as e:  # noqa: BLE001
-                cf = _error_payload(e)
-        else:
-            cf = {"ok": False}
-
-        providers = {
+        calls: Dict[str, ProviderCall] = {
             "ipinfo_asn": ipi,
             "ripe_overview": ripe,
             "ripe_abuse": rp_abuse,
@@ -454,50 +694,38 @@ async def investigate_asn(
             "ripe_routing_status": rs,
             "ripe_neighbors": nb,
             "ripe_prefixes": ap,
+            "cloudflare_bgp": cf_bgp,
+            "cloudflare_asn": cf,
         }
-        if cf_bgp_task:
-            providers["cloudflare_bgp"] = cf_bgp
-        if cf_task:
-            providers["cloudflare_asn"] = cf
-        provider_errors: Dict[str, Dict[str, Any]] = {}
-        result_errors: List[str] = []
-        for name, payload in providers.items():
-            if not payload or payload.get("ok"):
-                continue
-            if _should_suppress(name, payload):
-                continue
-            details = _error_details(payload)
-            if details:
-                provider_errors[name] = details
-            result_errors.append(_error_summary(name, payload))
+        provider_errors, result_errors = _collect_errors(calls)
 
         meta: Dict[str, Any] = {}
         # Prefer Cloudflare values when present; fall back to IPinfo
-        if cf.get("ok"):
-            meta.update(cf["data"])
-        if ipi.get("ok"):
+        if cf.ok:
+            meta.update(cf.data)
+        if ipi.ok:
             # Only set fields that are missing from CF
-            for k, v in ipi["data"].items():
+            for k, v in ipi.data.items():
                 if k not in meta or meta.get(k) in (None, ""):
                     meta[k] = v
-        if ripe.get("ok"):
-            holder = ripe["data"].get("holder")
+        if ripe.ok:
+            holder = ripe.data.get("holder")
             name = holder
             if name and ("-" in name):
                 name = name.split(" - ", 1)[-1]
             if name and (not meta.get("name")):
                 meta["name"] = name
             # Country code could be combined into name like asn tool; keep separate
-        if rp_abuse.get("ok"):
-            contacts = rp_abuse["data"].get("abuse_contacts") or []
+        if rp_abuse.ok:
+            contacts = rp_abuse.data.get("abuse_contacts") or []
             if contacts:
                 meta["abuseContacts"] = contacts
-        if caida.get("ok"):
-            for k, v in caida["data"].items():
+        if caida.ok:
+            for k, v in caida.data.items():
                 if k not in meta or meta.get(k) in (None, ""):
                     meta[k] = v
-        if pdb.get("ok"):
-            ixps = pdb["data"].get("ixps") or []
+        if pdb.ok:
+            ixps = pdb.data.get("ixps") or []
             existing = meta.get("ixps") or []
             existing_names = {i.get("name") for i in existing if isinstance(i, dict) and i.get("name")}
             new_names = {i.get("name") for i in ixps if isinstance(i, dict) and i.get("name")}
@@ -507,11 +735,11 @@ async def investigate_asn(
 
         # Attach CF BGP incidents summary if available
         meta_bgp: Dict[str, Any] = {}
-        if cf_bgp.get("ok"):
-            meta_bgp = cf_bgp.get("data", {})
+        if cf_bgp.ok:
+            meta_bgp = dict(cf_bgp.data)
         # Add RIPE routing counts
-        if rs.get("ok"):
-            d = rs.get("data", {})
+        if rs.ok:
+            d = rs.data
             v4p = (d.get("announced_space", {}).get("v4", {}) or {}).get("prefixes")
             v6p = (d.get("announced_space", {}).get("v6", {}) or {}).get("prefixes")
             neigh = d.get("observed_neighbours")
@@ -523,8 +751,8 @@ async def investigate_asn(
                 }
             )
         # Add RIPE neighbours lists
-        if nb.get("ok"):
-            neighs = nb.get("data", {}).get("neighbours", [])
+        if nb.ok:
+            neighs = nb.data.get("neighbours", [])
             upstream = [n.get("asn") for n in neighs if n.get("type") == "left"]
             downstream = [n.get("asn") for n in neighs if n.get("type") == "right"]
             uncertain = [n.get("asn") for n in neighs if n.get("type") == "uncertain"]
@@ -537,7 +765,7 @@ async def investigate_asn(
             )
             # Optionally resolve first N neighbor names via RIPE as-overview
             if resolve_neighbors and resolve_neighbors > 0:
-                to_resolve = set()
+                to_resolve: set[int] = set()
                 for seq in (
                     upstream[:resolve_neighbors],
                     downstream[:resolve_neighbors],
@@ -546,16 +774,9 @@ async def investigate_asn(
                     for a in seq:
                         if isinstance(a, int):
                             to_resolve.add(a)
-                name_map: Dict[int, str] = {}
-                tasks = [asyncio.create_task(as_overview(client=client, asn=int(a))) for a in to_resolve]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for a, reso in zip(to_resolve, results, strict=False):
-                    if isinstance(reso, dict) and reso.get("ok"):
-                        holder = reso.get("data", {}).get("holder")
-                        if holder:
-                            # Trim "ASNAME - Company" style
-                            name = holder.split(" - ", 1)[-1] if " - " in holder else holder
-                            name_map[int(a)] = name
+                # Sorted, not set-ordered: the lookup order was previously whatever the set
+                # iterated as, which is stable within a run but not across them.
+                name_map = await _resolve_neighbour_names(client=client, asns=sorted(to_resolve))
 
                 def _name_list(lst: list[int]) -> list[str]:
                     out: list[str] = []
@@ -572,8 +793,8 @@ async def investigate_asn(
                     }
                 )
         # Add announced prefixes lists (limited)
-        if ap.get("ok"):
-            prefs = ap.get("data", {}).get("prefixes", [])
+        if ap.ok:
+            prefs = ap.data.get("prefixes", [])
             v4_list = [
                 p.get("prefix") for p in prefs if isinstance(p.get("prefix"), str) and ":" not in p.get("prefix")
             ]
@@ -595,21 +816,25 @@ async def investigate_asn(
                 meta_bgp.update({"inetnums": inetnums})
 
         warnings: list[str] = []
-        ipinfo_suppressed = _should_suppress("ipinfo_asn", ipi)
-        if keys.cloudflare_api_token and not cf.get("ok"):
+        if keys.cloudflare_api_token and not cf.ok:
             warnings.append("cloudflare_query_failed_or_missing")
-        if not ipi.get("ok") and not ipinfo_suppressed:
+        if not ipi.ok and not ipi.suppressed:
             warnings.append("ipinfo_query_failed_or_missing")
-        if not ripe.get("ok"):
+        if not ripe.ok:
             warnings.append("ripestat_overview_failed")
-        if not rp_abuse.get("ok"):
+        if not rp_abuse.ok:
             warnings.append("ripestat_abuse_failed")
-        if not caida.get("ok"):
+        if not caida.ok:
             warnings.append("caida_failed")
-        if not pdb.get("ok"):
+        if not pdb.ok:
             warnings.append("peeringdb_failed")
 
-        data: Dict[str, Any] = {"asn": asn_int, "meta": meta, "bgp": meta_bgp}
+        data: Dict[str, Any] = {
+            "asn": asn_int,
+            "meta": meta,
+            "bgp": meta_bgp,
+            "provider_status": _status_map(calls),
+        }
         if provider_errors:
             data["errors"] = provider_errors
 

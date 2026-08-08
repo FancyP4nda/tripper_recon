@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 from rich.console import Console, RenderableType
 
-from tripper_recon.reporting.console import esc, render_asn_header, render_ip_analysis
+from tripper_recon.reporting.console import esc, render_asn_bgp_panels, render_asn_header, render_ip_analysis
 
 # ANSI SGR fragments rich emits for the named colours used by this module.
 GREEN = "\x1b[32m"
@@ -352,4 +352,305 @@ def test_provider_errors_escapes_hostile_detail() -> None:
     coloured = _ansi(render_ip_analysis(IP, data))
 
     assert "boom [/] [green]ok[/]" in plain
+    assert GREEN not in coloured and GREEN_BOLD not in coloured
+
+
+# --------------------------------------------------------------------------------------------
+# 4.7 — the BGP hijack envelope
+#
+# The provider module (``providers/cloudflare_rest.bgp_incidents``) was rewritten so it stops
+# emitting a role split it cannot substantiate. Its envelope keys changed, and this renderer
+# had to change with them. What is under test here is not formatting: it is that the renderer
+# never presents an inference as an observation.
+#
+# The defect these lock out, in the order it used to happen:
+#   1. ``as_victim = total - as_hijacker`` — a subtraction across two different denominators
+#      (an all-pages total against a single-page count).
+#   2. that remainder rendered as the sentence "always as a victim" — an attribution claim.
+#   3. ``hj.get("total") or 0`` — which turned an unknown total into a confident zero, and,
+#      after the provider rename, would print the literal string ``None`` as the count.
+# --------------------------------------------------------------------------------------------
+
+ASN = 64500
+
+
+def _hijacks(**overrides: Any) -> dict[str, Any]:
+    """A complete hijack envelope in the shape ``_summarise_hijacks`` returns."""
+    envelope: dict[str, Any] = {
+        "total_incidents": 4,
+        "events_examined": 4,
+        "pages_fetched": 1,
+        "counts_complete": True,
+        "as_hijacker": 1,
+        "as_victim": 3,
+        "split_available": True,
+        "split_unavailable_reason": None,
+    }
+    envelope.update(overrides)
+    return envelope
+
+
+def _bgp_line(render: Callable[..., str], **bgp: Any) -> str:
+    """Render the BGP panel group and return it as one whitespace-normalised line."""
+    out = render(render_asn_bgp_panels(ASN, {}, bgp), width=200)
+    return " ".join(out.split())
+
+
+# Panel 1 emits these row labels, in this order. Slicing between them isolates a single row,
+# which matters for the negative assertions: the panel also carries the ASN and a Radar URL, so
+# a bare ``"6" not in line`` would match the ``6`` inside ``AS64500`` and fail for the wrong
+# reason. A negative assertion that can pass or fail by accident is not evidence.
+_PANEL1_LABELS = (
+    "BGP Neighbors",
+    "Customer cone",
+    "BGP Hijacks (past 1y)",
+    "BGP Route leaks (past 1y)",
+    "In-depth BGP info",
+)
+
+
+def _bgp_row(render: Callable[..., str], label: str, **bgp: Any) -> str:
+    """Return just the value cell of one panel-1 row, whitespace-normalised."""
+    line = _bgp_line(render, **bgp)
+    if f"{label} " not in line:
+        return ""
+    tail = line.split(f"{label} ", 1)[1]
+    for other in _PANEL1_LABELS:
+        if other != label:
+            tail = tail.split(f" {other}", 1)[0]
+    return tail.strip()
+
+
+def test_hijack_absent_total_says_unavailable_not_none(render: Callable[..., str]) -> None:
+    """Cloudflare reporting no ``total_count`` is unknown, not zero and not the word ``None``.
+
+    Pre-fix, ``hj.get("total") or 0`` read the removed key, got ``None``, and the row rendered
+    the affirmative-looking literal ``None`` — which an analyst reads as "no incidents".
+    """
+    line = _bgp_line(render, hijacks=_hijacks(total_incidents=None, split_available=False))
+
+    assert "BGP Hijacks (past 1y) unavailable (Cloudflare reported no total)" in line
+    assert "Involved in" not in line
+
+
+def test_hijack_zero_total_says_none(render: Callable[..., str]) -> None:
+    """A counted zero is a real observation and keeps saying so."""
+    line = _bgp_line(render, hijacks=_hijacks(total_incidents=0, events_examined=0, as_hijacker=0, as_victim=0))
+
+    assert "BGP Hijacks (past 1y) None" in line
+
+
+@pytest.mark.parametrize(
+    "as_hijacker,as_victim,expected",
+    [
+        (0, 4, "Involved in 4 incidents (always as a victim)"),
+        (4, 0, "Involved in 4 incidents (always as a hijacker)"),
+        (1, 3, "Involved in 4 incidents (1 as hijacker • 3 as victim)"),
+    ],
+)
+def test_hijack_split_is_rendered_when_substantiated(
+    render: Callable[..., str], as_hijacker: int, as_victim: int, expected: str
+) -> None:
+    """The prose forms are permitted — but only over a complete, provider-confirmed split."""
+    line = _bgp_line(render, hijacks=_hijacks(as_hijacker=as_hijacker, as_victim=as_victim))
+
+    assert expected in line
+
+
+def test_hijack_singular_incident(render: Callable[..., str]) -> None:
+    line = _bgp_line(render, hijacks=_hijacks(total_incidents=1, events_examined=1, as_hijacker=0, as_victim=1))
+
+    assert "Involved in 1 incident (always as a victim)" in line
+    assert "1 incidents" not in line
+
+
+def test_hijack_without_split_reports_the_reason_and_no_role_numbers(render: Callable[..., str]) -> None:
+    """When the enumeration is incomplete the renderer must say so and print no role counts."""
+    row = _bgp_row(
+        render,
+        "BGP Hijacks (past 1y)",
+        hijacks=_hijacks(
+            total_incidents=97,
+            events_examined=50,
+            pages_fetched=10,
+            counts_complete=False,
+            as_hijacker=None,
+            as_victim=None,
+            split_available=False,
+            split_unavailable_reason="pagination_page_limit_reached",
+        ),
+    )
+
+    assert row == (
+        "Involved in 97 incidents (role split unavailable: pagination_page_limit_reached; 50 of 97 incidents examined)"
+    )
+    assert "as hijacker" not in row
+    assert "as victim" not in row
+
+
+def test_hijack_never_recomputes_the_victim_count(render: Callable[..., str]) -> None:
+    """``total_incidents - as_hijacker`` must not reappear in the renderer.
+
+    This is the exact defect the provider rewrite removed. A partial envelope that still
+    carries a hijacker count is the shape that tempts a renderer into finishing the arithmetic:
+    10 total, 3 hijacker, therefore "7 as victim". Seven is not an observation of anything.
+    """
+    row = _bgp_row(
+        render,
+        "BGP Hijacks (past 1y)",
+        hijacks=_hijacks(
+            total_incidents=10,
+            events_examined=3,
+            counts_complete=False,
+            as_hijacker=3,
+            as_victim=None,
+            split_available=False,
+            split_unavailable_reason="events_do_not_name_victims",
+        ),
+    )
+
+    assert "7" not in row
+    assert "as victim" not in row
+    assert "as hijacker" not in row
+
+
+def test_hijack_split_claimed_but_incomplete_is_not_trusted(render: Callable[..., str]) -> None:
+    """A cached or hand-edited envelope claiming a split without both counts prints neither.
+
+    ``split_available`` is the provider's assertion. Rendering ``None as hijacker`` on the
+    strength of it would be the same failure mode in a new coat.
+    """
+    line = _bgp_line(render, hijacks=_hijacks(as_victim=None, split_available=True))
+
+    assert "role split unavailable" in line
+    assert "None as" not in line
+
+
+@pytest.mark.parametrize("bogus", ["4", True, 4.5, None])
+def test_hijack_non_integer_total_is_unavailable_never_zero(render: Callable[..., str], bogus: Any) -> None:
+    """Anything that is not a real count is unknown. It is never silently coerced to zero."""
+    line = _bgp_line(render, hijacks=_hijacks(total_incidents=bogus, split_available=False))
+
+    assert "unavailable (Cloudflare reported no total)" in line
+    assert "BGP Hijacks (past 1y) None" not in line
+
+
+def test_hijack_legacy_envelope_keys_are_not_read(render: Callable[..., str]) -> None:
+    """The pre-rewrite keys are gone. Reading them again would resurrect the old semantics."""
+    row = _bgp_row(render, "BGP Hijacks (past 1y)", hijacks={"total": 12, "as_hijacker": 5, "as_victim": 7})
+
+    assert row == "unavailable (Cloudflare reported no total)"
+
+
+def test_hijack_reason_is_escaped(render: Callable[..., str]) -> None:
+    """The reason string reaches the terminal; treat it as untrusted like every other field.
+
+    Asserted on the plain render rather than on ANSI: panel 3 legitimately styles its own
+    labels green, so a whole-output ``GREEN not in`` check would fail on unrelated colour. If
+    the reason were unescaped, rich would consume the tags and the literal text would vanish.
+    """
+    row = _bgp_row(
+        render,
+        "BGP Hijacks (past 1y)",
+        hijacks=_hijacks(split_available=False, split_unavailable_reason="[green]clean[/]"),
+    )
+
+    assert "[green]clean[/]" in row
+
+
+def test_hijack_row_omitted_when_cloudflare_did_not_answer(render: Callable[..., str]) -> None:
+    """No envelope means the question was never answered; the row stays off the screen.
+
+    Rendering a zero here would be the ``0/0`` defect again in a different panel.
+    """
+    line = _bgp_line(render, ripe_announced_prefixes_v4=3)
+
+    assert "BGP Hijacks" not in line
+
+
+# --------------------------------------------------------------------------------------------
+# route leaks
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "total,expected",
+    [
+        (None, "BGP Route leaks (past 1y) unavailable (Cloudflare reported no total)"),
+        (0, "BGP Route leaks (past 1y) None"),
+        (6, "BGP Route leaks (past 1y) 6"),
+    ],
+)
+def test_leaks_distinguish_unknown_from_zero(render: Callable[..., str], total: Any, expected: str) -> None:
+    line = _bgp_line(render, leaks={"total_incidents": total})
+
+    assert expected in line
+
+
+def test_leaks_legacy_total_key_is_not_read(render: Callable[..., str]) -> None:
+    row = _bgp_row(render, "BGP Route leaks (past 1y)", leaks={"total": 6})
+
+    assert row == "unavailable (Cloudflare reported no total)"
+
+
+# --------------------------------------------------------------------------------------------
+# 2.3 — address provenance
+#
+# ``orchestrators._tag_ip_sources`` records whether an address was resolved now or only ever
+# seen historically by VirusTotal. Those are different evidentiary claims and the analyst has
+# to be able to tell which one is on screen; before this the two were concatenated into one
+# undifferentiated list and the distinction was destroyed at assembly time.
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source,must_contain",
+    [
+        ("active", "resolved now by the system resolver"),
+        ("passive", "seen historically in VirusTotal DNS records, may be stale"),
+        ("active+passive", "resolved now, and corroborated by VirusTotal DNS history"),
+    ],
+)
+def test_address_source_states_the_evidentiary_claim(
+    render: Callable[..., str], source: str, must_contain: str
+) -> None:
+    out = render(render_ip_analysis(IP, _ip_data(source=source)))
+
+    assert "address_source" in out
+    assert source in " ".join(out.split())
+    assert must_contain in " ".join(out.split())
+
+
+def test_passive_only_address_is_not_described_as_resolved(render: Callable[..., str]) -> None:
+    """The whole point of the tag: a passive hit must not read as a live answer."""
+    out = " ".join(render(render_ip_analysis(IP, _ip_data(source="passive"))).split())
+
+    assert "resolved now" not in out
+
+
+def test_absent_source_renders_no_row(render: Callable[..., str]) -> None:
+    """On the ``ip`` subcommand the operator supplied the address; there is no claim to qualify."""
+    out = render(render_ip_analysis(IP, _ip_data()))
+
+    assert "address_source" not in out
+
+
+@pytest.mark.parametrize("empty", ["", "   ", None])
+def test_empty_source_renders_no_row(render: Callable[..., str], empty: Any) -> None:
+    out = render(render_ip_analysis(IP, _ip_data(source=empty)))
+
+    assert "address_source" not in out
+
+
+def test_unknown_source_tag_is_echoed_not_guessed_at(render: Callable[..., str]) -> None:
+    """A tag this renderer does not know is still a fact the collector recorded."""
+    out = " ".join(render(render_ip_analysis(IP, _ip_data(source="ct-log"))).split())
+
+    assert "address_source ct-log" in out
+    assert "resolved now" not in out
+
+
+def test_hostile_source_tag_is_escaped() -> None:
+    coloured = _ansi(render_ip_analysis(IP, _ip_data(source="[green]active[/]")))
+
     assert GREEN not in coloured and GREEN_BOLD not in coloured

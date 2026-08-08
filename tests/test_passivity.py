@@ -16,11 +16,17 @@ If one of these fails in CI, the fix is almost never "edit the test". It is eith
 be removed. Read the failure message; each one names the passive alternative.
 
 KNOWN LIMIT — read this before trusting a green run. A static scan sees URL *literals*. It
-cannot see a host assembled at runtime: ``client.get("https://" + target_host + "/")`` is a
-direct fetch of the target and passes every test in this file. Verified by mutation, and it
-is the reason roadmap item 2.1 exists — an httpx request event hook at the single
-``create_client()`` construction point, checking the same allowlist against the URL actually
-about to go out. These tests are the compile-time half of that pair, not a substitute for it.
+cannot see a host assembled at runtime: a request built from a target-derived hostname is a
+direct fetch of the target and passes every test in this file. Verified by mutation.
+
+That gap is now covered by its runtime counterpart (roadmap item 2.1, shipped): an httpx
+request event hook installed at the single ``create_client()`` construction point, which
+checks ``ALLOWED_EGRESS_HOSTS`` against the URL actually about to go out and raises
+``PassiveBoundaryViolation`` otherwise. See ``tripper_recon/utils/http.py`` and
+``tests/test_http.py``. The two halves are complementary: the static scan fails the build, the
+hook fails the run. Neither is a substitute for the other, and
+``test_http.test_runtime_allowlist_is_a_subset_of_the_static_allowlist`` fails if the two
+allowlists drift apart.
 
 Authority for the constraint: docs/OPSEC.md sections 1, 2 and 7.
 """
@@ -222,9 +228,11 @@ MUTATING_METHODS = ("put", "patch", "delete")
 # --------------------------------------------------------------------------------------
 #
 # Active DNS on the domain path is the tool's ONE documented exception (docs/OPSEC.md
-# section 3): the target's own nameserver sees the query. That exception is tolerable only
-# while it lives in exactly one auditable place, so that roadmap item 2.2 can put it behind
-# an --active-dns flag by editing a single module.
+# section 3): the target's own nameserver sees the query. The operator has ACCEPTED that
+# resolver egress as a known risk, so this is a disclosed exception rather than a defect
+# awaiting a fix. An accepted risk is only auditable while it lives in exactly one place --
+# that is what these markers enforce. A second resolution site would make the OPSEC document
+# wrong and would widen the accepted risk without anyone accepting the wider version.
 
 ResolutionMarker = tuple[str, str, str]  # (label, regex, why it reaches the target)
 
@@ -606,9 +614,10 @@ def test_name_resolution_only_in_utils_dns(label: str, pattern: str, why: str) -
     operator runs, and that nameserver logs a query for their own domain at the moment the
     investigation started. For a single-use phishing domain that is the tell.
 
-    Confining it to one module is what keeps the exception honest — and what makes roadmap
-    item 2.2 (passive DNS by default, live resolution behind --active-dns) a single-file
-    change rather than an archaeology project.
+    The operator has accepted that resolver egress as a known risk, which makes it a disclosed
+    exception rather than an open defect. Confining it to one module is what keeps the
+    disclosure honest: the risk that was accepted is the one this module performs, and a
+    second resolution site would silently widen it.
     """
     rx = re.compile(pattern)
     offenders = [
@@ -624,9 +633,9 @@ def test_name_resolution_only_in_utils_dns(label: str, pattern: str, why: str) -
         f"WHY THIS MATTERS: {why}.\n\n"
         "Resolving the target's name is the ONE active thing this tool does, and it is "
         "documented as an exception precisely because it is confined to one auditable "
-        "module (docs/OPSEC.md section 3). A second resolution site makes the OPSEC "
-        "document wrong, and makes the planned --active-dns opt-out incomplete the day it "
-        "ships — users would disable resolution and still be resolving.\n\n"
+        "module (docs/OPSEC.md section 3). The operator accepted THAT exception, in THAT "
+        "module. A second resolution site makes the OPSEC document wrong and widens an "
+        "accepted risk past what was accepted.\n\n"
         "USE INSTEAD: the passive A/AAAA records VirusTotal already returns "
         "(vt_dns_records, parsed in orchestrators.py), or call "
         "tripper_recon.utils.dns.resolve_domain so the one exception stays in one place."
@@ -664,3 +673,78 @@ def test_utils_dns_is_the_module_that_resolves() -> None:
         "roadmap item 2.2 and excellent news, but this gate must then be tightened to forbid "
         "resolution EVERYWHERE, including here, rather than left passing vacuously."
     )
+
+
+# ------------------------------------------------------------------------------------------
+# The runtime hook is only as good as its coverage of client construction
+# ------------------------------------------------------------------------------------------
+
+#: The one module allowed to build an ``httpx.AsyncClient``. Everything else receives a client
+#: as a parameter, which is what keeps the egress hook on every request.
+CLIENT_FACTORY_MODULE = "tripper_recon/utils/http.py"
+
+#: Module-level httpx calls that open a connection without any client the package configured.
+_BARE_HTTPX_CALL_RE = re.compile(r"\bhttpx\.(get|post|put|patch|delete|head|options|request|stream)\s*\(")
+
+#: Client construction. ``httpx.Client`` is included even though the package is async: a
+#: synchronous client is just as capable of reaching the target and just as unhooked.
+_CLIENT_CONSTRUCTION_RE = re.compile(r"\bhttpx\.(Async)?Client\s*\(")
+
+
+def test_only_utils_http_constructs_a_client() -> None:
+    """The egress allowlist is a request event hook, and hooks belong to a client instance.
+
+    ``create_client()`` installs ``_enforce_egress_allowlist``; a bare ``httpx.AsyncClient()``
+    has an empty ``event_hooks["request"]`` list and enforces nothing. So the runtime half of
+    the passive boundary holds only while ``create_client`` is the sole constructor.
+
+    That property was true but unguarded: every provider takes ``client`` as a parameter today
+    purely by convention. A future provider that builds its own client would keep passing the
+    static URL-literal scan above, keep passing every other test in this file, and silently
+    lose the one check that can see a host assembled at runtime -- which is precisely the
+    case the hook exists for. This test makes the convention a build gate.
+    """
+    offenders: list[str] = []
+    for path, lineno, line in _iter_source_lines(PACKAGE_ROOT):
+        rel = _rel(path)
+        stripped = line.strip()
+        # Type annotations (`client: httpx.AsyncClient`) are not construction; require the
+        # opening parenthesis, which the regex does.
+        if _CLIENT_CONSTRUCTION_RE.search(line) and rel != CLIENT_FACTORY_MODULE:
+            offenders.append(f"{rel}:{lineno}  {stripped}")
+        if _BARE_HTTPX_CALL_RE.search(line):
+            offenders.append(f"{rel}:{lineno}  {stripped}")
+
+    assert not offenders, (
+        "PASSIVE BOUNDARY: an HTTP client is being created outside "
+        f"{CLIENT_FACTORY_MODULE}, or a module-level httpx call is opening a connection "
+        "with no client at all.\n\n" + "\n".join(f"  {o}" for o in offenders) + "\n\n"
+        "Only tripper_recon/utils/http.create_client() installs the egress allowlist hook "
+        "(_enforce_egress_allowlist). A client built anywhere else has an empty "
+        "event_hooks['request'] and can contact any host, including the target under "
+        "investigation, with nothing raising PassiveBoundaryViolation.\n\n"
+        "Fix: accept `client: httpx.AsyncClient` as a parameter the way every existing "
+        "provider does, and let the orchestrator supply create_client(). If a genuinely "
+        "different client shape is needed, add it to utils/http.py so it inherits the hook, "
+        "and record why in docs/OPSEC.md."
+    )
+
+
+def test_the_factory_actually_installs_the_hook() -> None:
+    """Guard against the gate above passing vacuously.
+
+    ``test_only_utils_http_constructs_a_client`` is worth nothing if ``create_client`` stops
+    installing the hook -- the whole package would funnel through one unguarded constructor
+    and every test would stay green.
+    """
+    from tripper_recon.utils.http import _enforce_egress_allowlist, create_client
+
+    client = create_client()
+    try:
+        assert _enforce_egress_allowlist in client.event_hooks.get("request", []), (
+            "create_client() no longer installs the egress allowlist hook. The runtime half "
+            "of the passive boundary is disabled: nothing inspects the host a request is "
+            "actually about to leave for."
+        )
+    finally:
+        pass

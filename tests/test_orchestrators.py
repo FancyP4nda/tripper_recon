@@ -1,5 +1,9 @@
 """Regression tests for tripper_recon.orchestrators internals.
 
+Two generations of fixes are pinned here. The W2/W3 section at the bottom covers the refactor:
+the provider envelope, IP provenance tagging, the widened non-public-address guard, the
+wall-clock deadline, and the fan-out that replaced the serial loops.
+
 Covers the W0 fixes owned by this module (commit ae59d18):
 
 * 0.1 — credential redaction on the error path (``_error_payload``). Pre-fix, the helper copied
@@ -18,8 +22,10 @@ of leaving the machine, which is what "passive-only" has to mean in a test suite
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -27,14 +33,22 @@ import httpx
 import pytest
 import respx
 
+from tripper_recon import orchestrators
 from tripper_recon.orchestrators import (
+    MAX_CONCURRENT_IPS,
+    MAX_CONCURRENT_NEIGHBOUR_LOOKUPS,
     _error_details,
     _error_payload,
     _error_summary,
     _should_suppress,
+    _tag_ip_sources,
     investigate_asn,
+    investigate_domain,
     investigate_ip,
+    non_public_ip_reason,
 )
+from tripper_recon.utils import http
+from tripper_recon.utils.http import PassiveBoundaryViolation
 from tripper_recon.utils.redact import _SECRET_ENV_VARS, REDACTED
 
 SECRET = "sk-tripperTESTSECRET-0123456789"
@@ -373,3 +387,506 @@ async def test_investigate_asn_accepts_a_valid_asn_as_far_as_the_guard() -> None
     assert result.data["asn"] == 15169
     # Every provider was refused by respx, so each one that ran reports an error.
     assert result.errors
+
+
+# =======================================================================================
+# W2 / W3 — the refactor
+# =======================================================================================
+
+
+@pytest.fixture
+def unlimited_rate() -> Iterator[None]:
+    """Lift the concurrency ceiling for tests that measure parallelism, then put it back.
+
+    ``configure_rate_limit`` mutates a module global that outlives the test. Several tests
+    below assert an exact peak concurrency; with the default ceiling of 10 in force they would
+    be measuring the limiter rather than the fan-out they are meant to check.
+    """
+    saved = http._configured_rate
+    http.configure_rate_limit(500)
+    try:
+        yield
+    finally:
+        http._configured_rate = saved
+
+
+class _Probe:
+    """Counts concurrent entries and records the high-water mark."""
+
+    def __init__(self) -> None:
+        self.current = 0
+        self.peak = 0
+        self.total = 0
+
+    @asynccontextmanager
+    async def track(self) -> AsyncIterator[None]:
+        self.current += 1
+        self.total += 1
+        self.peak = max(self.peak, self.current)
+        try:
+            yield
+        finally:
+            self.current -= 1
+
+
+def _ok(**data: Any) -> dict[str, Any]:
+    return {"ok": True, "data": dict(data)}
+
+
+def _slow_provider(probe: _Probe, *, hold: float = 0.02, **data: Any) -> Callable[..., Any]:
+    """A stand-in provider that reports when it is in flight."""
+
+    async def _call(**_kwargs: Any) -> dict[str, Any]:
+        async with probe.track():
+            await asyncio.sleep(hold)
+        return _ok(**data)
+
+    return _call
+
+
+# ---------------------------------------------------------------------------
+# 2.4 — the non-public guard is wider than is_private
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ip", ["224.0.0.1", "239.255.255.250", "233.252.0.1", "ff02::1"])
+async def test_investigate_ip_refuses_multicast_addressing(ip: str) -> None:
+    """``is_private`` covers neither 224/4 nor ff00::/8, so these reached five providers.
+
+    Multicast addressing in an indicator list is a misconfiguration or an internal capture, and
+    forwarding it discloses the operator's own network under the operator's own API keys.
+    """
+    async with no_network():
+        result = await investigate_ip(ip)
+
+    assert result.ok is False
+    assert result.data == {}
+    assert result.errors == [f"Multicast IP address {ip} cannot be investigated."]
+
+
+@pytest.mark.parametrize("ip", ["10.0.0.1", "127.0.0.1", "169.254.1.1", "::1", "0.0.0.0", "240.0.0.1"])
+async def test_investigate_ip_still_refuses_everything_it_refused_before(ip: str) -> None:
+    """The widened guard must not have narrowed anywhere. These all report as private."""
+    async with no_network():
+        result = await investigate_ip(ip)
+
+    assert result.ok is False
+    assert result.errors == [f"Private IP address {ip} cannot be investigated."]
+
+
+@pytest.mark.parametrize("ip", ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"])
+def test_non_public_ip_reason_passes_public_space(ip: str) -> None:
+    assert non_public_ip_reason(ip) is None
+
+
+def test_non_public_ip_reason_leaves_parsing_to_the_validator() -> None:
+    """An unparseable string is not this function's failure to report -- ``is_valid_ip`` runs
+    first and rejects it with the message the tests above pin."""
+    assert non_public_ip_reason("not-an-ip") is None
+
+
+# ---------------------------------------------------------------------------
+# 2.3 — IP provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("active", "passive", "expected"),
+    [
+        (["1.1.1.1"], [], [("1.1.1.1", "active")]),
+        ([], ["1.1.1.1"], [("1.1.1.1", "passive")]),
+        (["1.1.1.1"], ["1.1.1.1"], [("1.1.1.1", "active+passive")]),
+        (
+            ["1.1.1.1", "2.2.2.2"],
+            ["2.2.2.2", "3.3.3.3"],
+            [("1.1.1.1", "active"), ("2.2.2.2", "active+passive"), ("3.3.3.3", "passive")],
+        ),
+        # Duplicates within one source collapse, and active ordering is preserved.
+        (["9.9.9.9", "9.9.9.9"], [], [("9.9.9.9", "active")]),
+        ([], [], []),
+    ],
+)
+def test_tag_ip_sources(active: list[str], passive: list[str], expected: list[tuple[str, str]]) -> None:
+    """``ips = active_ips + passive_ips`` threw this away.
+
+    "Resolved now" and "seen historically by VirusTotal" are different evidentiary claims: a
+    passive-only address may be years stale, and an active-only address is one no passive
+    source has corroborated. The verdict engine cannot recover the difference later.
+    """
+    assert _tag_ip_sources(active, passive) == expected
+
+
+async def test_domain_entries_carry_their_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["1.1.1.1", "2.2.2.2"]))
+    monkeypatch.setattr(orchestrators, "vt_domain_summary", _vt_domain_with_a_records(["2.2.2.2", "3.3.3.3"]))
+
+    result = await investigate_domain("example.test")
+
+    assert [(e["ip"], e["source"]) for e in result.data["ips"]] == [
+        ("1.1.1.1", "active"),
+        ("2.2.2.2", "active+passive"),
+        ("3.3.3.3", "passive"),
+    ]
+
+
+async def test_domain_path_refuses_non_public_resolved_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Split-horizon DNS and sinkholes resolve to RFC1918 routinely.
+
+    Pre-fix the domain path had no guard at all, so those addresses went straight to five
+    third parties. They are now excluded, recorded with a reason, and warned about -- dropping
+    them silently would be its own small lie.
+    """
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr(
+        "tripper_recon.utils.dns.resolve_domain",
+        _fake_resolver(["10.0.0.5", "8.8.8.8", "224.0.0.1"]),
+    )
+
+    result = await investigate_domain("internal.example.test")
+
+    assert [e["ip"] for e in result.data["ips"]] == ["8.8.8.8"]
+    assert result.data["skipped_ips"] == [
+        {"ip": "10.0.0.5", "source": "active", "reason": "private"},
+        {"ip": "224.0.0.1", "source": "active", "reason": "multicast"},
+    ]
+    assert any("10.0.0.5" in w for w in result.warnings)
+    assert any("224.0.0.1" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# 3.6 — the provider envelope keeps "never asked" apart from "asked, came back clean"
+# ---------------------------------------------------------------------------
+
+
+async def test_provider_status_distinguishes_unconfigured_from_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect this envelope exists to prevent.
+
+    ``data['virustotal'] == {}`` is what the renderer sees for a provider that answered with
+    nothing, for one that errored, and for one that was never asked because no key is set.
+    Those are not the same claim, and the last one is not evidence of anything.
+    """
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    monkeypatch.setattr(orchestrators, "shodan_host", _fake_provider(_ok(ports=[443])))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    status = result.data["provider_status"]
+
+    # Answered.
+    assert status["shodan"]["outcome"] == "ok"
+    assert result.data["shodan"] == {"ports": [443]}
+
+    # Never asked -- no credential. Same empty dict, entirely different meaning.
+    assert result.data["virustotal"] == {}
+    assert status["virustotal"]["outcome"] == "not_configured"
+    assert status["virustotal"]["suppressed"] is True
+
+    # Every provider is accounted for, and every one carries its cost.
+    assert set(status) >= {"virustotal", "ipinfo", "shodan", "abuseipdb", "otx"}
+    assert all("elapsed_seconds" in entry for entry in status.values())
+
+
+async def test_provider_status_records_a_real_failure_with_its_redacted_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VT_API_KEY", "vt-key-0123456789")
+
+    async with respx.mock(assert_all_called=False) as router:
+        # 403, not a 5xx: a rejected credential is not retryable, so this test asserts the
+        # envelope rather than sitting through utils.backoff's retry schedule.
+        router.get(url__regex=r"https://www\.virustotal\.com/api/v3/ip_addresses/.*").respond(403)
+        result = await investigate_ip("8.8.8.8")
+
+    status = result.data["provider_status"]["virustotal"]
+    assert status["outcome"] == "error"
+    assert status.get("suppressed") is None
+    assert status["error"]["status_code"] == 403
+    # A non-suppressed failure still reaches the analyst, exactly as before the refactor.
+    assert any(msg.startswith("virustotal | 403") for msg in result.errors)
+    assert result.data["errors"]["virustotal"]["status_code"] == 403
+
+
+async def test_asn_path_reports_every_provider_it_considered() -> None:
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_asn(15169)
+
+    assert set(result.data["provider_status"]) == {
+        "ipinfo_asn",
+        "ripe_overview",
+        "ripe_abuse",
+        "caida",
+        "peeringdb",
+        "ripe_routing_status",
+        "ripe_neighbors",
+        "ripe_prefixes",
+        "cloudflare_bgp",
+        "cloudflare_asn",
+    }
+    # No Cloudflare token in the environment, so both Cloudflare calls are configuration
+    # rather than incidents -- recorded, and deliberately absent from the error list.
+    assert result.data["provider_status"]["cloudflare_bgp"]["outcome"] == "not_configured"
+    assert not any("cloudflare" in msg for msg in result.errors)
+
+
+async def test_domain_path_reports_its_domain_level_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    # resolve_domain is stubbed even though this test does not care about addresses: it is the
+    # one call in the package that leaves the machine without going through respx, and a test
+    # suite for a passive tool must not emit a DNS query as a side effect.
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver([]))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_domain("example.test")
+
+    status = result.data["domain_provider_status"]
+    assert status["virustotal"]["outcome"] == "not_configured"
+    assert status["otx"]["outcome"] == "not_configured"
+
+
+async def test_one_provider_raising_does_not_take_the_others_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole reason 23 try/except blocks existed. One helper now guarantees it everywhere."""
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    monkeypatch.setenv("OTX_API_KEY", "otx-key-0123456789")
+
+    async def _explode(**_kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("provider module blew up")
+
+    monkeypatch.setattr(orchestrators, "shodan_host", _explode)
+    monkeypatch.setattr(orchestrators, "otx_ip_pulses", _fake_provider(_ok(otx_pulse_count=2)))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert result.ok is True
+    assert result.data["otx"] == {"otx_pulse_count": 2}
+    assert result.data["provider_status"]["shodan"]["outcome"] == "error"
+    assert result.data["provider_status"]["shodan"]["error"]["error"] == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# 3.7 — per-target wall-clock deadline
+# ---------------------------------------------------------------------------
+
+
+async def test_investigate_ip_reports_a_deadline_breach_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """There was no elapsed-time awareness anywhere; OTX alone has a ~84s worst case."""
+
+    async def _never_returns(**_kwargs: Any) -> dict[str, Any]:
+        await asyncio.sleep(30)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _never_returns)
+
+    started = time.monotonic()
+    result = await investigate_ip("8.8.8.8", deadline=0.05)
+    elapsed = time.monotonic() - started
+
+    assert result.ok is False
+    assert result.data == {}
+    assert "deadline" in result.errors[0]
+    assert "8.8.8.8" in result.errors[0]
+    assert elapsed < 5.0, f"the deadline did not fire; waited {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize(
+    ("call", "target"),
+    [
+        (lambda: investigate_domain("example.test", deadline=0.05), "example.test"),
+        (lambda: investigate_asn(15169, deadline=0.05), "AS15169"),
+    ],
+    ids=["domain", "asn"],
+)
+async def test_every_entry_point_carries_a_deadline(
+    monkeypatch: pytest.MonkeyPatch, call: Callable[[], Any], target: str
+) -> None:
+    async def _never_returns(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(30)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(orchestrators, "vt_domain_summary", _never_returns)
+    monkeypatch.setattr(orchestrators, "as_overview", _never_returns)
+    # Structurally unreachable behind the hanging domain-level wave, but stubbed anyway: no
+    # test may depend on timing to avoid emitting a real DNS query.
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver([]))
+
+    result = await call()
+
+    assert result.ok is False
+    assert target in result.errors[0]
+    assert "deadline" in result.errors[0]
+
+
+async def test_a_non_positive_deadline_disables_the_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit zero is an opt-out, not a zero-second budget."""
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+
+    result = await investigate_ip("8.8.8.8", deadline=0)
+
+    assert result.ok is True
+
+
+# ---------------------------------------------------------------------------
+# 3.8 / 3.9 — the fan-out
+# ---------------------------------------------------------------------------
+
+
+async def test_the_five_per_ip_providers_run_in_one_wave(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    probe = _Probe()
+    for attribute in ("vt_ip_summary", "ipinfo_ip", "shodan_host", "abuseipdb_check", "otx_ip_pulses"):
+        monkeypatch.setattr(orchestrators, attribute, _slow_provider(probe))
+
+    result = await investigate_ip("8.8.8.8")
+
+    assert result.ok is True
+    assert probe.peak == 5, f"providers ran {probe.peak}-at-a-time; the wave is still partly serial"
+
+
+async def test_domain_ips_are_enriched_concurrently(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    """Pre-fix: five bare awaits per IP, inside a serial loop over IPs. Both levels serial."""
+    probe = _Probe()
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave(probe))
+    monkeypatch.setattr(
+        "tripper_recon.utils.dns.resolve_domain",
+        _fake_resolver([f"8.8.8.{n}" for n in range(1, 7)]),
+    )
+
+    result = await investigate_domain("example.test")
+
+    assert len(result.data["ips"]) == 6
+    assert probe.peak == 6, f"IPs were enriched {probe.peak}-at-a-time; the loop is still serial"
+
+
+async def test_domain_fan_out_is_bounded(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    """A domain with many A records must not create unbounded work.
+
+    The concurrency ceiling is lifted for this test precisely so the bound being measured is
+    ``MAX_CONCURRENT_IPS`` and not the rate limiter standing in for it.
+    """
+    probe = _Probe()
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave(probe))
+    monkeypatch.setattr(
+        "tripper_recon.utils.dns.resolve_domain",
+        _fake_resolver([f"8.8.{n // 250}.{n % 250}" for n in range(1, 41)]),
+    )
+
+    result = await investigate_domain("bigfanout.example.test")
+
+    assert len(result.data["ips"]) == 40
+    assert probe.peak == MAX_CONCURRENT_IPS
+
+
+async def test_asn_providers_run_in_one_wave(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    """Pre-fix: wave 1 was fully drained before routing-status, neighbours and prefixes were
+    even created, and those three depend on nothing in wave 1."""
+    probe = _Probe()
+    for attribute in (
+        "ipinfo_asn",
+        "as_overview",
+        "abuse_contact",
+        "caida_asrank",
+        "peeringdb_ixps_for_asn",
+        "routing_status",
+        "asn_neighbours",
+        "announced_prefixes",
+        "bgp_incidents",
+        "fetch_asn_metadata",
+    ):
+        monkeypatch.setattr(orchestrators, attribute, _slow_provider(probe))
+
+    result = await investigate_asn(15169)
+
+    assert result.ok is True
+    assert probe.peak == 10, f"the ASN path ran {probe.peak}-at-a-time; it is still two waves"
+
+
+async def test_neighbour_resolution_is_bounded(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    """``--neighbors 8`` asks for up to 24 lookups; they used to gather unbounded."""
+    neighbours = [
+        *({"asn": 100 + n, "type": "left"} for n in range(10)),
+        *({"asn": 200 + n, "type": "right"} for n in range(10)),
+        *({"asn": 300 + n, "type": "uncertain"} for n in range(10)),
+    ]
+    probe = _Probe()
+
+    async def _overview(*, client: Any, asn: int) -> dict[str, Any]:
+        async with probe.track():
+            await asyncio.sleep(0.01)
+        return _ok(holder=f"AS{asn} - Example Network")
+
+    monkeypatch.setattr(orchestrators, "as_overview", _overview)
+    monkeypatch.setattr(orchestrators, "asn_neighbours", _fake_provider(_ok(neighbours=neighbours)))
+
+    result = await investigate_asn(15169, resolve_neighbors=8)
+
+    assert probe.peak <= MAX_CONCURRENT_NEIGHBOUR_LOOKUPS
+    # One call in the main wave, then 8 upstream + 8 downstream + 8 uncertain.
+    assert probe.total == 25
+    assert result.data["bgp"]["ripe_upstream_named"][0] == "Example Network (100)"
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by the section above
+# ---------------------------------------------------------------------------
+
+
+def _fake_provider(payload: dict[str, Any]) -> Callable[..., Any]:
+    async def _call(**_kwargs: Any) -> dict[str, Any]:
+        return payload
+
+    return _call
+
+
+def _fake_resolver(addresses: list[str]) -> Callable[..., Any]:
+    async def _resolve(_domain: str) -> list[str]:
+        return list(addresses)
+
+    return _resolve
+
+
+def _fake_wave(probe: _Probe | None = None) -> Callable[..., Any]:
+    """Stand in for ``_ip_provider_wave`` with five providers that answered emptily."""
+
+    async def _wave(*, client: Any, keys: Any, ip: str) -> dict[str, Any]:
+        if probe is None:
+            return _empty_calls()
+        async with probe.track():
+            await asyncio.sleep(0.02)
+        return _empty_calls()
+
+    return _wave
+
+
+def _empty_calls() -> dict[str, Any]:
+    return {
+        name: orchestrators._envelope(name, _ok(), 0.0)
+        for name in ("virustotal", "ipinfo", "shodan", "abuseipdb", "otx")
+    }
+
+
+def _vt_domain_with_a_records(addresses: list[str]) -> Callable[..., Any]:
+    records = [{"type": "A", "value": address} for address in addresses]
+    return _fake_provider(_ok(vt_dns_records=records))
+
+
+async def test_a_boundary_violation_is_not_downgraded_to_a_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one exception ``_call_provider`` must not absorb.
+
+    A ``PassiveBoundaryViolation`` means the tool tried to contact a host nobody approved --
+    most plausibly the target itself. Filing that as one more entry in ``result.errors``, beside
+    a routine 500, would take the loudest signal in the codebase and make it look like noise.
+    """
+
+    async def _off_boundary(**_kwargs: Any) -> dict[str, Any]:
+        raise PassiveBoundaryViolation("target-under-investigation.test", "https://REDACTED/")
+
+    monkeypatch.setattr(orchestrators, "vt_ip_summary", _off_boundary)
+
+    with pytest.raises(PassiveBoundaryViolation):
+        await investigate_ip("8.8.8.8")

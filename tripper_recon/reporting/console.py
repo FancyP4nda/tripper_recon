@@ -1,11 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from rich.console import Group, RenderableType
 from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
+
+#: How each `source` tag produced by ``orchestrators._tag_ip_sources`` is explained on screen.
+#:
+#: The tag itself is machine vocabulary; the parenthetical is the evidentiary claim, and the
+#: claim is the point. "Resolved now" means this address answers for the domain at the moment
+#: of the lookup. "Seen historically" means VirusTotal recorded the mapping at some past date
+#: this tool does not currently retain -- the address may have moved on years ago. An analyst
+#: pivoting on a passive-only address is making a weaker statement than one pivoting on an
+#: active answer, and the report has to say which one they are holding.
+_SOURCE_EXPLANATIONS: Dict[str, str] = {
+    "active": "active - resolved now by the system resolver",
+    "passive": "passive - seen historically in VirusTotal DNS records, may be stale",
+    "active+passive": "active+passive - resolved now, and corroborated by VirusTotal DNS history",
+}
 
 
 def esc(value: Any) -> str:
@@ -23,6 +37,34 @@ def esc(value: Any) -> str:
 
 def _fmt_ports(ports: Iterable[int]) -> str:
     return ", ".join(str(p) for p in sorted({int(p) for p in ports if isinstance(p, int) or str(p).isdigit()}))
+
+
+def _fmt_source(source: Any) -> Optional[str]:
+    """Explain an address-provenance tag, or return ``None`` when there is nothing to say.
+
+    An unrecognised tag is echoed verbatim rather than dropped or guessed at: a tag this
+    renderer does not know about is still a fact the collector recorded, and inventing a gloss
+    for it would be the same class of error as the hijack split this module stopped printing.
+    """
+    if source is None:
+        return None
+    text = str(source).strip()
+    if not text:
+        return None
+    return _SOURCE_EXPLANATIONS.get(text, text)
+
+
+def _incident_count(value: Any) -> Optional[int]:
+    """Read an incident count, mapping anything that is not a real count to ``None``.
+
+    ``None`` means the provider did not report a total. Zero means it reported none. Collapsing
+    the two -- which ``hj.get("total") or 0`` did -- is the defect this whole path exists to
+    remove, so the coercion must never invent a zero. ``bool`` is excluded because ``True`` is
+    an ``int`` to Python and is not an incident count to anyone else.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _fmt_coords(coords: Dict[str, Any] | None) -> str:
@@ -51,6 +93,13 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
     table.add_column("Value", style="none")
 
     table.add_row("ip", ip)
+
+    # Provenance, when the caller recorded one. The `ip` subcommand does not: the operator typed
+    # the address, so there is no resolution claim to qualify. The domain path always does.
+    source_line = _fmt_source(data.get("source"))
+    if source_line:
+        table.add_row("address_source", esc(source_line))
+
     city = ipinfo.get("city")
     if city:
         table.add_row("city", esc(city))
@@ -243,6 +292,54 @@ def _join_asns(asns: list[int] | None, limit: int = 60) -> str:
     return s
 
 
+def _hijack_line(hj: Dict[str, Any]) -> str:
+    """Render the BGP hijack envelope from ``providers.cloudflare_rest.bgp_incidents``.
+
+    This function used to manufacture an attribution claim. It read a page-1 hijacker count,
+    subtracted it from an all-pages total, called the remainder the victim count, and printed
+    the result as the sentence "always as a victim" -- into a report an analyst pastes into a
+    ticket. The provider module now refuses to supply a split it cannot substantiate, and this
+    renderer's job is to say so out loud instead of filling the gap.
+
+    Three rules follow, and each one is the inverse of a bug that shipped:
+
+    * ``None`` is not zero. ``total_incidents``, ``as_hijacker`` and ``as_victim`` are each
+      ``int | None``; ``None`` means unknown, ``0`` means counted and found none. No ``or 0``.
+    * The victim figure is never recomputed here. ``total_incidents - as_hijacker`` is exactly
+      the arithmetic that was removed upstream and it must not come back downstream.
+    * The prose forms ("always as a victim", "always as a hijacker") assert that one role
+      accounts for every incident. That is only true over a complete enumeration, so they are
+      reachable only when the provider module reports ``split_available``.
+    """
+    total = _incident_count(hj.get("total_incidents"))
+    if total is None:
+        return "unavailable (Cloudflare reported no total)"
+    if total == 0:
+        return "None"
+
+    base = f"Involved in {total} incident{'' if total == 1 else 's'}"
+
+    if hj.get("split_available") is True:
+        as_hijacker = _incident_count(hj.get("as_hijacker"))
+        as_victim = _incident_count(hj.get("as_victim"))
+        # split_available is the provider's assertion that both counts exist. Verify rather
+        # than trust: a hand-edited or cached envelope could claim the split and omit a number,
+        # and printing "None as hijacker" is precisely the affirmative-looking nonsense this
+        # rewrite removes.
+        if as_hijacker is None or as_victim is None:
+            return f"{base} (role split unavailable: split_available set without both counts)"
+        if as_hijacker == 0:
+            return f"{base} (always as a victim)"
+        if as_victim == 0:
+            return f"{base} (always as a hijacker)"
+        return f"{base} ({as_hijacker} as hijacker • {as_victim} as victim)"
+
+    reason = hj.get("split_unavailable_reason") or "unspecified"
+    examined = _incident_count(hj.get("events_examined"))
+    examined_text = "an unreported number of" if examined is None else str(examined)
+    return f"{base} (role split unavailable: {esc(reason)}; {examined_text} of {total} incidents examined)"
+
+
 def render_asn_bgp_panels(
     asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], use_color: bool = False
 ) -> RenderableType:
@@ -264,22 +361,17 @@ def render_asn_bgp_panels(
 
     hj = bgp.get("hijacks", {}) if isinstance(bgp, dict) else {}
     leaks = bgp.get("leaks", {}) if isinstance(bgp, dict) else {}
-    if hj:
-        total_h = hj.get("total") or 0
-        as_h = hj.get("as_hijacker") or 0
-        as_v = hj.get("as_victim") if hj.get("as_victim") is not None else (total_h - as_h)
-        if total_h:
-            qual = (
-                " (always as a victim)"
-                if as_h == 0
-                else (" (always as a hijacker)" if as_v == 0 else f" ({as_h} as hijacker • {as_v} as victim)")
-            )
-            t1.add_row("BGP Hijacks (past 1y)", f"Involved in {total_h} incident{'' if total_h == 1 else 's'}{qual}")
+    if isinstance(hj, dict) and hj:
+        t1.add_row("BGP Hijacks (past 1y)", _hijack_line(hj))
+    if isinstance(leaks, dict) and leaks:
+        total_l = _incident_count(leaks.get("total_incidents"))
+        if total_l is None:
+            leak_text = "unavailable (Cloudflare reported no total)"
+        elif total_l == 0:
+            leak_text = "None"
         else:
-            t1.add_row("BGP Hijacks (past 1y)", "None")
-    if leaks:
-        total_l = leaks.get("total") or 0
-        t1.add_row("BGP Route leaks (past 1y)", "None" if total_l == 0 else str(total_l))
+            leak_text = str(total_l)
+        t1.add_row("BGP Route leaks (past 1y)", leak_text)
     t1.add_row("In-depth BGP info", f"https://radar.cloudflare.com/routing/as{asn}?dateRange=52w")
     panels.append(Text(f"--- BGP informations for AS{asn} ---", style="bold cyan"))
     panels.append(t1)
