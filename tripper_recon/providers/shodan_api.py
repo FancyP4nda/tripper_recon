@@ -28,5 +28,3 @@ async def shodan_host(*, client: httpx.AsyncClient, api_key: Optional[str], ip: 
         return {"ok": True, "data": {"ports": ports, "org": org, "tags": tags, "cpe": sorted(set(cpe))}}
 
     return await with_exponential_backoff(_call)
-
-

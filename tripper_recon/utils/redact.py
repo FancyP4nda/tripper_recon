@@ -80,13 +80,8 @@ def redact_url(url: str) -> str:
         if not parts.query:
             return _redact_literals(url)
         pairs = parse_qsl(parts.query, keep_blank_values=True)
-        cleaned = [
-            (name, REDACTED if name.lower() in _SENSITIVE_PARAMS else value)
-            for name, value in pairs
-        ]
-        rebuilt = urlunsplit(
-            (parts.scheme, parts.netloc, parts.path, urlencode(cleaned), parts.fragment)
-        )
+        cleaned = [(name, REDACTED if name.lower() in _SENSITIVE_PARAMS else value) for name, value in pairs]
+        rebuilt = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(cleaned), parts.fragment))
         return _redact_literals(rebuilt)
     except Exception:  # noqa: BLE001 - redaction must never raise on the error path
         return _redact_literals(url)

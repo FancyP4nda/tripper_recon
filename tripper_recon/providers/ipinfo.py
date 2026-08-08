@@ -73,9 +73,10 @@ async def ipinfo_asn(*, client: httpx.AsyncClient, token: Optional[str], asn: in
             "country": j.get("country"),
             "rir": j.get("rir"),
             "allocationDate": j.get("allocated") or j.get("allocation"),
-            "organization": (j.get("company") or {}).get("name") if isinstance(j.get("company"), dict) else j.get("org"),
+            "organization": (j.get("company") or {}).get("name")
+            if isinstance(j.get("company"), dict)
+            else j.get("org"),
         }
         return {"ok": True, "data": data}
 
     return await with_exponential_backoff(_call)
-

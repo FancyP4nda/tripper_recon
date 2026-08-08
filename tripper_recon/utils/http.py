@@ -14,10 +14,12 @@ _DEFAULT_BROWSER_UA = (
 
 _global_user_agent: str | None = None
 
+
 def configure_user_agent(ua: str | None) -> None:
     global _global_user_agent
     if ua:
         _global_user_agent = ua
+
 
 def _user_agent() -> str:
     if _global_user_agent:
@@ -53,9 +55,11 @@ def create_client(timeout: float = 15.0) -> httpx.AsyncClient:
 _global_sem: asyncio.Semaphore | None = None
 _init_rate: int = 10
 
+
 def configure_rate_limit(rate: int) -> None:
     global _init_rate
     _init_rate = max(1, rate)
+
 
 class RateLimiter:
     def __init__(self, rate: int | None = None):
@@ -70,5 +74,3 @@ class RateLimiter:
 
     async def __aexit__(self, *_: Any) -> None:
         self._sem.release()
-
-

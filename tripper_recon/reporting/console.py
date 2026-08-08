@@ -104,9 +104,9 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
         table.add_row("virustotal_analysis_link", esc(vt_link))
 
     if abuse:
-        reports = abuse.get('abuseipdb_reports', 0)
+        reports = abuse.get("abuseipdb_reports", 0)
         table.add_row("abuseipdb_reports", esc(reports))
-        conf_val = abuse.get('abuseipdb_confidence_score', 0)
+        conf_val = abuse.get("abuseipdb_confidence_score", 0)
         try:
             conf_int = int(conf_val)
         except Exception:
@@ -134,7 +134,7 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
 
     if ports:
         ports_sorted = sorted({int(p) for p in ports if isinstance(p, int) or str(p).isdigit()})
-        if str(ports_limit).lower() == 'all':
+        if str(ports_limit).lower() == "all":
             max_show = len(ports_sorted)
         else:
             try:
@@ -243,7 +243,9 @@ def _join_asns(asns: list[int] | None, limit: int = 60) -> str:
     return s
 
 
-def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], use_color: bool = False) -> RenderableType:
+def render_asn_bgp_panels(
+    asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], use_color: bool = False
+) -> RenderableType:
     panels: List[RenderableType] = []
 
     # Panel 1: BGP informations
@@ -267,8 +269,12 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
         as_h = hj.get("as_hijacker") or 0
         as_v = hj.get("as_victim") if hj.get("as_victim") is not None else (total_h - as_h)
         if total_h:
-            qual = " (always as a victim)" if as_h == 0 else (" (always as a hijacker)" if as_v == 0 else f" ({as_h} as hijacker • {as_v} as victim)")
-            t1.add_row("BGP Hijacks (past 1y)", f"Involved in {total_h} incident{'' if total_h==1 else 's'}{qual}")
+            qual = (
+                " (always as a victim)"
+                if as_h == 0
+                else (" (always as a hijacker)" if as_v == 0 else f" ({as_h} as hijacker • {as_v} as victim)")
+            )
+            t1.add_row("BGP Hijacks (past 1y)", f"Involved in {total_h} incident{'' if total_h == 1 else 's'}{qual}")
         else:
             t1.add_row("BGP Hijacks (past 1y)", "None")
     if leaks:
@@ -318,14 +324,14 @@ def render_asn_bgp_panels(asn: int, meta: Dict[str, Any], bgp: Dict[str, Any], u
         if v4_list:
             v4_str = "\n".join(str(p) for p in v4_list[:50])
             if len(v4_list) > 50:
-                v4_str += f"\n… and {len(v4_list)-50} more"
+                v4_str += f"\n… and {len(v4_list) - 50} more"
         t4.add_row("IPv4", v4_str)
 
         v6_str = "NONE"
         if v6_list:
             v6_str = "\n".join(str(p) for p in v6_list[:50])
             if len(v6_list) > 50:
-                v6_str += f"\n… and {len(v6_list)-50} more"
+                v6_str += f"\n… and {len(v6_list) - 50} more"
         t4.add_row("IPv6", v6_str)
         panels.append(Text(f"--- Aggregated IP resources for AS{asn} ---", style="bold cyan"))
         panels.append(t4)

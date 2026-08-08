@@ -67,5 +67,3 @@ def logger(module: str) -> Any:
         "warn": lambda msg, **c: _log(30, msg, **c),
         "error": lambda msg, **c: _log(40, msg, **c),
     }
-
-

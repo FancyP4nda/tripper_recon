@@ -331,8 +331,6 @@ async def test_cmd_domain_echoes_the_rejected_target_verbatim(
     assert target in capsys.readouterr().out
 
 
-
-
 @respx.mock
 @pytest.mark.parametrize(
     "target",

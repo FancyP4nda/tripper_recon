@@ -23,7 +23,8 @@ async def fetch_asn_metadata(*, client: httpx.AsyncClient, api_token: Optional[s
             "    abuseContacts rir allocationDate\n"
             "    ixps { name }\n"
             "  }\n"
-            "}"),
+            "}"
+        ),
         "variables": {"asn": asn},
     }
 
@@ -54,7 +55,8 @@ async def fetch_asn_metadata(*, client: httpx.AsyncClient, api_token: Optional[s
             "    abuseContacts rir allocationDate\n"
             "    ixps { name }\n"
             "  }\n"
-            "}"),
+            "}"
+        ),
         "variables": {"asn": f"AS{asn}"},
     }
 
@@ -76,4 +78,3 @@ async def fetch_asn_metadata(*, client: httpx.AsyncClient, api_token: Optional[s
     # try string fallback
     res2 = await with_exponential_backoff(_call_str)
     return res2
-

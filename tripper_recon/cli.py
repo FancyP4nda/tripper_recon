@@ -33,8 +33,8 @@ def _fmt_provider_error(detail: Any) -> str:
             parts.append(f"message={message}")
         url = detail.get("url")
         if url and not status and not reason and not message:
-             # Just an empty URL without a real error gets noisy
-             return "Connection Timeout / Network Error"
+            # Just an empty URL without a real error gets noisy
+            return "Connection Timeout / Network Error"
         elif url:
             parts.append(f"url={url}")
         body = detail.get("body")
@@ -71,10 +71,20 @@ def _print_whois_block(whois: Any) -> None:
         return
 
     priority = [
-        "Domain Name", "Registry Domain ID", "Registrar", "Registrar IANA ID",
-        "Registrar URL", "Registrar WHOIS Server", "Registrar Abuse Contact Email",
-        "Registrar Abuse Contact Phone", "Updated Date", "Creation Date",
-        "Registry Expiry Date", "Domain Status", "Name Server", "DNSSEC",
+        "Domain Name",
+        "Registry Domain ID",
+        "Registrar",
+        "Registrar IANA ID",
+        "Registrar URL",
+        "Registrar WHOIS Server",
+        "Registrar Abuse Contact Email",
+        "Registrar Abuse Contact Phone",
+        "Updated Date",
+        "Creation Date",
+        "Registry Expiry Date",
+        "Domain Status",
+        "Name Server",
+        "DNSSEC",
     ]
 
     console.print("\n[bold white]Whois Lookup[/]")
@@ -96,7 +106,7 @@ def _print_certificate_block(cert: Dict[str, Any], jarm: Any) -> None:
         ("version", "Version"),
         ("serial_number", "Serial Number"),
         ("thumbprint_sha256", "Thumbprint"),
-        ("signature_algorithm", "Signature Algorithm")
+        ("signature_algorithm", "Signature Algorithm"),
     ]:
         val = cert.get(key)
         if val:
@@ -132,9 +142,6 @@ def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
     return list(dict.fromkeys(targets)), str(p)
 
 
-
-
-
 async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
@@ -142,7 +149,7 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
         return 1
 
     if output == "console" and source_file:
-        console.print(f"\n[bold green]Processing {len(targets)} targets from \"{source_file}\"[/]\n")
+        console.print(f'\n[bold green]Processing {len(targets)} targets from "{source_file}"[/]\n')
 
     tasks = [investigate_ip(t) for t in targets]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -277,13 +284,19 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
                 console.print(f"  [cyan]virustotal_categories[/]: {j_cats}")
 
         dns_records = vt_dom.get("vt_dns_records") or []
-        passive_ips = [str(r.get("value")) for r in dns_records if isinstance(r, dict) and r.get("type") in {"A", "AAAA"} and r.get("value")]
+        passive_ips = [
+            str(r.get("value"))
+            for r in dns_records
+            if isinstance(r, dict) and r.get("type") in {"A", "AAAA"} and r.get("value")
+        ]
         if passive_ips:
             preview = ", ".join(passive_ips[:5])
             suffix = "" if len(passive_ips) <= 5 else f" ... (+{len(passive_ips) - 5} more)"
             console.print(f"  [cyan]virustotal_passive_ips[/]: {preview}{suffix}")
 
-    vt_link = (vt_dom.get("vt_link") if isinstance(vt_dom, dict) else None) or f"https://www.virustotal.com/gui/domain/{norm_domain}"
+    vt_link = (
+        vt_dom.get("vt_link") if isinstance(vt_dom, dict) else None
+    ) or f"https://www.virustotal.com/gui/domain/{norm_domain}"
     console.print(f"  [cyan]virustotal_analysis_link[/]: {vt_link}")
     console.print(f"  [cyan]abuseipdb_analysis_link[/]: https://www.abuseipdb.com/check/{norm_domain}")
 
@@ -303,7 +316,9 @@ async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str 
 
     if vt_dom:
         _print_whois_block(vt_dom.get("vt_whois"))
-        _print_certificate_block(vt_dom.get("vt_last_https_certificate") or {}, vt_dom.get("vt_last_https_certificate_jarm"))
+        _print_certificate_block(
+            vt_dom.get("vt_last_https_certificate") or {}, vt_dom.get("vt_last_https_certificate_jarm")
+        )
 
     if domain_errors:
         console.print("[bold red]domain_provider_errors:[/]")
@@ -339,7 +354,7 @@ async def _cmd_asn(
     neighbors: int = 8,
     enrich: bool = False,
     enrich_limit: int = 50,
-    monochrome: bool = False, # retained for flag compat, rich handles this via terminal settings or NO_COLOR
+    monochrome: bool = False,  # retained for flag compat, rich handles this via terminal settings or NO_COLOR
     prefixes_out: str | None = None,
     prefixes: str = "both",
 ) -> int:
@@ -358,7 +373,9 @@ async def _cmd_asn(
         console.print()
 
         if not meta:
-            console.print("[yellow]Note: Cloudflare Radar API token missing or request failed. Set CLOUDFLARE_API_TOKEN in .env for full ASN details.[/]\n")
+            console.print(
+                "[yellow]Note: Cloudflare Radar API token missing or request failed. Set CLOUDFLARE_API_TOKEN in .env for full ASN details.[/]\n"
+            )
 
         bgp = res.data.get("bgp", {})
         if bgp:
@@ -376,7 +393,11 @@ async def _cmd_asn(
 
             out_lines: list[str] = []
             name = meta.get("name") or ""
-            title = f"--- Aggregated IP resources for AS{asn} ({name}) ---" if name else f"--- Aggregated IP resources for AS{asn} ---"
+            title = (
+                f"--- Aggregated IP resources for AS{asn} ({name}) ---"
+                if name
+                else f"--- Aggregated IP resources for AS{asn} ---"
+            )
             out_lines.append(title)
             out_lines.append("")
 
@@ -417,9 +438,19 @@ async def _cmd_asn(
 def main() -> None:
     load_env()
     parser = argparse.ArgumentParser(prog="tripper-recon", description="Passive OSINT IP/Domain/ASN investigations")
-    parser.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format (may also be given after the subcommand)")
-    parser.add_argument("--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers")
-    parser.add_argument("--user-agent", type=str, default=None, help="Custom User-Agent string to spoof in HTTP requests")
+    parser.add_argument(
+        "-o",
+        "--format",
+        choices=["console", "json"],
+        default="console",
+        help="Output format (may also be given after the subcommand)",
+    )
+    parser.add_argument(
+        "--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers"
+    )
+    parser.add_argument(
+        "--user-agent", type=str, default=None, help="Custom User-Agent string to spoof in HTTP requests"
+    )
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -428,13 +459,21 @@ def main() -> None:
     # default=SUPPRESS so an omitted subcommand flag leaves the top-level value in place.
     # With a real default, argparse overwrote it and `-o json ip 8.8.8.8` silently emitted console text.
     p_ip.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
-    p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
+    p_ip.add_argument(
+        "--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)"
+    )
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
-    p_domain.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
-    p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
-
+    p_domain.add_argument(
+        "-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format"
+    )
+    p_domain.add_argument(
+        "--ports-limit",
+        type=str,
+        default="25",
+        help="Limit number of ports shown per IP in console (use 'all' to show all)",
+    )
 
     p_asn = sub.add_parser("asn", help="Lookup ASN details")
     p_asn.add_argument("asn", type=str)
@@ -444,7 +483,12 @@ def main() -> None:
     p_asn.add_argument("--enrich-limit", type=int, default=50, help="Limit inetnum lines during enrichment")
     p_asn.add_argument("--monochrome", action="store_true", help="Disable ANSI colors in console output")
     p_asn.add_argument("--prefixes-out", type=str, default=None, help="Write full prefix list to a text file")
-    p_asn.add_argument("--prefixes", choices=["v4", "v6", "both"], default="both", help="Which prefixes to include when writing --prefixes-out")
+    p_asn.add_argument(
+        "--prefixes",
+        choices=["v4", "v6", "both"],
+        default="both",
+        help="Which prefixes to include when writing --prefixes-out",
+    )
 
     args = parser.parse_args()
 
@@ -460,7 +504,9 @@ def main() -> None:
         case "ip":
             code = asyncio.run(_cmd_ip(args.ip, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
         case "domain":
-            code = asyncio.run(_cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25")))
+            code = asyncio.run(
+                _cmd_domain(args.domain, output=args.format, ports_limit=getattr(args, "ports_limit", "25"))
+            )
         case "asn":
             asn_str = str(args.asn).strip()
             if asn_str.lower().startswith("as"):
@@ -472,16 +518,18 @@ def main() -> None:
                 console.print(f"[bold red]Error:[/] Invalid ASN provided: {args.asn}")
                 code = 2
             else:
-                code = asyncio.run(_cmd_asn(
-                    asn_int,
-                    output=args.format,
-                    neighbors=args.neighbors,
-                    enrich=args.enrich,
-                    enrich_limit=args.enrich_limit,
-                    monochrome=args.monochrome,
-                    prefixes_out=getattr(args, "prefixes_out", None),
-                    prefixes=getattr(args, "prefixes", "both"),
-                ))
+                code = asyncio.run(
+                    _cmd_asn(
+                        asn_int,
+                        output=args.format,
+                        neighbors=args.neighbors,
+                        enrich=args.enrich,
+                        enrich_limit=args.enrich_limit,
+                        monochrome=args.monochrome,
+                        prefixes_out=getattr(args, "prefixes_out", None),
+                        prefixes=getattr(args, "prefixes", "both"),
+                    )
+                )
         case _:
             code = 2
     raise SystemExit(code)

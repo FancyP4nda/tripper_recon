@@ -228,8 +228,16 @@ async def investigate_domain(domain: str) -> InvestigationResult:
     domain_errors: Dict[str, Dict[str, Any]] = {}
     out: List[Dict[str, Any]] = []
     async with create_client() as client:
-        vt_domain_task = asyncio.create_task(vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)) if keys.vt_api_key else None
-        otx_domain_task = asyncio.create_task(otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)) if keys.otx_api_key else None
+        vt_domain_task = (
+            asyncio.create_task(vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain))
+            if keys.vt_api_key
+            else None
+        )
+        otx_domain_task = (
+            asyncio.create_task(otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain))
+            if keys.otx_api_key
+            else None
+        )
 
         vt_domain = None
         if vt_domain_task:
@@ -272,6 +280,7 @@ async def investigate_domain(domain: str) -> InvestigationResult:
                 domain_error_msgs.append(_error_summary("otx_domain", otx_domain))
 
         from tripper_recon.utils.dns import resolve_domain
+
         active_ips = await resolve_domain(domain)
         ips = active_ips + passive_ips
         if ips:
@@ -358,7 +367,9 @@ async def investigate_domain(domain: str) -> InvestigationResult:
     return InvestigationResult(ok=True, data=data, errors=result_errors)
 
 
-async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich: bool = False, enrich_limit: int = 50) -> InvestigationResult:
+async def investigate_asn(
+    asn: int | str, *, resolve_neighbors: int = 0, enrich: bool = False, enrich_limit: int = 50
+) -> InvestigationResult:
     if not is_valid_asn(asn):
         return InvestigationResult(ok=False, errors=["Invalid ASN"], data={})
     asn_int = int(asn)
@@ -373,11 +384,15 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
 
         cf_bgp_task = None
         if keys.cloudflare_api_token:
-            cf_bgp_task = asyncio.create_task(bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int))
+            cf_bgp_task = asyncio.create_task(
+                bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int)
+            )
 
         cf_task = None
         if keys.cloudflare_api_token:
-            cf_task = asyncio.create_task(fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int))
+            cf_task = asyncio.create_task(
+                fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int)
+            )
 
         try:
             ipi = await ipi_task
@@ -500,26 +515,34 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             v4p = (d.get("announced_space", {}).get("v4", {}) or {}).get("prefixes")
             v6p = (d.get("announced_space", {}).get("v6", {}) or {}).get("prefixes")
             neigh = d.get("observed_neighbours")
-            meta_bgp.update({
-                "ripe_announced_prefixes_v4": v4p,
-                "ripe_announced_prefixes_v6": v6p,
-                "ripe_observed_neighbours": neigh,
-            })
+            meta_bgp.update(
+                {
+                    "ripe_announced_prefixes_v4": v4p,
+                    "ripe_announced_prefixes_v6": v6p,
+                    "ripe_observed_neighbours": neigh,
+                }
+            )
         # Add RIPE neighbours lists
         if nb.get("ok"):
             neighs = nb.get("data", {}).get("neighbours", [])
             upstream = [n.get("asn") for n in neighs if n.get("type") == "left"]
             downstream = [n.get("asn") for n in neighs if n.get("type") == "right"]
             uncertain = [n.get("asn") for n in neighs if n.get("type") == "uncertain"]
-            meta_bgp.update({
-                "ripe_upstream_asns": upstream,
-                "ripe_downstream_asns": downstream,
-                "ripe_uncertain_asns": uncertain,
-            })
+            meta_bgp.update(
+                {
+                    "ripe_upstream_asns": upstream,
+                    "ripe_downstream_asns": downstream,
+                    "ripe_uncertain_asns": uncertain,
+                }
+            )
             # Optionally resolve first N neighbor names via RIPE as-overview
             if resolve_neighbors and resolve_neighbors > 0:
                 to_resolve = set()
-                for seq in (upstream[:resolve_neighbors], downstream[:resolve_neighbors], uncertain[:resolve_neighbors]):
+                for seq in (
+                    upstream[:resolve_neighbors],
+                    downstream[:resolve_neighbors],
+                    uncertain[:resolve_neighbors],
+                ):
                     for a in seq:
                         if isinstance(a, int):
                             to_resolve.add(a)
@@ -533,26 +556,34 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
                             # Trim "ASNAME - Company" style
                             name = holder.split(" - ", 1)[-1] if " - " in holder else holder
                             name_map[int(a)] = name
+
                 def _name_list(lst: list[int]) -> list[str]:
                     out: list[str] = []
                     for a in lst[:resolve_neighbors]:
                         nm = name_map.get(int(a))
                         out.append(f"{nm} ({a})" if nm else str(a))
                     return out
-                meta_bgp.update({
-                    "ripe_upstream_named": _name_list(upstream),
-                    "ripe_downstream_named": _name_list(downstream),
-                    "ripe_uncertain_named": _name_list(uncertain),
-                })
+
+                meta_bgp.update(
+                    {
+                        "ripe_upstream_named": _name_list(upstream),
+                        "ripe_downstream_named": _name_list(downstream),
+                        "ripe_uncertain_named": _name_list(uncertain),
+                    }
+                )
         # Add announced prefixes lists (limited)
         if ap.get("ok"):
             prefs = ap.get("data", {}).get("prefixes", [])
-            v4_list = [p.get("prefix") for p in prefs if isinstance(p.get("prefix"), str) and ":" not in p.get("prefix")]
+            v4_list = [
+                p.get("prefix") for p in prefs if isinstance(p.get("prefix"), str) and ":" not in p.get("prefix")
+            ]
             v6_list = [p.get("prefix") for p in prefs if isinstance(p.get("prefix"), str) and ":" in p.get("prefix")]
-            meta_bgp.update({
-                "ripe_prefixes_v4": v4_list,
-                "ripe_prefixes_v6": v6_list,
-            })
+            meta_bgp.update(
+                {
+                    "ripe_prefixes_v4": v4_list,
+                    "ripe_prefixes_v6": v6_list,
+                }
+            )
             # Optional enrichment: placeholder aggregation (fast). Full whois/pWhois can be added later.
             if enrich:
                 inetnums = {
@@ -583,4 +614,3 @@ async def investigate_asn(asn: int | str, *, resolve_neighbors: int = 0, enrich:
             data["errors"] = provider_errors
 
         return InvestigationResult(ok=True, data=data, warnings=warnings, errors=result_errors)
-

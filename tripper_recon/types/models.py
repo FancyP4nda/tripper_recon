@@ -37,5 +37,3 @@ class InvestigationResult(BaseModel):
     data: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
-
-

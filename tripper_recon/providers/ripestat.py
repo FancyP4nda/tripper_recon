@@ -39,5 +39,3 @@ async def asn_neighbours(*, client: httpx.AsyncClient, asn: int) -> Dict[str, An
 
 async def announced_prefixes(*, client: httpx.AsyncClient, asn: int) -> Dict[str, Any]:
     return await _get(client, "/announced-prefixes/data.json", {"resource": f"AS{asn}", "sourceapp": "tripper-recon"})
-
-

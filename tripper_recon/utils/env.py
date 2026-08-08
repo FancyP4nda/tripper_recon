@@ -20,4 +20,3 @@ def load_env() -> None:
         if p.is_file():
             load_dotenv(p, override=False)
             break
-

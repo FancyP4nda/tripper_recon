@@ -33,5 +33,3 @@ async def reverse_ptr(ip: str) -> str | None:
             return None
 
     return await asyncio.to_thread(_rev)
-
-

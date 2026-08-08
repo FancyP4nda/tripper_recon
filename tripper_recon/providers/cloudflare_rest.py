@@ -15,8 +15,12 @@ async def bgp_incidents(*, client: httpx.AsyncClient, api_token: Optional[str], 
     headers = {"Authorization": f"Bearer {api_token}"}
 
     async def _call() -> Dict[str, Any]:
-        r1 = await client.get(f"{CF_BASE}/bgp/hijacks/events", params={"dateRange": "52w", "involvedAsn": asn}, headers=headers)
-        r2 = await client.get(f"{CF_BASE}/bgp/leaks/events", params={"dateRange": "52w", "involvedAsn": asn}, headers=headers)
+        r1 = await client.get(
+            f"{CF_BASE}/bgp/hijacks/events", params={"dateRange": "52w", "involvedAsn": asn}, headers=headers
+        )
+        r2 = await client.get(
+            f"{CF_BASE}/bgp/leaks/events", params={"dateRange": "52w", "involvedAsn": asn}, headers=headers
+        )
         if r1.status_code >= 400 and r2.status_code >= 400:
             return {"ok": False, "error": "http_error"}
         out: Dict[str, Any] = {}
@@ -25,7 +29,11 @@ async def bgp_incidents(*, client: httpx.AsyncClient, api_token: Optional[str], 
             total = j1.get("result_info", {}).get("total_count")
             events = j1.get("result", {}).get("events", [])
             as_hijacker = len([e for e in events if e.get("hijacker_asn") == asn])
-            out["hijacks"] = {"total": total, "as_hijacker": as_hijacker, "as_victim": (total - as_hijacker) if isinstance(total, int) else None}
+            out["hijacks"] = {
+                "total": total,
+                "as_hijacker": as_hijacker,
+                "as_victim": (total - as_hijacker) if isinstance(total, int) else None,
+            }
         if r2.status_code < 400:
             j2 = r2.json()
             total = j2.get("result_info", {}).get("total_count")
@@ -33,5 +41,3 @@ async def bgp_incidents(*, client: httpx.AsyncClient, api_token: Optional[str], 
         return {"ok": True, "data": out}
 
     return await with_exponential_backoff(_call)
-
-

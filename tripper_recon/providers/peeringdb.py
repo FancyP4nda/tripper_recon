@@ -38,5 +38,3 @@ async def peeringdb_ixps_for_asn(*, client: httpx.AsyncClient, asn: int) -> Dict
         return {"ok": True, "data": {"ixps": ixps}}
 
     return await with_exponential_backoff(_call)
-
-
