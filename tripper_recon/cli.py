@@ -201,9 +201,36 @@ async def _cmd_ip(ip: str, *, output: str = "console", ports_limit: str = "25") 
     return 0 if failed == 0 else 1
 
 
+_DEFANG_MARKERS = ("hxxp", "hxxps", "[.]", "(.)", "[dot]", "[:]", "[//]")
+
+
+def _looks_defanged(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in _DEFANG_MARKERS)
+
+
 async def _cmd_domain(domain: str, *, output: str = "console", ports_limit: str = "25") -> int:
-    parsed = urlparse(domain)
-    norm_domain = parsed.hostname or domain.strip().strip("/")
+    # urlparse raises on some malformed input -- notably a defanged indicator such as
+    # `hxxps://evil[.]com`, which reads as an invalid IPv6 literal. Analysts paste defanged
+    # indicators routinely, so fail with an instruction instead of a traceback.
+    try:
+        parsed = urlparse(domain)
+        norm_domain = parsed.hostname or domain.strip().strip("/")
+    except ValueError:
+        hint = " It looks defanged - refang it first." if _looks_defanged(domain) else ""
+        log["error"]("Could not parse target", domain=domain)
+        if output == "console":
+            console.print(f"[bold red]Could not parse target:[/] {domain}.{hint}")
+        return 2
+
+    if _looks_defanged(norm_domain):
+        log["error"]("Target looks defanged", domain=norm_domain)
+        if output == "console":
+            console.print(
+                f"[bold red]Target looks defanged:[/] {norm_domain}\n"
+                "Refang it first, e.g. hxxps://evil[.]com -> evil.com"
+            )
+        return 2
 
     res = await investigate_domain(norm_domain)
     if not res.ok:
@@ -378,8 +405,8 @@ async def _cmd_asn(
 
 def main() -> None:
     load_env()
-    parser = argparse.ArgumentParser(prog="tripper-recon", description="Unified OSINT IP/Domain/ASN investigations")
-    parser.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    parser = argparse.ArgumentParser(prog="tripper-recon", description="Passive OSINT IP/Domain/ASN investigations")
+    parser.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format (may also be given after the subcommand)")
     parser.add_argument("--rate-limit", type=int, default=10, help="Max concurrent outgoing API requests across global providers")
     parser.add_argument("--user-agent", type=str, default=None, help="Custom User-Agent string to spoof in HTTP requests")
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
@@ -387,18 +414,20 @@ def main() -> None:
 
     p_ip = sub.add_parser("ip", help="Investigate an IP address")
     p_ip.add_argument("ip", type=str)
-    p_ip.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    # default=SUPPRESS so an omitted subcommand flag leaves the top-level value in place.
+    # With a real default, argparse overwrote it and `-o json ip 8.8.8.8` silently emitted console text.
+    p_ip.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_ip.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)")
 
     p_domain = sub.add_parser("domain", help="Investigate a domain")
     p_domain.add_argument("domain", type=str)
-    p_domain.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_domain.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_domain.add_argument("--ports-limit", type=str, default="25", help="Limit number of ports shown per IP in console (use 'all' to show all)")
 
 
     p_asn = sub.add_parser("asn", help="Lookup ASN details")
     p_asn.add_argument("asn", type=str)
-    p_asn.add_argument("-o", "--format", choices=["console", "json"], default="console", help="Output format")
+    p_asn.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_asn.add_argument("--neighbors", type=int, default=8, help="Resolve first N neighbors to names")
     p_asn.add_argument("--enrich", action="store_true", help="Enrich prefix info via whois/pWhois (slower)")
     p_asn.add_argument("--enrich-limit", type=int, default=50, help="Limit inetnum lines during enrichment")
@@ -434,7 +463,7 @@ def main() -> None:
             else:
                 code = asyncio.run(_cmd_asn(
                     asn_int,
-                    output=args.format or "console",
+                    output=args.format,
                     neighbors=args.neighbors,
                     enrich=args.enrich,
                     enrich_limit=args.enrich_limit,

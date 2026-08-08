@@ -15,7 +15,7 @@
 
 Tripper Recon is an async Open Source Intelligence (OSINT) tool for infrastructure investigations. Whether you are hunting for threat actors, reviewing SIEM logs, or profiling external IP addresses, Tripper gives you one interface over ten third-party intelligence providers.
 
-It offers a CLI for analysts and a REST API for local automation.
+It offers a CLI for analysts, with JSON output for scripted use.
 
 ## Key Features
 
@@ -24,7 +24,7 @@ It offers a CLI for analysts and a REST API for local automation.
 - **Passive collection**: every query goes to a third-party API. The tool does not scan, connect to, or fetch the target. See [OPSEC & Passivity](#opsec--passivity).
 - **Concurrent IP lookups**: the `ip` command queries its five providers in one wave and processes bulk target files concurrently.
 - **Retry with backoff**: jittered exponential backoff on provider requests.
-- **Two interfaces**: a `rich` console renderer for terminal work, and a FastAPI server for local programmatic access.
+- **Scriptable**: `-o json` emits the full result set; structured logs go to stderr so stdout stays parseable.
 
 > **Status.** This is an active project under review. A sequenced hardening plan, with a
 > known-defect list and file-line evidence, is in [`docs/ROADMAP.md`](docs/ROADMAP.md); the
@@ -40,7 +40,6 @@ The tool is built to investigate infrastructure without touching it. Full detail
 - **All intelligence comes from third-party APIs.** No port scan, no banner grab, no HTTP request to the target, no submission of a URL for live scanning.
 - **One documented exception:** the `domain` command resolves the target with your system resolver. That recursive lookup can reach the target's own authoritative nameserver. Treat it as a disclosure risk on a live investigation — see `docs/OPSEC.md`.
 - **Every query is visible to the provider.** A VirusTotal lookup under your API key is attributable to you.
-- **The REST server has no authentication.** Do not expose it beyond localhost.
 
 ---
 
@@ -81,9 +80,9 @@ tripper-recon asn 15169
 tripper-recon ip ./path/to/suspicious_ips.txt --format json
 ```
 
-> Put `--format` after the subcommand, as shown. The same flag exists at the top level but is
-> shadowed by the subcommand's own default, so `tripper-recon --format json ip 8.8.8.8` silently
-> emits console text. Fixing that is item 0.6 in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+`--format` works in either position — `tripper-recon -o json ip 8.8.8.8` and
+`tripper-recon ip 8.8.8.8 -o json` are equivalent. Structured logs go to stderr, so
+`tripper-recon ip targets.txt -o json | jq` is safe.
 
 ### Known limitations
 
@@ -91,29 +90,13 @@ Read these before you trust an answer. Each is tracked in [`docs/ROADMAP.md`](do
 
 | Limitation | Effect |
 |---|---|
-| **The tool states no verdict.** | It renders provider data. Deciding "malicious or not" is still your job. |
-| **A provider that was never asked renders as `0/0` in green.** | An unset `VT_API_KEY` looks the same as a clean VirusTotal result. Check your coverage. |
-| **Provider errors can echo an API key.** | Shodan and IPInfo carry the key in the query string, and the failing URL is copied into error output. Do not paste raw error output into a ticket. |
-| **Exit code is 0 even when every provider failed.** | Do not gate automation on exit status yet. |
-| **Colour is the only malice signal.** | Redirecting output to a file strips it. |
-| **No URL support.** | Pass the hostname to `domain` instead. Defanged input (`hxxp`, `[.]`) crashes the command. |
-
-### REST API
-
-Launch the built-in FastAPI server for programmatic access:
-
-```bash
-tripper-recon-api
-```
-
-Routes: `GET /health`, `/ip/{ip}`, `/domain/{domain}`, `/asn/{asn}`. Swagger UI and ReDoc are served automatically at `/docs` and `/redoc`.
-
-> **Security warning.** The server currently binds `0.0.0.0:8000` with no authentication, no
-> authorization, and no rate limiting, in a process that holds your provider API keys. Run it on a
-> trusted host only, and firewall the port. Binding to localhost by default is item 0.8 in
-> [`docs/ROADMAP.md`](docs/ROADMAP.md).
-
----
+| **The tool states no verdict.** | It renders provider data. Deciding "malicious or not" is still your job. This is the headline gap — see roadmap W5. |
+| **Exit code is 0 even when every provider failed.** | Do not gate automation on exit status yet. Roadmap item 4.2. |
+| **No coverage line.** | Nothing tells you how many providers actually answered. A sparse result and a clean result look alike. Roadmap item 4.4. |
+| **Colour carries most of the signal.** | `rich` strips colour when you redirect to a file, which is exactly the "paste into a ticket" workflow. Roadmap item 5.8. |
+| **No URL support.** | Pass the hostname to `domain` instead. Roadmap W6. |
+| **`--rate-limit` has no effect.** | The limiter constrains task creation rather than requests. Roadmap item 3.3. |
+| **The `domain` path queries providers serially per IP.** | Slow on a domain with many A records. Roadmap item 3.8. |
 
 ## Data Providers
 
@@ -147,8 +130,7 @@ API access requires configuring your provider keys. Create a `.env` file in the 
 
 ```ini
 # Core
-# Log level is numeric: 10=DEBUG, 20=INFO, 30=WARN, 40=ERROR.
-# A word such as INFO raises ValueError on import.
+# Log level: a number (10=DEBUG, 20=INFO, 30=WARN, 40=ERROR) or a name (DEBUG/INFO/WARN/ERROR).
 TRIPPER_RECON_LOG_LEVEL=20
 TRIPPER_RECON_USER_AGENT="Your Custom User Agent"
 

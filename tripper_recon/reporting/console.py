@@ -2,9 +2,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
 from rich.console import Group, RenderableType
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+
+def esc(value: Any) -> str:
+    """Render a provider-controlled value as literal text.
+
+    Every string in this module's output originates with a third party -- an OTX pulse title, a
+    Shodan org name, a WHOIS field. `rich` parses square brackets as markup, so an attacker-named
+    pulse such as ``evil [/] campaign`` raises MarkupError, and ``[green]0/94[/]`` renders as a
+    green zero. Escaping is both a crash guard and a display-spoof guard.
+    """
+    if value is None:
+        return ""
+    return escape(str(value))
 
 
 def _fmt_ports(ports: Iterable[int]) -> str:
@@ -39,10 +53,10 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
     table.add_row("ip", ip)
     city = ipinfo.get("city")
     if city:
-        table.add_row("city", city)
+        table.add_row("city", esc(city))
     country = ipinfo.get("country")
     if country:
-        table.add_row("country", country)
+        table.add_row("country", esc(country))
     
     isp_line = None
     asn_id = asn_meta.get("asn")
@@ -52,40 +66,46 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
     elif ipinfo.get("org"):
         isp_line = ipinfo.get("org")
     if isp_line:
-        table.add_row("isp", isp_line)
+        table.add_row("isp", esc(isp_line))
     
     org = asn_meta.get("organization") or ipinfo.get("org")
     if org:
-        table.add_row("organization", org)
+        table.add_row("organization", esc(org))
     
     coords = _fmt_coords(ipinfo.get("coordinates"))
     if coords:
-        table.add_row("coordinates", coords)
+        table.add_row("coordinates", esc(coords))
     
     if ipinfo.get("postal"):
-        table.add_row("postal_code", str(ipinfo.get("postal")))
+        table.add_row("postal_code", esc(ipinfo.get("postal")))
         
     table.add_row("cloudflare_radar_link", f"https://radar.cloudflare.com/ip/{ip}")
     
-    malicious = int(vt_stats.get("malicious", 0) or 0)
+    # Absence is not safety. When VirusTotal was never asked, or answered with an error, there
+    # are no stats to sum -- rendering the resulting 0/0 in green makes an unset API key look
+    # identical to a clean verdict. Say "no data" instead.
+    malicious = int(vt_stats.get("malicious", 0) or 0) if isinstance(vt_stats, dict) else 0
     total_engines = 0
     if isinstance(vt_stats, dict):
         try:
             total_engines = sum(int(v or 0) for v in vt_stats.values())
         except Exception:
             total_engines = 0
-            
-    vt_color = "red" if malicious > 0 else "green"
-    table.add_row("virustotal_detections", f"[{vt_color}]{malicious}/{total_engines}[/]")
+
+    if total_engines <= 0:
+        table.add_row("virustotal_detections", "[yellow]no data - not queried or query failed[/]")
+    else:
+        vt_color = "red" if malicious > 0 else "green"
+        table.add_row("virustotal_detections", f"[{vt_color}]{malicious}/{total_engines}[/]")
     
     if vt_reputation is not None:
-        table.add_row("virustotal_community_score", str(vt_reputation))
+        table.add_row("virustotal_community_score", esc(vt_reputation))
     if vt_link:
-        table.add_row("virustotal_analysis_link", vt_link)
+        table.add_row("virustotal_analysis_link", esc(vt_link))
         
     if abuse:
         reports = abuse.get('abuseipdb_reports', 0)
-        table.add_row("abuseipdb_reports", str(reports))
+        table.add_row("abuseipdb_reports", esc(reports))
         conf_val = abuse.get('abuseipdb_confidence_score', 0)
         try:
             conf_int = int(conf_val)
@@ -102,11 +122,11 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
             pulse_count = int(otx.get("otx_pulse_count", 0) or 0)
         except Exception:
             pulse_count = 0
-        table.add_row("otx_pulse_count", str(pulse_count))
+        table.add_row("otx_pulse_count", esc(pulse_count))
         table.add_row("otx_pulse_link", f"https://otx.alienvault.com/indicator/ip/{ip}")
         titles = otx.get("otx_pulse_titles") or []
         if isinstance(titles, list) and titles:
-            joined = "; ".join(str(t) for t in titles[:5] if t)
+            joined = "; ".join(esc(t) for t in titles[:5] if t)
             if joined:
                 table.add_row("otx_pulse_titles", joined)
     else:
@@ -138,26 +158,26 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
         error_table.add_column("Error")
         for name, detail in errors.items():
             if not isinstance(detail, dict):
-                error_table.add_row(name, str(detail))
+                error_table.add_row(esc(name), esc(detail))
                 continue
             parts: List[str] = []
             status = detail.get("status_code") or detail.get("status")
             if status is not None:
-                parts.append(f"status={status}")
+                parts.append(f"status={esc(status)}")
             reason = detail.get("reason")
             if reason:
-                parts.append(f"reason={reason}")
+                parts.append(f"reason={esc(reason)}")
             message = detail.get("message")
             if message:
-                parts.append(f"message={message}")
+                parts.append(f"message={esc(message)}")
             url = detail.get("url")
             if url:
-                parts.append(f"url={url}")
+                parts.append(f"url={esc(url)}")
             body = detail.get("body")
             if body:
-                parts.append(f"body={body}")
+                parts.append(f"body={esc(body)}")
             joined = " | ".join(parts) if parts else "error"
-            error_table.add_row(name, joined)
+            error_table.add_row(esc(name), joined)
         table.add_row("provider_errors", error_table)
 
     title_text = Text(f"--- IP lookup for {ip} ---", style="bold white")
@@ -165,9 +185,11 @@ def render_ip_analysis(ip: str, data: Dict[str, Any], *, ports_limit: str = "25"
 
 
 def render_asn_header(asn: int, meta: Dict[str, Any], use_color: bool = False) -> RenderableType:
-    name = meta.get("name") or (meta.get("organization", {}) or {}).get("name") or ""
     org = meta.get("organization")
     org_name = org.get("name") if isinstance(org, dict) else org
+    # IPInfo returns `org` as a plain string, so this must not assume a dict -- doing so raised
+    # AttributeError whenever nothing else supplied a name.
+    name = meta.get("name") or org_name or ""
     rir = meta.get("rir")
     rir_desc_map = {
         "ARIN": "ARIN (USA, Canada, many Caribbean and North Atlantic islands)",
@@ -185,24 +207,24 @@ def render_asn_header(asn: int, meta: Dict[str, Any], use_color: bool = False) -
 
     table.add_row("AS Number", "──>", str(asn))
     if name:
-        table.add_row("AS Name", "──>", name)
+        table.add_row("AS Name", "──>", esc(name))
     if org_name:
-        table.add_row("Organization", "──>", str(org_name))
+        table.add_row("Organization", "──>", esc(org_name))
     if meta.get("caidaRank"):
-        table.add_row("CAIDA AS Rank", "──>", f"#{meta.get('caidaRank')}")
+        table.add_row("CAIDA AS Rank", "──>", f"#{esc(meta.get('caidaRank'))}")
     if meta.get("abuseContacts"):
-        table.add_row("Abuse contact", "──>", str(meta["abuseContacts"][0]))
+        table.add_row("Abuse contact", "──>", esc(meta["abuseContacts"][0]))
     alloc = meta.get("allocationDate") or meta.get("allocated") or meta.get("allocation")
     if alloc:
-        table.add_row("AS Reg. date", "──>", str(alloc))
+        table.add_row("AS Reg. date", "──>", esc(alloc))
     if rir_line:
-        table.add_row("RIR (Region)", "──>", rir_line)
+        table.add_row("RIR (Region)", "──>", esc(rir_line))
         
     ixps = meta.get("ixps") or []
     if isinstance(ixps, list) and ixps:
         ixp_names = [i.get("name") for i in ixps if isinstance(i, dict) and i.get("name")]
         if ixp_names:
-            table.add_row("Peering @IXPs", "──>", " • ".join(str(n) for n in ixp_names))
+            table.add_row("Peering @IXPs", "──>", " • ".join(esc(n) for n in ixp_names))
     else:
         table.add_row("Peering @IXPs", "──>", "NONE")
 

@@ -16,6 +16,7 @@ from tripper_recon.providers.virustotal import vt_domain_summary, vt_ip_summary
 from tripper_recon.types.models import ApiKeys, InvestigationResult
 from tripper_recon.utils.http import RateLimiter, create_client
 from tripper_recon.utils.logging import logger
+from tripper_recon.utils.redact import redact_text, redact_url
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
 from tripper_recon.providers.ripestat import as_overview, abuse_contact, routing_status, asn_neighbours, announced_prefixes
 from tripper_recon.providers.caida import caida_asrank
@@ -27,6 +28,9 @@ log = logger("orchestrators")
 
 
 def _error_payload(err: Exception) -> Dict[str, Any]:
+    # Every string leaving this function is redacted: Shodan and IPInfo authenticate in the
+    # query string, so both the request URL and the exception text carry the API key, and
+    # this payload reaches console output and -o json.
     if isinstance(err, httpx.HTTPStatusError):
         resp = err.response
         req = getattr(resp, "request", None)
@@ -35,18 +39,18 @@ def _error_payload(err: Exception) -> Dict[str, Any]:
             "error": "http_error",
             "status_code": resp.status_code if resp else None,
             "reason": resp.reason_phrase if resp else None,
-            "url": str(req.url) if req else None,
-            "message": str(err),
+            "url": redact_url(str(req.url)) if req else None,
+            "message": redact_text(str(err)),
         }
     if isinstance(err, httpx.RequestError):
         req = getattr(err, "request", None)
         return {
             "ok": False,
             "error": "network_error",
-            "url": str(req.url) if req else None,
-            "message": str(err),
+            "url": redact_url(str(req.url)) if req else None,
+            "message": redact_text(str(err)),
         }
-    return {"ok": False, "error": type(err).__name__, "message": str(err)}
+    return {"ok": False, "error": type(err).__name__, "message": redact_text(str(err))}
 
 
 def _error_details(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,8 +77,14 @@ def _error_summary(provider: str, payload: Dict[str, Any]) -> str:
 def _should_suppress(provider: str, payload: Dict[str, Any]) -> bool:
     if not payload or payload.get("ok"):
         return False
+    # A provider may report `error` as a list (Cloudflare's GraphQL errors array). `x in {...}`
+    # against an unhashable operand raises TypeError, so normalise before every membership test.
     err = payload.get("error")
+    if not isinstance(err, (str, type(None))):
+        err = None
     status = payload.get("status") or payload.get("status_code")
+    if not isinstance(status, (int, str, type(None))):
+        status = None
     if err in {"missing_api_key", "missing_api_token", "missing_token", "API key not configured"}:
         return True
     if provider == "ipinfo_asn" and err in {"unauthorized", "http_error"} and status in {401, 403}:
