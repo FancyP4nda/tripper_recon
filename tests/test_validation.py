@@ -3,9 +3,10 @@
 These are the pure functions every orchestrator gates on (`orchestrators.py:114`, `:204`, `:345`),
 so a regression here silently changes which indicators the tool refuses to look at.
 
-Tests marked ``xfail(strict=False)`` assert the DESIRED behaviour for a gap that roadmap item 6.4
-("Fix domain validation: IDN/punycode via `idna`, path-bearing input, trailing dot; add a per-label
-63-octet check") is scheduled to close. They flip to passing automatically when 6.4 lands.
+Roadmap item 6.4 ("Fix domain validation: IDN/punycode via `idna`, path-bearing input, trailing
+dot; add a per-label 63-octet check") has landed. The six tests that carried
+``xfail(strict=False)`` markers asserting the DESIRED behaviour now pass unmodified and the
+markers are gone -- the assertions themselves were not touched.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from tripper_recon.utils.validation import (
     is_valid_asn,
     is_valid_domain,
     is_valid_ip,
+    normalize_asn,
+    normalize_domain,
 )
 
 # --------------------------------------------------------------------------------------
@@ -124,15 +127,10 @@ def test_is_valid_asn_boundaries_are_exclusive_at_zero_and_2_32() -> None:
     assert is_valid_asn(2**32) is False
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: the 'AS' prefix is stripped in cli.py:455 but the validator itself "
-    "rejects 'AS15169', so any non-CLI caller (API, bulk mode W6.10) refuses the canonical form",
-    strict=False,
-)
 def test_is_valid_asn_accepts_as_prefixed_form() -> None:
-    """DESIRED behaviour. Today `int('AS15169')` raises and the bare `except Exception` returns
-    False; normalisation lives only in the CLI, which means it is not shared with any other
-    entry point."""
+    """Roadmap 6.4 (was xfail). The 'AS' prefix used to be stripped in cli.py only, so every
+    non-CLI caller (API, bulk mode W6.10) refused the canonical form. Normalisation now lives in
+    `normalize_asn`, which `is_valid_asn` delegates to and the CLI can adopt."""
     assert is_valid_asn("AS15169") is True
     assert is_valid_asn("as15169") is True
 
@@ -200,58 +198,114 @@ def test_is_valid_domain_total_length_boundary_is_253() -> None:
     assert is_valid_domain(over_limit) is False
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: no per-label 63-octet check -- the regex bounds total length only",
-    strict=False,
-)
 def test_is_valid_domain_rejects_label_over_63_octets() -> None:
-    """DESIRED behaviour (RFC 1035 §2.3.4). Today a 64-octet label is accepted, so the tool will
-    happily issue provider lookups for a name no resolver can ever answer."""
+    """Roadmap 6.4 (was xfail), RFC 1035 §2.3.4. A 64-octet label used to be accepted, so the tool
+    would happily issue provider lookups for a name no resolver can ever answer."""
     assert is_valid_domain("a" * 63 + ".example.com") is True  # at the limit, valid either way
     assert is_valid_domain("a" * 64 + ".example.com") is False
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: trailing-dot (fully-qualified) form is rejected",
-    strict=False,
-)
 def test_is_valid_domain_accepts_trailing_dot() -> None:
-    """DESIRED behaviour. `example.com.` is the fully-qualified form and appears in DNS tooling
-    output an analyst is likely to paste; today it is refused with a bare "Invalid domain"."""
+    """Roadmap 6.4 (was xfail). `example.com.` is the fully-qualified form and appears in DNS
+    tooling output an analyst is likely to paste; it used to be refused with a bare
+    "Invalid domain"."""
     assert is_valid_domain("example.com.") is True
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: 'evil-.com' is accepted -- the regex guards a leading hyphen but not a "
-    "trailing one, and only on the first label",
-    strict=False,
-)
 def test_is_valid_domain_rejects_trailing_hyphen_label() -> None:
-    """DESIRED behaviour (RFC 1123 §2.1: a label may not end in a hyphen)."""
+    """Roadmap 6.4 (was xfail), RFC 1123 §2.1: a label may not end in a hyphen."""
     assert is_valid_domain("evil-.com") is False
     assert is_valid_domain("sub.evil-.com") is False
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: IDN input is rejected instead of being IDNA-encoded",
-    strict=False,
-)
 def test_is_valid_domain_accepts_idn_unicode() -> None:
-    """DESIRED behaviour. IDN homographs are a routine phishing artefact; refusing them outright
-    means the tool cannot be pointed at the exact indicator an analyst was handed."""
+    """Roadmap 6.4 (was xfail). IDN homographs are a routine phishing artefact; refusing them
+    outright meant the tool could not be pointed at the exact indicator an analyst was handed."""
     assert is_valid_domain("münchen.de") is True
     assert is_valid_domain("пример.рф") is True
 
 
-@pytest.mark.xfail(
-    reason="roadmap 6.4: a punycode TLD (xn--p1ai) fails the [A-Za-z]{2,63} TLD class",
-    strict=False,
-)
 def test_is_valid_domain_accepts_punycode_tld() -> None:
-    """DESIRED behaviour. `xn--e1afmkfd.xn--p1ai` is the A-label form of `пример.рф` -- the
-    encoding the tool would itself produce -- and it is rejected because the final label contains
-    digits and hyphens."""
+    """Roadmap 6.4 (was xfail). `xn--e1afmkfd.xn--p1ai` is the A-label form of `пример.рф` -- the
+    encoding the tool itself produces -- and it used to be rejected because the final label
+    contains digits and hyphens."""
     assert is_valid_domain("xn--e1afmkfd.xn--p1ai") is True
+
+
+def test_is_valid_domain_rejects_double_trailing_dot() -> None:
+    """One trailing dot is the FQDN notation; two is an empty label and stays invalid. Guards
+    against the trailing-dot fix being implemented as a blanket `rstrip('.')`."""
+    assert is_valid_domain("example.com..") is False
+    assert is_valid_domain(".example.com") is False
+    assert is_valid_domain(".") is False
+
+
+def test_is_valid_domain_rejects_non_string_input() -> None:
+    """`is_valid_domain(None)` used to raise AttributeError inside a validation gate."""
+    assert is_valid_domain(None) is False  # type: ignore[arg-type]
+    assert is_valid_domain(12345) is False  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------------------
+# normalize_domain / normalize_asn -- normalisation is a separate operation from validation
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("example.com", "example.com"),
+        ("  Example.COM  ", "example.com"),
+        ("example.com.", "example.com"),  # the fully-qualifying dot is dropped
+        ("münchen.de", "xn--mnchen-3ya.de"),
+        ("пример.рф", "xn--e1afmkfd.xn--p1ai"),
+        ("xn--e1afmkfd.xn--p1ai", "xn--e1afmkfd.xn--p1ai"),  # already encoded, unchanged
+    ],
+)
+def test_normalize_domain_returns_the_a_label_form(value: str, expected: str) -> None:
+    assert normalize_domain(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "localhost", "evil-.com", "example.com/path", "a" * 64 + ".com"])
+def test_normalize_domain_returns_none_for_invalid_input(value: str) -> None:
+    assert normalize_domain(value) is None
+
+
+def test_normalize_domain_encodes_a_homograph_it_does_not_fold_it() -> None:
+    """Security-load-bearing. `аpple.com` leads with Cyrillic U+0430, not Latin 'a'. Encoding it
+    to its own A-label is correct; silently mapping it onto `apple.com` would point every provider
+    lookup at the legitimate domain instead of the phishing one the analyst was handed."""
+    cyrillic = "аpple.com"
+    assert cyrillic != "apple.com"
+    assert normalize_domain(cyrillic) == "xn--pple-43d.com"
+    assert normalize_domain(cyrillic) != normalize_domain("apple.com")
+
+
+def test_normalize_domain_does_not_mutate_validation_semantics() -> None:
+    """`is_valid_domain` is exactly `normalize_domain(...) is not None`, and neither one rewrites
+    what the caller passed."""
+    value = "  MÜNCHEN.de  "
+    assert is_valid_domain(value) is (normalize_domain(value) is not None)
+    assert value == "  MÜNCHEN.de  "
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("AS15169", 15169),
+        ("as15169", 15169),
+        ("  AS15169  ", 15169),
+        ("15169", 15169),
+        (15169, 15169),
+        ("AS0", None),  # reserved, RFC 7607
+        ("AS", None),
+        ("ASN15169", None),
+        ("abc", None),
+        (None, None),
+    ],
+)
+def test_normalize_asn_returns_the_bare_number(value: object, expected: int | None) -> None:
+    assert normalize_asn(value) == expected  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------------------

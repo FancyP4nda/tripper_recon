@@ -381,7 +381,7 @@ async def test_investigate_ip_accepts_a_public_address_as_far_as_the_guard() -> 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("asn", ["AS15169", "notanasn", "", "1.5", 0, -1, "-1", 2**32, 2**32 + 1, None])
+@pytest.mark.parametrize("asn", ["notanasn", "", "1.5", 0, -1, "-1", 2**32, 2**32 + 1, None])
 async def test_investigate_asn_rejects_invalid_asn(asn: Any) -> None:
     async with no_network():
         result = await investigate_asn(asn)
@@ -389,6 +389,27 @@ async def test_investigate_asn_rejects_invalid_asn(asn: Any) -> None:
     assert result.ok is False
     assert result.errors == ["Invalid ASN"]
     assert result.data == {}
+
+
+@pytest.mark.parametrize("asn", ["AS15169", "as15169", " AS15169 "])
+async def test_investigate_asn_accepts_the_as_prefixed_form(asn: str) -> None:
+    """W6 (roadmap 6.4) moved the 'AS' strip out of cli.py and into ``normalize_asn``.
+
+    ``AS15169`` used to be refused here -- the prefix was stripped in the CLI alone, so every
+    non-CLI caller refused the one form an analyst actually pastes, and this file listed it as
+    INVALID above. It is valid now, so the assertion moves rather than disappears: the guard
+    must let it through, and it must reach the providers as the integer 15169.
+
+    ``ok`` is ``False`` because respx refused all ten providers, which is the W4.2 blackout
+    rule and not a validation refusal. Pinning ``errors != ["Invalid ASN"]`` is what keeps the
+    two apart.
+    """
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_asn(asn)
+
+    assert result.data["asn"] == 15169
+    assert result.errors != ["Invalid ASN"]
+    assert result.data != {}
 
 
 async def test_investigate_asn_accepts_a_valid_asn_as_far_as_the_guard() -> None:

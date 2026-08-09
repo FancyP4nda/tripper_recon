@@ -37,6 +37,7 @@ import ast
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -83,6 +84,11 @@ ALLOWED_HOSTS: set[str] = {
     "api.asrank.caida.org",
     # PeeringDB net/IXP records — PDB_BASE, providers/peeringdb.py
     "www.peeringdb.com",
+    # urlscan.io Search + Result APIs — URLSCAN_BASE, providers/urlscan.py. Both GET, both
+    # reads of a scan somebody ELSE ran. The submission route on the same API is forbidden
+    # (FORBIDDEN_MARKERS below, docs/OPSEC.md section 7), and the screenshot base
+    # (URLSCAN_SCREENSHOT_BASE, same host) is emitted as a link and never retrieved.
+    "urlscan.io",
     # ---- Rendered as a clickable pivot only; never fetched by this tool -----------------
     # Cloudflare Radar UI deep link — reporting/console.py, cli.py
     "radar.cloudflare.com",
@@ -105,6 +111,7 @@ EXPECTED_PROVIDER_HOSTS: set[str] = {
     "stat.ripe.net",
     "api.asrank.caida.org",
     "www.peeringdb.com",
+    "urlscan.io",
 }
 
 # Matches an absolute URL literal in source text. Stops at whitespace, quote, bracket or
@@ -119,13 +126,31 @@ _URL_LITERAL_RE = re.compile(r"https?://[^\s\"'`<>()\[\]\\]+")
 # Each of these sits on an API this tool already talks to, or on one it plausibly would,
 # and each has a passive sibling one call away. That is exactly why they get reached for
 # by mistake. Marker regex, what it does to the target, what to use instead.
+#
+# W6 NARROWED TWO OF THESE, and both narrowings are paid for in section 5 below rather than
+# given away. A line-level substring marker cannot tell a verb from a verb, so:
+#
+#   * ``/urls\b`` forbade the VirusTotal URL-report GET as loudly as the submission POST --
+#     the very call its own failure message named as the passive alternative. It is now
+#     ``/urls`` NOT followed by a path segment, i.e. a request that stops at the collection,
+#     which is the shape a submission has and the report read does not.
+#   * ``urlscan\.io`` forbade the whole HOST, which was right while no provider used it and
+#     wrong the moment providers/urlscan.py started reading other people's completed scans
+#     over GET. It is now the submission PATH.
+#
+# Both markers were also blind to a destination assembled from a module constant, which is
+# exactly how a narrowed marker gets walked around. Section 5 resolves every request
+# destination through the constants that build it and re-checks the result, so the
+# narrowing costs nothing and the constant dodge closes at the same time.
 
 ForbiddenMarker = tuple[str, str, str, str]  # (label, regex, why, passive alternative)
 
 FORBIDDEN_MARKERS: list[ForbiddenMarker] = [
     (
         "VirusTotal POST /urls",
-        r"/urls\b",
+        # /urls at the end of a path -- the collection. /urls/<id> is the report GET and is
+        # the sanctioned passive call; //urlscan.io is a different host and neither.
+        r"/urls(?![/\w])",
         (
             "submitting a URL to VirusTotal instructs VT's own crawler to FETCH the target, "
             "and publishes the indicator to the VT community feed"
@@ -146,7 +171,11 @@ FORBIDDEN_MARKERS: list[ForbiddenMarker] = [
     ),
     (
         "urlscan.io scan submission",
-        r"urlscan\.io|/api/v1/scan",
+        # The submission PATH, not the host. urlscan.io is an allowlisted provider whose
+        # search and result endpoints are GET reads of scans a DIFFERENT party already ran;
+        # `scan` is the one route on that API that makes urlscan go and load the target.
+        # `(?!\w)` matches /api/v1/scan and /api/v1/scan/ while sparing /api/v1/scanners.
+        r"/api/v1/scan(?!\w)",
         (
             "urlscan loads the target in a real browser from urlscan infrastructure and, "
             "unless explicitly made private, publishes the resulting scan"
@@ -593,6 +622,300 @@ def test_no_state_mutating_http_verb_anywhere(method: str) -> None:
         "back anywhere (docs/OPSEC.md section 1). There is no passive use for this verb — "
         "if a provider API requires it for a plain lookup, that is worth a comment in "
         "docs/OPSEC.md and an explicit exception here, not a silent addition."
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Test 5 — resolved request endpoints (W6)
+# --------------------------------------------------------------------------------------
+#
+# Everything above works on one line of text at a time. That is why two of the markers had
+# to be over-broad to be safe, and it is also why an over-broad marker gets walked around:
+# no provider writes its path inline, so every destination in this package is a constant and
+# an f-string, and a line-level regex sees neither half of the result.
+#
+# This section resolves the destination of every request the package makes — through the
+# module-level constants that build it — and asks the question the markers cannot: does the
+# path this request will ACTUALLY go to end at a submission collection, and is anything but
+# GET going anywhere but the one pinned read-only query endpoint.
+#
+# Concretely, it is what makes these three distinguishable, which no substring can do:
+#     GET  https://www.virustotal.com/api/v3/urls/{url_id}   report read      — allowed
+#     POST https://www.virustotal.com/api/v3/urls            submission       — FORBIDDEN
+#     POST https://urlscan.io/api/v1/scan/                   submission       — FORBIDDEN
+# and it stays true when the path is spelled f"{VT_BASE}/{SOME_SEGMENT}".
+
+#: Every httpx method that opens a connection. ``request`` and ``stream`` take the verb as
+#: their first argument and the destination as their second; the rest take the destination
+#: first. Both shapes are handled in :func:`_request_call_sites`.
+_HTTP_METHODS: frozenset[str] = frozenset(
+    {"get", "post", "put", "patch", "delete", "head", "options", "request", "stream"}
+)
+
+#: Receivers that are an httpx client. ``ast`` cannot type-check, so the check is pinned to the
+#: name every provider in this package uses; ``test_only_utils_http_constructs_a_client`` is what
+#: keeps that name the only way a request can be made.
+_CLIENT_RECEIVERS: frozenset[str] = frozenset({"client"})
+
+#: Path segments that make the provider go and fetch the target, forbidden when a request PATH
+#: ENDS there. Ending at the collection is what a submission looks like; the same segment
+#: followed by an identifier is the report read, which is the passive sibling this tool uses.
+FORBIDDEN_TERMINAL_SEGMENTS: dict[str, str] = {
+    "urls": (
+        "VirusTotal's URL collection. A request that stops here is a submission: VT's own "
+        "crawler fetches the target and the indicator lands in the community feed. The report "
+        "read is the same collection plus an identifier — /api/v3/urls/<url_id> — and is "
+        "already implemented in providers/virustotal.vt_url_summary"
+    ),
+    "scan": (
+        "urlscan's submission route. It loads the target in a real browser from urlscan "
+        "infrastructure and, unless made private, publishes the scan. Use "
+        "providers/urlscan.urlscan_search_url to find a scan somebody else already ran"
+    ),
+}
+
+#: Path segments forbidden ANYWHERE in a resolved path, identifier or not. An analysis object is
+#: the receipt for a submission: possessing one to read means something here submitted the target.
+FORBIDDEN_ANY_SEGMENT: dict[str, str] = {
+    "analyses": (
+        "an analysis object is the receipt for a submission. Reading one — with or without an "
+        "id — means something in this codebase asked a provider to go and look at the target. "
+        "Read last_analysis_stats off the existing ip_addresses/, domains/ or urls/ report"
+    ),
+}
+
+#: The one destination a verb other than GET may go to. Same endpoint the POST pin above names,
+#: reached here by resolving the constant rather than by trusting its name.
+NON_GET_DESTINATIONS: frozenset[str] = frozenset({EXPECTED_RADAR_GRAPHQL_ENDPOINT})
+
+#: Resolved destinations expected to be found, so a resolver that quietly stops resolving cannot
+#: turn every assertion below into a claim about the empty set. Keyed by module filename.
+EXPECTED_RESOLVED_ENDPOINTS: dict[str, set[str]] = {
+    "virustotal.py": {
+        "GET https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+        "GET https://www.virustotal.com/api/v3/domains/{domain}",
+        # The one this section exists for: the segment constant is resolved through, so the
+        # gate sees the real path and can tell this GET from the submission POST.
+        "GET https://www.virustotal.com/api/v3/urls/{url_id}",
+    },
+    "urlscan.py": {
+        "GET https://urlscan.io/api/v1/search/",
+        "GET https://urlscan.io/api/v1/result/{uuid}/",
+    },
+    "cloudflare_radar.py": {
+        "POST https://api.cloudflare.com/client/v4/radar/graphql",
+    },
+    "cloudflare_rest.py": {
+        # Built from a nested constant (HIJACKS_URL = f"{CF_BASE}/..."), which proves the
+        # resolver follows a constant that is itself an f-string over another constant.
+        "GET https://api.cloudflare.com/client/v4/radar/bgp/hijacks/events",
+        "GET https://api.cloudflare.com/client/v4/radar/bgp/leaks/events",
+    },
+}
+
+
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``NAME = <string expression>`` bindings, resolved in source order.
+
+    Source order matters: ``HIJACKS_URL = f"{CF_BASE}/bgp/hijacks/events"`` can only resolve
+    once ``CF_BASE`` is known, and that is the shape a real dodge would take.
+    """
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        targets: list[ast.expr]
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+            value = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        resolved = _resolve_string(value, constants)
+        if resolved is None or "{" in resolved:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                constants[target.id] = resolved
+    return constants
+
+
+def _resolve_string(node: ast.expr, constants: dict[str, str], depth: int = 0) -> Optional[str]:
+    """Best-effort static value of a string expression, with ``{name}`` for the unknown parts.
+
+    An unresolvable interpolation becomes a placeholder rather than aborting the resolution.
+    That is the point: ``f"{VT_BASE}/{SEGMENT}/{url_id}"`` has to come out as
+    ``https://www.virustotal.com/api/v3/urls/{url_id}`` so that the trailing identifier is
+    visible as a segment and the path is not mistaken for the bare collection.
+    """
+    if depth > 8:
+        return "{...}"
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.Name):
+        return constants.get(node.id, "{" + node.id + "}")
+    if isinstance(node, ast.Attribute):
+        return "{" + node.attr + "}"
+    if isinstance(node, ast.FormattedValue):
+        return _resolve_string(node.value, constants, depth + 1)
+    if isinstance(node, ast.JoinedStr):
+        parts = [_resolve_string(value, constants, depth + 1) for value in node.values]
+        return "".join(part if part is not None else "{?}" for part in parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _resolve_string(node.left, constants, depth + 1)
+        right = _resolve_string(node.right, constants, depth + 1)
+        if left is None and right is None:
+            return None
+        return (left or "{?}") + (right or "{?}")
+    if isinstance(node, ast.Call):
+        return "{" + _first_arg_label(node) + "()}"
+    return None
+
+
+ResolvedRequest = tuple[Path, int, str, Optional[str]]  # (module, line, verb, resolved URL)
+
+
+def _request_call_sites() -> list[ResolvedRequest]:
+    """Every ``client.<verb>(...)`` in the package, with its destination resolved."""
+    sites: list[ResolvedRequest] = []
+    for path in _python_sources(PACKAGE_ROOT):
+        tree = _parse(path)
+        constants = _module_string_constants(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            method = node.func.attr
+            if method not in _HTTP_METHODS:
+                continue
+            receiver = node.func.value
+            if not isinstance(receiver, ast.Name) or receiver.id not in _CLIENT_RECEIVERS:
+                continue
+
+            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            if method in {"request", "stream"}:
+                verb_node = node.args[0] if node.args else keywords.get("method")
+                verb = _resolve_string(verb_node, constants) if verb_node is not None else None
+                destination = node.args[1] if len(node.args) > 1 else keywords.get("url")
+            else:
+                verb = method
+                destination = node.args[0] if node.args else keywords.get("url")
+
+            resolved = _resolve_string(destination, constants) if destination is not None else None
+            sites.append((path, node.lineno, (verb or "<dynamic>").upper(), resolved))
+    return sites
+
+
+def _path_segments(url: str) -> list[str]:
+    """Path segments of a resolved URL, query and fragment discarded, empties dropped."""
+    remainder = url.split("://", 1)[1] if "://" in url else url
+    remainder = remainder.split("?", 1)[0].split("#", 1)[0]
+    _, _, path = remainder.partition("/")
+    return [segment for segment in path.split("/") if segment]
+
+
+def test_the_endpoint_resolver_actually_resolves() -> None:
+    """Guard the guard.
+
+    Every assertion in this section is a claim about the set of destinations the resolver
+    produced. If the resolver stops following constants — a provider switches to a helper
+    function, ``_resolve_string`` is edited, a module moves — the assertions pass over an empty
+    or placeholder-riddled set and this section becomes decoration.
+
+    The expected set is deliberately written out in full, including the VirusTotal URL-report
+    GET, because that call site is the reason the section exists: it is the one destination the
+    line-level markers above are narrowed around.
+    """
+    observed: dict[str, set[str]] = {}
+    for path, _lineno, verb, resolved in _request_call_sites():
+        if resolved is not None:
+            observed.setdefault(path.name, set()).add(f"{verb} {resolved}")
+
+    missing = {
+        module: sorted(expected - observed.get(module, set()))
+        for module, expected in EXPECTED_RESOLVED_ENDPOINTS.items()
+        if expected - observed.get(module, set())
+    }
+
+    assert not missing, (
+        "The endpoint resolver in tests/test_passivity.py no longer produces destinations it "
+        f"is known to produce: {missing}.\n\n"
+        "Section 5 is therefore NOT inspecting the real request paths, and the two narrowed "
+        "markers in FORBIDDEN_MARKERS are running without the check that pays for them. Do "
+        "not silence this.\n"
+        "Likely causes: a provider stopped building its URL from module constants; a request "
+        "moved off a receiver named `client`; _resolve_string or _module_string_constants was "
+        "edited.\n"
+        f"Resolver produced: { {k: sorted(v) for k, v in sorted(observed.items())} }"
+    )
+
+
+def test_no_resolved_request_path_reaches_a_submission_endpoint() -> None:
+    """The destination a request will actually go to, checked after the constants are resolved.
+
+    This is the check that lets ``/urls`` and ``urlscan.io`` be narrowed in FORBIDDEN_MARKERS
+    without giving anything away. A substring marker sees ``f"{VT_BASE}/{SEGMENT}/{url_id}"``
+    and learns nothing; this sees ``https://www.virustotal.com/api/v3/urls/{url_id}``, notes
+    that the path does not stop at ``urls``, and passes it — while the same code fails
+    ``f"{VT_BASE}/{SEGMENT}"``, which is the submission.
+    """
+    offenders: list[str] = []
+    for path, lineno, verb, resolved in _request_call_sites():
+        site = f"{_rel(path)}:{lineno}  {verb} {resolved if resolved is not None else '<unresolvable>'}"
+        if resolved is None:
+            offenders.append(
+                f"{site} — the destination could not be resolved statically at all, so no gate "
+                "in this file can see where this request goes. Build it from a module-level "
+                "constant the way every provider here does"
+            )
+            continue
+        segments = _path_segments(resolved)
+        if not segments:
+            continue
+        terminal = segments[-1].lower()
+        if terminal in FORBIDDEN_TERMINAL_SEGMENTS:
+            offenders.append(f"{site} — path ends at '{terminal}': {FORBIDDEN_TERMINAL_SEGMENTS[terminal]}")
+        for segment in segments:
+            if segment.lower() in FORBIDDEN_ANY_SEGMENT:
+                offenders.append(f"{site} — path contains '{segment}': {FORBIDDEN_ANY_SEGMENT[segment.lower()]}")
+
+    assert not offenders, (
+        "PASSIVE BOUNDARY: a request resolves to a submission endpoint.\n\n"
+        + "\n".join(f"      {o}" for o in offenders)
+        + "\n\n"
+        "A submission does not read data a third party already holds — it instructs that third "
+        "party to go and FETCH the target on your behalf. The target's server logs the visit, "
+        "and on both VirusTotal and urlscan the indicator is published where anyone can read "
+        "it, so a live actor learns they are under investigation twice over (docs/OPSEC.md "
+        "sections 1 and 7).\n\n"
+        "There is no flag for this and no exception. If the passive sibling genuinely cannot "
+        "answer the question, the answer is that the question belongs in a different tool."
+    )
+
+
+def test_every_non_get_request_goes_to_the_one_pinned_query_endpoint() -> None:
+    """Verb and destination checked together, against the resolved path.
+
+    ``test_every_post_in_providers_is_a_pinned_query_endpoint`` pins the Radar POST by the NAME
+    of the constant naming its destination, and ``test_radar_graphql_endpoint_constant_is_
+    unchanged`` pins that constant's value — two tests that have to agree. This one asks the
+    question directly of the resolved value, and covers every non-GET verb rather than POST
+    alone.
+    """
+    offenders = [
+        f"{_rel(path)}:{lineno}  {verb} {resolved if resolved is not None else '<unresolvable>'}"
+        for path, lineno, verb, resolved in _request_call_sites()
+        if verb != "GET" and resolved not in NON_GET_DESTINATIONS
+    ]
+
+    assert not offenders, (
+        "PASSIVE BOUNDARY: a non-GET request goes somewhere other than the one sanctioned "
+        "read-only query endpoint.\n\n" + "\n".join(f"      {o}" for o in offenders) + "\n\n"
+        f"The only destination a verb other than GET may have is {EXPECTED_RADAR_GRAPHQL_ENDPOINT} "
+        "— Cloudflare's Radar GraphQL API, which reads data Cloudflare already holds despite "
+        "using POST.\n\n"
+        "Every other non-GET on an OSINT API means one of two things, and both are out of "
+        "scope here: a submission (the provider fetches the target for you) or a write (this "
+        "tool contributes nothing anywhere). See docs/OPSEC.md sections 1 and 7."
     )
 
 

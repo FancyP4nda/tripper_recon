@@ -475,19 +475,27 @@ def test_blackout_is_exit_one(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "0 of 6 providers answered" in out
 
 
-def test_defanged_input_is_exit_two_and_never_reaches_a_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_defanged_input_is_refanged_before_it_reaches_a_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """W6: a defanged paste is refanged and investigated, and the DEFANGED form never leaves.
+
+    The property that matters is not the exit code -- it is that no provider is ever asked about
+    a hostname carrying "[.]" or an "hxxp" scheme, which would be a wasted lookup for a host that
+    cannot exist, and that the analyst is told what was changed.
+    """
     called: List[str] = []
 
     async def _fake(domain: str, **kwargs: Any) -> InvestigationResult:
         called.append(domain)
-        raise AssertionError("a defanged target must not reach the orchestrator")
+        return _domain_result(skipped=[], investigated=[])
 
     monkeypatch.setattr(cli, "investigate_domain", _fake)
 
-    _out, code = _capture(lambda: cli._cmd_domain("hxxps://evil[.]com"))
+    out, code = _capture(lambda: cli._cmd_domain("hxxps://evil[.]com"))
 
-    assert code == 2
-    assert called == []
+    assert called == ["evil.com"], "the refanged host is what reaches the orchestrator"
+    assert not any(m in called[0] for m in ("hxxp", "[.]", "(.)", "[dot]"))
+    assert "refanged" in out.lower(), "the transform is announced, never silent"
+    assert code != 2
 
 
 # --------------------------------------------------------------------------------------------

@@ -116,7 +116,12 @@ from tripper_recon.providers.ripestat import (
     routing_status,
 )
 from tripper_recon.providers.shodan_api import shodan_host
-from tripper_recon.providers.virustotal import vt_domain_summary, vt_ip_summary
+from tripper_recon.providers.virustotal import (
+    VT_URL_NO_REPORT_ERROR,
+    vt_domain_summary,
+    vt_ip_summary,
+    vt_url_summary,
+)
 from tripper_recon.types.models import (
     ApiKeys,
     Coverage,
@@ -132,9 +137,10 @@ from tripper_recon.types.models import (
 from tripper_recon.utils.http import PassiveBoundaryViolation, create_client, rate_limited
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
-from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_asn, is_valid_domain, is_valid_ip
+from tripper_recon.utils.urls import HostKind, ParsedURL, RedirectChain, parse_url
+from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_domain, is_valid_ip, normalize_asn
 from tripper_recon.verdict import engine as verdict_engine
-from tripper_recon.verdict.config import ScoringConfig, default_config
+from tripper_recon.verdict.config import IndicatorScope, ScoringConfig, default_config
 from tripper_recon.verdict.known_infrastructure import KnownInfrastructure, load_catalogue
 from tripper_recon.verdict.models import Verdict
 
@@ -180,6 +186,31 @@ IP_PROVIDERS: Tuple[str, ...] = ("virustotal", "ipinfo", "shodan", "abuseipdb", 
 
 #: The domain-level providers, asked about the name itself rather than about an address.
 DOMAIN_PROVIDERS: Tuple[str, ...] = ("virustotal", "otx")
+
+#: The URL-level providers, asked about the whole link rather than about its host.
+#:
+#: One entry today. The urlscan SEARCH provider (``providers/urlscan.py``) is written and tested,
+#: and its host is now allowlisted in both places (``utils/http.ALLOWED_EGRESS_HOSTS`` and
+#: ``tests/test_passivity.ALLOWED_HOSTS``), so the passive boundary no longer blocks it. Wiring it
+#: in changes this tuple, which is the DENOMINATOR of the URL-scope coverage ratio -- doing that
+#: in the same change that moved the boundary would have made a passivity change and a coverage
+#: change indistinguishable in one diff. It is the next step, not an oversight; docs/OPSEC.md
+#: section 6 gap 3 records the interim state and why the allowlist entry leads the wiring.
+#: Declared as a tuple rather than counted from the calls made, for the reason on
+#: :data:`IP_PROVIDERS`.
+URL_PROVIDERS: Tuple[str, ...] = ("virustotal_url",)
+
+#: How far a URL investigation pivots, shallowest first. See :func:`investigate_url`.
+#:
+#: ``url``  -- the link itself: whoever already holds a report on this exact URL.
+#: ``host`` -- ``url`` plus the host's own reputation. **Still fully passive**: no name is
+#:             resolved, so the target's nameserver learns nothing (``docs/OPSEC.md`` §3).
+#: ``full`` -- ``host`` plus every public address the host resolves to. This is the only depth
+#:             that resolves, so it is the only depth that touches the one documented exception.
+URL_DEPTHS: Tuple[str, ...] = ("url", "host", "full")
+
+#: The depth :func:`investigate_url` uses when the caller does not choose one.
+DEFAULT_URL_DEPTH = "full"
 
 #: The ASN providers. Order matches the single gather wave in :func:`_investigate_asn`.
 ASN_PROVIDERS: Tuple[str, ...] = (
@@ -435,6 +466,7 @@ def _suppressed_names(data: Mapping[str, Any]) -> List[str]:
             names.append(f"{prefix}{name}")
 
     _scan(data.get("provider_status"), "")
+    _scan(data.get("url_provider_status"), "url:")
     _scan(data.get("domain_provider_status"), "domain:")
     for entry in data.get("ips") or []:
         if isinstance(entry, Mapping):
@@ -502,6 +534,7 @@ def _finalise(
     expected: Sequence[str],
     domain_expected: Optional[Sequence[str]] = None,
     skipped_addresses: Sequence[SkippedAddress] = (),
+    coverage: Optional[Coverage] = None,
 ) -> InvestigationResult:
     """Compute coverage, publish it with the run metadata, and settle ``ok``.
 
@@ -513,8 +546,16 @@ def _finalise(
     The model fields are the typed interface; the ``data`` copies exist because the console
     renderers are handed ``result.data`` and nothing else, which is exactly why the ASN path's
     ``warnings`` reached the JSON consumer and never reached the screen (W4.3).
+
+    ``coverage`` overrides the computed figure, and exists for exactly one caller: the URL path
+    merges three differently-scoped status maps (URL, host, per-address) whose expected provider
+    sets differ, and :func:`types.models.coverage_from_result_data` applies a single ``expected``
+    to both the top-level and the per-address maps. Rather than teach that function a fourth
+    shape from a file this lane does not own, :func:`_url_coverage` builds the merge and hands it
+    in. Every other caller leaves this ``None`` and gets the computed figure.
     """
-    coverage = coverage_from_result_data(data, expected=expected, domain_expected=domain_expected)
+    if coverage is None:
+        coverage = coverage_from_result_data(data, expected=expected, domain_expected=domain_expected)
     warnings = _coverage_warnings(
         coverage,
         suppressed=_suppressed_names(data),
@@ -1018,79 +1059,147 @@ async def investigate_domain(domain: str, *, deadline: Optional[float] = None) -
     return await _with_deadline(_investigate_domain(domain), target=domain, deadline=deadline)
 
 
-async def _investigate_domain(domain: str) -> InvestigationResult:
-    keys = _env_keys()
-    result_errors: List[str] = []
-    domain_intel: Dict[str, Any] = {}
-    domain_errors: Dict[str, Dict[str, Any]] = {}
+class _DomainCollection(NamedTuple):
+    """Everything the host stage of an investigation gathered, before assembly into ``data``."""
 
-    async with create_client() as client:
-        vt_domain, otx_domain = await asyncio.gather(
-            _call_provider(
-                "virustotal_domain", vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)
-            ),
-            _call_provider("otx_domain", otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)),
+    calls: Dict[str, ProviderCall]
+    intel: Dict[str, Any]
+    provider_errors: Dict[str, Dict[str, Any]]
+    messages: List[str]
+    entries: List[Dict[str, Any]]
+    skipped: List[SkippedAddress]
+    #: True when the system resolver was used, i.e. when the OPSEC §3 exception was exercised.
+    resolved_actively: bool
+
+
+async def _collect_domain(
+    *,
+    client: httpx.AsyncClient,
+    keys: ApiKeys,
+    domain: str,
+    resolve_addresses: bool = True,
+) -> _DomainCollection:
+    """The host stage: domain-level intel, then optionally the addresses the name resolves to.
+
+    Shared by :func:`_investigate_domain` and :func:`_investigate_url` so that the URL path
+    composes the existing pivot instead of growing a second copy of it. A second copy would
+    drift, and the thing it would drift on is the non-public-address guard.
+
+    ``resolve_addresses=False`` makes this stage **fully passive**: no name is resolved and no
+    address is enriched, so the target's authoritative nameserver learns nothing. That is what
+    ``--depth host`` buys on the URL path, and it is the honest default for a link whose host
+    the analyst has not yet decided to touch. Domain-level intel is unaffected: VirusTotal and
+    OTX are asked about the name either way, and VirusTotal's passive A/AAAA records still
+    arrive in ``intel``.
+    """
+    vt_domain, otx_domain = await asyncio.gather(
+        _call_provider("virustotal_domain", vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)),
+        _call_provider("otx_domain", otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)),
+    )
+
+    intel: Dict[str, Any] = {}
+    passive_ips: List[str] = []
+    if vt_domain.ok:
+        intel["virustotal"] = vt_domain.data
+        passive_ips = _passive_ips_from_vt(vt_domain.data)
+    if otx_domain.ok:
+        intel["otx"] = otx_domain.data
+
+    calls = {"virustotal": vt_domain, "otx": otx_domain}
+    provider_errors, messages = _collect_errors(calls)
+
+    if not resolve_addresses:
+        return _DomainCollection(
+            calls=calls,
+            intel=intel,
+            provider_errors=provider_errors,
+            messages=messages,
+            entries=[],
+            skipped=[],
+            resolved_actively=False,
         )
 
-        passive_ips: List[str] = []
-        if vt_domain.ok:
-            domain_intel["virustotal"] = vt_domain.data
-            passive_ips = _passive_ips_from_vt(vt_domain.data)
-        if otx_domain.ok:
-            domain_intel["otx"] = otx_domain.data
+    # utils.dns is the one sanctioned resolution site (docs/OPSEC.md section 3); the import
+    # stays local so tests/test_passivity.py keeps seeing exactly one resolver module.
+    from tripper_recon.utils.dns import resolve_domain
 
-        domain_calls = {"virustotal": vt_domain, "otx": otx_domain}
-        domain_errors, domain_error_msgs = _collect_errors(domain_calls)
+    active_ips = await resolve_domain(domain)
 
-        # utils.dns is the one sanctioned resolution site (docs/OPSEC.md section 3); the import
-        # stays local so tests/test_passivity.py keeps seeing exactly one resolver module.
-        from tripper_recon.utils.dns import resolve_domain
+    enrichable: List[Tuple[str, str]] = []
+    skipped: List[SkippedAddress] = []
+    for ip, source in _tag_ip_sources(active_ips, passive_ips):
+        reason = non_public_ip_reason(ip)
+        if reason is None:
+            enrichable.append((ip, source))
+            continue
+        skipped.append(_skipped_address(ip, source, reason))
 
-        active_ips = await resolve_domain(domain)
+    gate = asyncio.Semaphore(MAX_CONCURRENT_IPS)
 
-        enrichable: List[Tuple[str, str]] = []
-        skipped: List[SkippedAddress] = []
-        for ip, source in _tag_ip_sources(active_ips, passive_ips):
-            reason = non_public_ip_reason(ip)
-            if reason is None:
-                enrichable.append((ip, source))
-                continue
-            skipped.append(_skipped_address(ip, source, reason))
+    async def _bounded(ip: str, source: str) -> Tuple[Dict[str, Any], List[str]]:
+        async with gate:
+            return await _enrich_domain_ip(client=client, keys=keys, ip=ip, source=source)
 
-        gate = asyncio.Semaphore(MAX_CONCURRENT_IPS)
+    enriched = await asyncio.gather(*(_bounded(ip, source) for ip, source in enrichable))
 
-        async def _bounded(ip: str, source: str) -> Tuple[Dict[str, Any], List[str]]:
-            async with gate:
-                return await _enrich_domain_ip(client=client, keys=keys, ip=ip, source=source)
+    entries: List[Dict[str, Any]] = []
+    address_messages: List[str] = []
+    for entry, entry_messages in enriched:
+        entries.append(entry)
+        address_messages.extend(entry_messages)
 
-        enriched = await asyncio.gather(*(_bounded(ip, source) for ip, source in enrichable))
+    # Per-address messages first, then the domain-level ones -- the order the domain path has
+    # always published, which `tests/test_orchestrators.py` reads positionally.
+    return _DomainCollection(
+        calls=calls,
+        intel=intel,
+        provider_errors=provider_errors,
+        messages=[*address_messages, *messages],
+        entries=entries,
+        skipped=skipped,
+        resolved_actively=True,
+    )
 
-    out: List[Dict[str, Any]] = []
-    for entry, messages in enriched:
-        out.append(entry)
-        result_errors.extend(messages)
-    result_errors.extend(domain_error_msgs)
+
+def _address_accounting(entries: Sequence[Dict[str, Any]], skipped: Sequence[SkippedAddress]) -> Dict[str, int]:
+    return {
+        "resolved": len(entries) + len(skipped),
+        "investigated": len(entries),
+        "skipped": len(skipped),
+    }
+
+
+def _skipped_ip_rows(skipped: Sequence[SkippedAddress]) -> List[Dict[str, Any]]:
+    """Always present, even when empty.
+
+    A renderer that sees the key only when something was skipped cannot tell "none were
+    skipped" from "this build does not report skips", and the second reading is the one that
+    gets an analyst hurt.
+    """
+    return [{"ip": address.address, "source": address.source, "reason": address.reason.value} for address in skipped]
+
+
+async def _investigate_domain(domain: str) -> InvestigationResult:
+    keys = _env_keys()
+
+    async with create_client() as client:
+        collected = await _collect_domain(client=client, keys=keys, domain=domain)
+
+    out = collected.entries
+    skipped = collected.skipped
+    result_errors: List[str] = list(collected.messages)
 
     data: Dict[str, Any] = {
         "domain": domain,
         "ips": out,
-        "domain_provider_status": _status_map(domain_calls),
-        "addresses": {
-            "resolved": len(out) + len(skipped),
-            "investigated": len(out),
-            "skipped": len(skipped),
-        },
-        # Always present, even when empty. A renderer that sees the key only when something was
-        # skipped cannot tell "none were skipped" from "this build does not report skips", and
-        # the second reading is the one that gets an analyst hurt.
-        "skipped_ips": [
-            {"ip": address.address, "source": address.source, "reason": address.reason.value} for address in skipped
-        ],
+        "domain_provider_status": _status_map(collected.calls),
+        "addresses": _address_accounting(out, skipped),
+        "skipped_ips": _skipped_ip_rows(skipped),
     }
-    if domain_intel:
-        data["domain_intel"] = domain_intel
-    if domain_errors:
-        data["domain_errors"] = domain_errors
+    if collected.intel:
+        data["domain_intel"] = collected.intel
+    if collected.provider_errors:
+        data["domain_errors"] = collected.provider_errors
 
     result = _finalise(
         data,
@@ -1102,6 +1211,352 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
         skipped_addresses=skipped,
     )
     return _adjudicate_domain(result, domain=domain)
+
+
+# --------------------------------------------------------------------------------------
+# URL (roadmap 6.8)
+#
+# The one thing to understand about this path: **it adds no new way to reach the target.**
+# A URL investigation is the URL-report lookup plus the existing host -> address -> ASN pivot,
+# composed. Nothing here fetches the link, follows a redirect, expands a shortener, or submits
+# the URL anywhere for analysis. `redirect_chain` is reported as NOT RESOLVED unless a third
+# party's already-completed scan supplied one, and then it is stamped with that party's name
+# and the date they saw it, because a cached chain is a historical claim and a redirector that
+# pointed at a kit last month may point at a parked page today.
+#
+# It also fixes a routing defect rather than papering over it: a URL with an IP-literal host
+# ("hxxp://185.220.101.5:8080/x", written defanged here because tests/test_passivity.py fails the
+# build on any absolute URL literal whose host is not allowlisted -- the same reason
+# the URL parser in ``utils.urls`` defangs its own docstrings) used to be handed to the domain
+# orchestrator, where
+# `is_valid_domain` rejected it and the analyst got "Invalid domain" for a perfectly well-formed
+# indicator. Here the host's kind decides which existing stage runs.
+# --------------------------------------------------------------------------------------
+
+#: Schemes a URL investigation will look up. Anything else is refused rather than guessed at:
+#: no provider in this tool holds intelligence about ``file:``, ``javascript:`` or ``data:``,
+#: and forwarding one would spend quota to learn nothing.
+INVESTIGABLE_URL_SCHEMES: FrozenSet[str] = frozenset({"http", "https"})
+
+#: The address-provenance tag for the single address a URL's IP-literal host contributes.
+#: Distinct from ``active``/``passive`` because nothing was resolved -- the analyst wrote the
+#: address into the link, and ``reporting.console`` echoes an unrecognised tag verbatim.
+URL_HOST_SOURCE = "url-host"
+
+#: Said out loud, at the top of the warning list, whenever VirusTotal holds no report.
+#:
+#: The provider module refuses to map this onto the shared ``not_found`` error precisely so it
+#: cannot land in ``Coverage.answered``: for an address, "no record" is evidence, because the
+#: address exists whether or not anyone submitted it. For a URL it is not. A link that went live
+#: an hour ago has no report, and neither does a link nobody has ever seen; the two are
+#: indistinguishable here and neither is exculpatory.
+VT_URL_NO_REPORT_WARNING = (
+    "VirusTotal holds no report for this URL. That is the ordinary state of a link nobody has "
+    "submitted yet -- including one stood up an hour ago -- and it carries no exculpatory weight"
+)
+
+
+def _has_no_vt_url_report(call: ProviderCall) -> bool:
+    """True when VirusTotal answered specifically "nobody has ever submitted this URL"."""
+    return bool(call.error) and call.error.get("error") == VT_URL_NO_REPORT_ERROR
+
+
+def _url_anomaly_rows(parsed: ParsedURL) -> List[Dict[str, str]]:
+    """The parser's observations, flattened for JSON and for the renderer.
+
+    Anomalies are signals for a reader (and, once ``verdict/`` grows ``url.*`` signal ids, for a
+    scorer). They are never a verdict here: plenty of benign sites use IDN, and it is the
+    combination that is interesting.
+    """
+    return [
+        {"code": anomaly.code.value, "component": anomaly.component, "detail": anomaly.detail}
+        for anomaly in parsed.anomalies
+    ]
+
+
+def _redirect_chain_from_vt(vt_url_data: Mapping[str, Any]) -> RedirectChain:
+    """Read VirusTotal's recorded chain, or say plainly that nobody's scan supplied one.
+
+    Three distinct facts, kept distinct, because collapsing them is how a report starts implying
+    that a link does not redirect:
+
+    * a chain a third party recorded -- carried with the provider, the field and the date;
+    * a passive source consulted that held no chain -- ``not_resolved`` with that as the reason;
+    * nothing consulted at all -- the default reason, which says we did not look.
+
+    This tool never resolves one. There is no branch here that could.
+    """
+    observation = vt_url_data.get("vt_redirect_observation")
+    source = observation.get("source") if isinstance(observation, Mapping) else None
+    observed_at = observation.get("observed_at") if isinstance(observation, Mapping) else None
+
+    hops_raw = vt_url_data.get("vt_redirection_chain")
+    hops = tuple(str(hop) for hop in hops_raw if str(hop).strip()) if isinstance(hops_raw, (list, tuple)) else ()
+    final_url = vt_url_data.get("vt_last_final_url")
+    final = str(final_url) if isinstance(final_url, str) and final_url.strip() else None
+
+    if source and (hops or final):
+        return RedirectChain.from_passive_record(
+            hops,
+            source=str(source),
+            final_url=final,
+            observed_at=str(observed_at) if observed_at else None,
+        )
+    return RedirectChain.not_resolved(
+        "VirusTotal holds a report for this URL and it records no redirect. That is one passive "
+        "source saying so at one moment, not a statement about where the link leads now."
+    )
+
+
+def _url_coverage(
+    *,
+    url_status: Mapping[str, Any],
+    domain_status: Optional[Mapping[str, Any]],
+    entries: Sequence[Mapping[str, Any]],
+) -> Coverage:
+    """Merge the URL, host and per-address coverages, each against its own expected set.
+
+    Built here rather than by ``coverage_from_result_data`` because that function applies one
+    ``expected`` sequence to both the top-level and the per-address maps, and on this path those
+    are different provider sets. The namespacing matches it exactly (``url:``, ``domain:``,
+    ``<address>:``) so the two never state ratios in different vocabularies.
+    """
+    parts: List[Coverage] = [Coverage.from_status_map(url_status, expected=URL_PROVIDERS, prefix="url:")]
+    if domain_status is not None:
+        parts.append(Coverage.from_status_map(domain_status, expected=DOMAIN_PROVIDERS, prefix="domain:"))
+    for entry in entries:
+        per_ip = entry.get("provider_status")
+        if isinstance(per_ip, Mapping):
+            parts.append(Coverage.from_status_map(per_ip, expected=IP_PROVIDERS, prefix=f"{entry.get('ip') or '?'}:"))
+    return Coverage.merge(parts)
+
+
+def _url_target_error(parsed: ParsedURL) -> Optional[str]:
+    """Why this URL cannot be investigated, or ``None`` when it can.
+
+    Refusing is cheap and quota is not. Each branch below is a case where every provider call
+    would be made against a string that cannot have a report.
+    """
+    if not parsed.is_hierarchical:
+        return (
+            f"{parsed.scheme}: is not a hierarchical URL, so there is no host to investigate. "
+            "Investigate whatever the payload contains instead"
+        )
+    if parsed.scheme.lower() not in INVESTIGABLE_URL_SCHEMES:
+        return (
+            f"scheme {parsed.scheme!r} is not one this tool investigates "
+            f"({', '.join(sorted(INVESTIGABLE_URL_SCHEMES))})"
+        )
+    if not parsed.host:
+        return "Invalid URL: no host component"
+    if parsed.host_kind in {HostKind.IPV4, HostKind.IPV6}:
+        reason = non_public_ip_reason(parsed.host)
+        if reason is not None:
+            return f"{reason} IP address {parsed.host} cannot be investigated."
+    return None
+
+
+async def investigate_url(
+    url: str,
+    *,
+    depth: str = DEFAULT_URL_DEPTH,
+    deadline: Optional[float] = None,
+) -> InvestigationResult:
+    """Investigate one URL: the link itself, then optionally its host and its addresses.
+
+    ``depth`` is one of :data:`URL_DEPTHS`. ``url`` and ``host`` are fully passive -- no name is
+    resolved at either -- and ``full`` adds the resolver step that ``docs/OPSEC.md`` §3 discloses.
+
+    ``ok`` follows the same contract as every other entry point (module docstring): ``False``
+    for a URL this tool refuses or cannot parse a host out of, for non-public addressing, for a
+    deadline breach, and for a run in which no provider answered at any level.
+    """
+    if depth not in URL_DEPTHS:
+        return InvestigationResult(
+            ok=False,
+            errors=[f"Invalid depth {depth!r}: expected one of {', '.join(URL_DEPTHS)}"],
+            data={},
+        )
+
+    parsed = parse_url(url)
+    refusal = _url_target_error(parsed)
+    if refusal is not None:
+        return InvestigationResult(ok=False, errors=[refusal], data={})
+
+    return await _with_deadline(
+        _investigate_url(parsed, depth=depth),
+        target=parsed.masked_url,
+        deadline=deadline,
+    )
+
+
+async def _investigate_url(parsed: ParsedURL, *, depth: str) -> InvestigationResult:
+    keys = _env_keys()
+    target = parsed.normalised_url
+    host = parsed.host
+    host_is_address = parsed.host_kind in {HostKind.IPV4, HostKind.IPV6}
+
+    result_errors: List[str] = []
+    url_intel: Dict[str, Any] = {}
+    entries: List[Dict[str, Any]] = []
+    skipped: List[SkippedAddress] = []
+    domain_status: Optional[Dict[str, Any]] = None
+    domain_intel: Dict[str, Any] = {}
+    domain_errors: Dict[str, Dict[str, Any]] = {}
+    resolved_actively = False
+
+    async with create_client() as client:
+        url_calls = {
+            "virustotal_url": await _call_provider(
+                "virustotal_url", vt_url_summary(client=client, api_key=keys.vt_api_key, url=target)
+            )
+        }
+        if url_calls["virustotal_url"].ok:
+            url_intel["virustotal"] = url_calls["virustotal_url"].data
+
+        url_errors, url_messages = _collect_errors(url_calls)
+        result_errors.extend(url_messages)
+
+        if depth != "url":
+            if host_is_address:
+                # No name to look up, so the host stage IS the address stage. Nothing resolves.
+                entry, messages = await _enrich_domain_ip(client=client, keys=keys, ip=host, source=URL_HOST_SOURCE)
+                entries.append(entry)
+                result_errors.extend(messages)
+            else:
+                collected = await _collect_domain(
+                    client=client,
+                    keys=keys,
+                    domain=host,
+                    resolve_addresses=depth == "full",
+                )
+                domain_status = _status_map(collected.calls)
+                domain_intel = collected.intel
+                domain_errors = collected.provider_errors
+                entries = collected.entries
+                skipped = collected.skipped
+                resolved_actively = collected.resolved_actively
+                result_errors.extend(collected.messages)
+
+    url_status = _status_map(url_calls)
+    vt_url_data = url_intel.get("virustotal")
+    chain = _redirect_chain_from_vt(vt_url_data) if isinstance(vt_url_data, Mapping) else RedirectChain.not_resolved()
+
+    data: Dict[str, Any] = {
+        # `url` is the evidence form and carries the URL byte-for-byte, credentials included:
+        # machines consume the JSON export and a rewritten indicator breaks them. `url_display`
+        # is the form a human-facing renderer prints, with any password masked.
+        "url": target,
+        "url_display": parsed.masked_url,
+        "url_raw": parsed.raw,
+        "depth": depth,
+        "scheme": parsed.scheme,
+        "scheme_assumed": parsed.scheme_assumed,
+        "host": host,
+        "host_kind": parsed.host_kind.value,
+        "host_ascii": parsed.host_ascii,
+        # The full host, deliberately. ``utils.urls`` never guesses an eTLD+1, and a guessed one
+        # pivots the investigation onto the wrong entity while looking exactly as confident.
+        "pivot_host": parsed.pivot_host,
+        "registrable_domain": parsed.registrable_domain,
+        "registrable_domain_status": parsed.registrable_domain_status.value,
+        "port": parsed.port,
+        "path": parsed.path,
+        "query": parsed.query,
+        "fragment": parsed.fragment,
+        "userinfo_present": parsed.userinfo_present,
+        "url_anomalies": _url_anomaly_rows(parsed),
+        "redirect_chain": {**chain.model_dump(mode="json"), "rendered": chain.render()},
+        "url_provider_status": url_status,
+        "ips": entries,
+        "addresses": _address_accounting(entries, skipped),
+        "skipped_ips": _skipped_ip_rows(skipped),
+        "collection": {
+            "passive_only": not resolved_actively,
+            "active_steps": ["system resolver (docs/OPSEC.md section 3)"] if resolved_actively else [],
+        },
+    }
+    if url_intel:
+        data["url_intel"] = url_intel
+    if url_errors:
+        data["url_errors"] = url_errors
+    if domain_status is not None:
+        data["domain"] = host
+        data["domain_provider_status"] = domain_status
+        if domain_intel:
+            data["domain_intel"] = domain_intel
+        if domain_errors:
+            data["domain_errors"] = domain_errors
+
+    result = _finalise(
+        data,
+        target=parsed.masked_url,
+        run=current_run(),
+        errors=result_errors,
+        expected=IP_PROVIDERS,
+        domain_expected=DOMAIN_PROVIDERS,
+        skipped_addresses=skipped,
+        coverage=_url_coverage(url_status=url_status, domain_status=domain_status, entries=entries),
+    )
+    if _has_no_vt_url_report(url_calls["virustotal_url"]):
+        # Published as its own flag rather than left for a renderer to re-derive from the error
+        # payload. "no report exists" and "the query failed" are different facts and only one
+        # of them means nobody has ever submitted this link; a renderer that cannot tell them
+        # apart prints the wrong one.
+        result.data["url_report_missing"] = True
+        result.warnings.insert(0, VT_URL_NO_REPORT_WARNING)
+        result.data["warnings"] = list(result.warnings)
+    return _adjudicate_url(result, parsed=parsed, host_is_address=host_is_address)
+
+
+def _adjudicate_url(result: InvestigationResult, *, parsed: ParsedURL, host_is_address: bool) -> InvestigationResult:
+    """Score the URL, and separately its host and each of its addresses. Never merged.
+
+    Same rule as the domain path, one level up: a phishing page on a compromised WordPress site
+    is a malicious URL on a host that is itself a victim, and both statements have to survive to
+    the screen. The URL verdict lands on ``data['verdict']``, the host's on
+    ``data['host_verdict']``, and each address's on its own entry in ``data['ips']``.
+
+    **The URL verdict is honest about being unscored.** ``verdict/scoring.yaml`` declares no
+    signal whose ``applies_to`` includes ``url``, so the engine is handed an empty signal list
+    and returns ``INSUFFICIENT_DATA`` -- which is the true answer, not a degradation. It becomes
+    a real score the day ``url.*`` signal ids and their weights land in the ruleset; wiring the
+    scope now means that day needs no change here.
+    """
+    tools, reason = _adjudicator()
+    if tools is None:
+        _record_verdict_failure(result, reason or "the verdict engine is unavailable")
+        return result
+
+    ip_verdicts: List[Verdict] = []
+    try:
+        verdict = verdict_engine.evaluate(
+            indicator=parsed.masked_url,
+            scope=IndicatorScope.URL,
+            signals=(),
+            coverage=result.coverage_or_unknown,
+            cfg=tools.cfg,
+            now=tools.now,
+            passive_only=bool((result.data.get("collection") or {}).get("passive_only", True)),
+            active_collection=tuple((result.data.get("collection") or {}).get("active_steps") or ()),
+        )
+        if not host_is_address and result.data.get("domain_provider_status") is not None:
+            host_verdict = verdict_engine.evaluate_domain_intel(result.data, cfg=tools.cfg, now=tools.now)
+            result.data["host_verdict"] = host_verdict.to_json_dict()
+        for entry in result.data.get("ips") or []:
+            if not isinstance(entry, dict):
+                continue
+            address = str(entry.get("ip") or "")
+            if not address:
+                continue
+            address_verdict = _ip_verdict(entry, ip=address, tools=tools)
+            entry["verdict"] = address_verdict.to_json_dict()
+            ip_verdicts.append(address_verdict)
+    except Exception as exc:  # noqa: BLE001 - a scoring fault must not lose the collection
+        log["error"]("Verdict computation failed", target=parsed.masked_url, error=f"{type(exc).__name__}: {exc}")
+        _record_verdict_failure(result, f"the scoring engine raised {type(exc).__name__}: {exc}")
+        return result
+    return _attach_verdicts(result, verdict=verdict, ip_verdicts=ip_verdicts)
 
 
 # --------------------------------------------------------------------------------------
@@ -1146,9 +1601,14 @@ async def investigate_asn(
     out-of-range ASN, for a deadline breach, and for a run in which no provider answered.
     ``True`` otherwise, with ``data['coverage']`` stating how partial the answer is.
     """
-    if not is_valid_asn(asn):
+    # Parse once, then check, rather than validate-then-reparse. The old pairing of
+    # `is_valid_asn(asn)` with `int(asn)` encoded the assumption that anything the validator
+    # accepts is `int()`-parsable, and roadmap 6.4 broke it by making the validator accept
+    # "AS15169" -- on which `int()` raises ValueError straight out of this coroutine. The
+    # ASN is still validated; the prefix is just normalised off before it is.
+    asn_int = normalize_asn(asn)
+    if asn_int is None:
         return InvestigationResult(ok=False, errors=["Invalid ASN"], data={})
-    asn_int = int(asn)
     return await _with_deadline(
         _investigate_asn(asn_int, resolve_neighbors=resolve_neighbors, enrich=enrich, enrich_limit=enrich_limit),
         target=f"AS{asn_int}",

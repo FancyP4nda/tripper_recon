@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
 from pydantic import ValidationError
@@ -12,6 +14,134 @@ from rich.text import Text
 
 from tripper_recon import __version__
 from tripper_recon.verdict.models import Signal, Verdict, VerdictLabel
+
+# --------------------------------------------------------------------------------------
+# Defanging (roadmap 6.2) -- the indicator, never the document
+#
+# A recon report is pasted into tickets, chat and email, and every one of those turns a live
+# indicator into something clickable. Defanging is what stops a colleague scrolling past a
+# phishing URL in a ticket and resolving it by accident -- which is both a compromise risk and,
+# for a single-use link, the tell that burns the investigation the tool was careful not to burn.
+#
+# **This is a per-field transform and there is deliberately no document-wide pass.** A regex
+# sweep over rendered output cannot tell the indicator from the pivot links beside it: it would
+# mangle `radar.cloudflare.com/ip/1.2.3.4` into something unclickable and destroy the part of
+# the report an analyst actually uses. So each function below takes ONE field whose entire
+# content is one indicator, and the call sites are individually chosen.
+#
+# Three standing rules, each the inverse of a way this could go wrong:
+#
+# * **Third-party pivot links stay live.** They point at VirusTotal, Shodan, AbuseIPDB and
+#   Cloudflare Radar -- never at the target -- and their whole value is being clickable.
+# * **The JSON export is never defanged.** Machines consume it, and `evil[.]com` is not a
+#   hostname. `cli.py`'s `-o json` branch does not route through this module at all.
+# * **Non-public addressing is not defanged.** `10.0.0.5` is the operator's own internal
+#   addressing rather than a hostile indicator; bracketing it adds noise to the one table --
+#   addresses resolved but not investigated -- that exists to be read carefully.
+# --------------------------------------------------------------------------------------
+
+#: Scheme rewrites. `hxxp` is the convention every ticketing system and SOC analyst already
+#: reads; inventing a different mangling would make the output less legible, not safer.
+_DEFANG_SCHEMES: Dict[str, str] = {"http": "hxxp", "https": "hxxps", "ftp": "fxp", "ftps": "fxps"}
+
+_SCHEME_MARK = "://"
+
+
+#: A scheme token immediately in front of ``://``, per RFC 3986 section 3.1.
+_EMBEDDED_SCHEME_RE = re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*)://")
+
+
+def _defang_scheme_markers(text: str) -> str:
+    """Neutralise every ``scheme://`` inside one field, leaving all other bytes alone."""
+
+    def _rewrite(match: re.Match[str]) -> str:
+        scheme = match.group(1).lower()
+        return f"{_DEFANG_SCHEMES.get(scheme, scheme)}[{_SCHEME_MARK}]"
+
+    return _EMBEDDED_SCHEME_RE.sub(_rewrite, text)
+
+
+def defang_host(host: str) -> str:
+    """Bracket the dots in a hostname. ``evil.example`` -> ``evil[.]example``."""
+    return host.replace(".", "[.]")
+
+
+def defang_address(address: str) -> str:
+    """Defang a public IPv4 literal. Everything else comes back verbatim.
+
+    Three deliberate non-actions:
+
+    * **Non-public addressing is untouched** -- see the module rule above.
+    * **IPv6 is untouched.** Nothing linkifies a bare IPv6 literal, so bracketing its colons
+      buys no safety, and ``2606[:]4700[:][:]1111`` is materially harder to read and to paste
+      back than the address it came from. Cost with no benefit is not a security control.
+    * **An unparsable string is untouched**, rather than guessed at. A renderer that mangles a
+      value it did not understand is asserting a reading it does not have.
+    """
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        return address
+    if parsed.version != 4 or not parsed.is_global:
+        return address
+    return address.replace(".", "[.]")
+
+
+def _defang_bare_host(value: str) -> str:
+    """One host with no userinfo and no port: an address literal, or a name."""
+    try:
+        ip_address(value)
+    except ValueError:
+        return defang_host(value)
+    return defang_address(value)
+
+
+def defang_indicator(value: Any) -> str:
+    """Defang one whole field that holds exactly one indicator: a URL, a host, or an address.
+
+    Only the scheme and the host are touched. The path and query keep every byte, because they
+    routinely carry the campaign identifier an analyst is pivoting on and because nothing in a
+    path is clickable on its own.
+    """
+    text = str(value or "")
+    if not text:
+        return text
+
+    head, mark, tail = text.partition(_SCHEME_MARK)
+    if mark:
+        scheme = head.lower()
+        authority, slash, rest = tail.partition("/")
+        # The path and query keep every byte -- they routinely carry the campaign identifier an
+        # analyst is pivoting on -- except for any scheme marker inside them. An open-redirect
+        # parameter (`?next=hxxp://evil.example`, written defanged because tests/test_passivity.py
+        # fails the build on a URL literal naming a non-allowlisted host) is a second live link,
+        # and a terminal will happily linkify it out of a "defanged" report.
+        return (
+            f"{_DEFANG_SCHEMES.get(scheme, scheme)}[{_SCHEME_MARK}]"
+            f"{defang_indicator(authority)}{slash}{_defang_scheme_markers(rest)}"
+        )
+
+    # An authority: optional userinfo, a host, an optional port. Only the host is defanged.
+    credentials, at, hostport = text.rpartition("@")
+    prefix = f"{credentials}{at}" if at else ""
+    if hostport.startswith("[") and "]" in hostport:
+        return f"{prefix}{hostport}"  # a bracketed IPv6 literal; left literal, see defang_address
+    host, colon, port = hostport.rpartition(":")
+    # `":" not in host` is what keeps an unbracketed IPv6 literal out of this branch: the last
+    # group of `2606:4700::1111` is all digits and would otherwise be read as a port.
+    if colon and port.isdigit() and ":" not in host:
+        return f"{prefix}{_defang_bare_host(host)}{colon}{port}"
+    return f"{prefix}{_defang_bare_host(hostport)}"
+
+
+def indicator_text(value: Any, *, defang: bool) -> str:
+    """The escaped, optionally-defanged form of one indicator field.
+
+    The single call every renderer in this module uses, so the ``defang`` flag cannot be
+    honoured in one row and forgotten in the next.
+    """
+    return esc(defang_indicator(value) if defang else value)
+
 
 #: How each `source` tag produced by ``orchestrators._tag_ip_sources`` is explained on screen.
 #:
@@ -493,13 +623,17 @@ def _warnings_beyond_coverage(warnings: Any, *, skipped: Any = None) -> List[str
     return kept
 
 
-def render_skipped_ips(skipped: Any) -> Optional[RenderableType]:
+def render_skipped_ips(skipped: Any, *, defang: bool = False) -> Optional[RenderableType]:
     """Render addresses that were resolved but deliberately never sent to a provider.
 
     On the domain path the private/reserved guard drops these before enrichment, and until now
     they vanished from the output entirely: an analyst who resolved four addresses and saw one
     investigated was given no way to learn what happened to the other three. Silently
     disappearing evidence is indistinguishable from evidence that came back clean.
+
+    ``defang`` is honoured but is almost always a no-op here: every address in this table was
+    refused for being non-public, and :func:`defang_address` leaves non-public addressing
+    literal. The parameter exists so the flag is threaded uniformly rather than special-cased.
     """
     if not isinstance(skipped, (list, tuple)) or not skipped:
         return None
@@ -520,7 +654,7 @@ def render_skipped_ips(skipped: Any) -> Optional[RenderableType]:
             source = ""
             reason = ""
         reason_text = f"{reason} addressing - never sent to a provider" if reason else "no reason recorded"
-        table.add_row(esc(address), esc(source) or "-", esc(reason_text))
+        table.add_row(indicator_text(address, defang=defang), esc(source) or "-", esc(reason_text))
 
     note = Text(
         "  no provider was asked about these addresses; nothing here is evidence that they are clean",
@@ -1030,15 +1164,19 @@ def _fmt_detecting_engines(engines: Any, *, limit: int = 8) -> Optional[str]:
     return f"{joined} ... and {hidden} more" if hidden > 0 else joined
 
 
-def _fmt_str_list(values: Any, *, limit: int = 12) -> Optional[str]:
-    """Join a provider's string list for display, or ``None`` when it is empty."""
+def _fmt_str_list(values: Any, *, limit: int = 12, defang: bool = False) -> Optional[str]:
+    """Join a provider's string list for display, or ``None`` when it is empty.
+
+    ``defang`` is for lists whose every entry is an indicator -- Shodan's hostnames -- and is
+    off for lists that are not, such as CVE identifiers.
+    """
     if not isinstance(values, (list, tuple)) or not values:
         return None
     items = [str(v).strip() for v in values if str(v).strip()]
     if not items:
         return None
     shown = items[:limit]
-    joined = ", ".join(esc(v) for v in shown)
+    joined = ", ".join(indicator_text(v, defang=defang) for v in shown)
     hidden = len(items) - len(shown)
     return f"{joined} ... and {hidden} more" if hidden > 0 else joined
 
@@ -1052,6 +1190,7 @@ def render_ip_analysis(
     generated_at: Any = None,
     show_run_line: bool = True,
     explain: bool = False,
+    defang: bool = False,
 ) -> RenderableType:
     """Render one IP analysis block: header, verdict, coverage, then the field table.
 
@@ -1073,6 +1212,12 @@ def render_ip_analysis(
 
     ``explain=True`` appends the full signal breakdown -- every weight, its ruleset key and the
     provider values behind it -- under the verdict banner.
+
+    ``defang=True`` brackets the address wherever this block states it as the indicator (the
+    title, the ``ip`` row, Shodan's hostnames). The pivot links are untouched and stay
+    clickable, which is the whole reason defanging is a per-field transform here rather than a
+    pass over the finished text -- see the module's defanging section. It defaults to ``False``
+    so that a direct caller gets literal output; ``cli.py`` turns it on unless ``--fanged``.
     """
     vt = data.get("virustotal", {})
     vt_stats = vt.get("vt_last_analysis_stats", {})
@@ -1090,7 +1235,7 @@ def render_ip_analysis(
     table.add_column("Key", style="bold cyan")
     table.add_column("Value", style="none")
 
-    table.add_row("ip", ip)
+    table.add_row("ip", indicator_text(ip, defang=defang))
 
     # Provenance, when the caller recorded one. The `ip` subcommand does not: the operator typed
     # the address, so there is no resolution claim to qualify. The domain path always does.
@@ -1212,7 +1357,7 @@ def render_ip_analysis(
         vulns = _fmt_str_list(shodan_data.get("vulns"))
         if vulns:
             table.add_row("shodan_vulns", f"[red]{vulns}[/]")
-        hostnames = _fmt_str_list(shodan_data.get("hostnames"))
+        hostnames = _fmt_str_list(shodan_data.get("hostnames"), defang=defang)
         if hostnames:
             table.add_row("shodan_hostnames", hostnames)
 
@@ -1288,7 +1433,7 @@ def render_ip_analysis(
     # attempted, which a raw status map cannot show.
     published_run_id, published_started_at, published_version = run_fields(data.get("run"))
     header = render_run_header(
-        f"--- IP lookup for {ip} ---",
+        f"--- IP lookup for {defang_indicator(ip) if defang else ip} ---",
         run_id=run_id if run_id is not None else (published_run_id or data.get("run_id")),
         generated_at=(generated_at if generated_at is not None else (published_started_at or data.get("generated_at"))),
         version=published_version,
@@ -1321,6 +1466,7 @@ def render_domain_header(
     verdict: Any = None,
     verdict_error: Any = None,
     explain: bool = False,
+    defang: bool = False,
 ) -> RenderableType:
     """The domain report's opening block: run provenance, verdict, coverage, warnings, skips.
 
@@ -1351,7 +1497,7 @@ def render_domain_header(
     must still have seen them.
     """
     header = render_run_header(
-        f"--- Domain lookup for {domain} ---",
+        f"--- Domain lookup for {defang_indicator(domain) if defang else domain} ---",
         run_id=run_id,
         generated_at=generated_at,
         version=version,
@@ -1361,7 +1507,7 @@ def render_domain_header(
         n
         for n in (
             render_warnings(_warnings_beyond_coverage(warnings, skipped=skipped_ips)),
-            render_skipped_ips(skipped_ips),
+            render_skipped_ips(skipped_ips, defang=defang),
         )
         if n is not None
     ]
@@ -1629,3 +1775,349 @@ def render_asn_bgp_panels(
         panels.append(Text(""))
 
     return Group(*panels)
+
+
+# --------------------------------------------------------------------------------------
+# URL (roadmap 6.8) and indicator triage (6.9, 6.10)
+#
+# The rule that shapes every renderer below: a URL report must never let a reader infer that
+# the tool followed the link. `redirect_chain` therefore always states its resolution word
+# first -- "NOT RESOLVED" or "FROM PASSIVE RECORD (<provider>:<field>, observed <date>)" -- and
+# a chain that came from somebody else's scan is printed with that party's name and the date
+# they saw it attached, because a cached chain is a claim about the past. A redirector that
+# served a kit last month may serve a parked page today, and the date is the only thing on
+# screen that lets a reader tell which claim they are holding.
+# --------------------------------------------------------------------------------------
+
+#: What the report says about the registrable domain, per ``utils.urls.RegistrableDomainStatus``.
+#:
+#: Spelled out rather than left blank, because a blank reads as "the tool checked and there is
+#: no registrable domain". ``utils.urls`` never guesses an eTLD+1: a last-two-labels rule is
+#: right on ``a.evil.com`` and silently wrong on ``evil.co.uk``, and a wrong one pivots the
+#: whole investigation onto the wrong entity while looking exactly as confident as a right one.
+#: The four not-derived states are worded separately because "no list is vendored" is a gap in
+#: this tool and "the host is an IP literal" is not a gap at all.
+_REGISTRABLE_DOMAIN_STATUS: Dict[str, str] = {
+    "unavailable_no_public_suffix_list": "not derived - no public suffix list is vendored, so pivot on the full host",
+    "not_applicable_ip_literal": "not applicable - the host is an IP literal, so there is no domain to pivot on",
+    "not_applicable_single_label": "not applicable - the host is a single label",
+    "not_applicable_no_host": "not applicable - there is no host",
+}
+_REGISTRABLE_DOMAIN_UNKNOWN = "not derived - the parser reported no status"
+
+#: The row for a URL VirusTotal holds no report on. Never "0/0", never green, and deliberately
+#: distinct from "the query failed": no report means nobody ever submitted the link, which is
+#: the ordinary state of one that went live an hour ago and is not exculpatory.
+_NO_VT_URL_REPORT = "no report exists - nobody has submitted this URL to VirusTotal; UNKNOWN, not clean"
+
+#: Said beside a URL whose scheme this tool supplied. The assumption is not cosmetic: it changes
+#: the VirusTotal URL identifier, and therefore whether a report is found at all.
+_SCHEME_ASSUMED_NOTE = "assumed by this tool - it was NOT in the input, and it changes which report is looked up"
+
+#: Said beside a URL carrying embedded credentials, which are a routine phishing disguise.
+_USERINFO_NOTE = "credentials embedded before the @ - a display trick as often as a real login"
+
+
+def _collection_line(collection: Any) -> str:
+    """How the evidence was gathered, in the words the verdict block uses."""
+    if not isinstance(collection, Mapping):
+        return "not recorded"
+    if collection.get("passive_only", True):
+        return "passive only - no traffic was sent to the target or its infrastructure"
+    steps = collection.get("active_steps") or []
+    named = ", ".join(str(step) for step in steps if str(step).strip()) or "unnamed active steps"
+    return f"ACTIVE COLLECTION contributed: {named}"
+
+
+def render_url_anomalies(anomalies: Any) -> Optional[RenderableType]:
+    """The parser's observations about the URL string itself.
+
+    These are signals, never a verdict. Several are individually unremarkable -- plenty of
+    benign sites use IDN -- and the interesting thing is the combination, which is why they are
+    listed for a reader to weigh rather than folded into a score the ruleset cannot yet justify.
+    """
+    if not isinstance(anomalies, (list, tuple)) or not anomalies:
+        return None
+    block = Text(
+        f"url_anomalies ({len(anomalies)}), observations about the string, not a verdict:", style="bold yellow"
+    )
+    for anomaly in anomalies:
+        if isinstance(anomaly, Mapping):
+            code = str(anomaly.get("code") or "")
+            component = str(anomaly.get("component") or "")
+            detail = str(anomaly.get("detail") or "")
+            line = f"  - {code} ({component}): {detail}" if component else f"  - {code}: {detail}"
+        else:
+            line = f"  - {anomaly}"
+        block.append("\n")
+        block.append(line, style="yellow")
+    return block
+
+
+def _redirect_chain_text(chain: Any, *, defang: bool) -> str:
+    """The redirect-chain line, with every hop defanged when the rest of the report is.
+
+    ``RedirectChain.render`` owns the wording -- the resolution word first, then the source and
+    the observation date -- and this function does not second-guess it. What it does is defang
+    the hop URLs *inside* that wording.
+
+    That was missing, and it mattered more here than anywhere else on the page. Every other
+    indicator field goes through ``indicator_text``, so a URL report pasted into a ticket or a
+    chat window carries ``hxxps[://]evil[.]example`` and nothing in it is clickable. The
+    redirect chain went out live -- and the two URLs in a redirect chain are the landing page
+    and the kit, which is to say the two most dangerous strings in the whole report. One
+    hyperlink-happy chat client turns a passive investigation into a visit.
+
+    Hops are substituted longest-first: a chain frequently contains one URL that is a prefix of
+    the next, and replacing the shorter one first would corrupt the longer.
+    """
+    if not isinstance(chain, Mapping):
+        return "NOT RESOLVED"
+    rendered = str(chain.get("rendered") or "") or "NOT RESOLVED"
+    if not defang:
+        return rendered
+
+    hops = chain.get("hops")
+    urls = [str(hop) for hop in hops if str(hop)] if isinstance(hops, (list, tuple)) else []
+    final_url = chain.get("final_url")
+    if isinstance(final_url, str) and final_url:
+        urls.append(final_url)
+
+    for url in sorted(set(urls), key=len, reverse=True):
+        rendered = rendered.replace(url, defang_indicator(url))
+    return rendered
+
+
+def render_url_analysis(
+    data: Dict[str, Any],
+    *,
+    explain: bool = False,
+    defang: bool = True,
+    show_run_line: bool = True,
+) -> RenderableType:
+    """Render the URL-level block of a URL investigation.
+
+    ``data`` is what ``orchestrators.investigate_url`` returns. This renders the URL scope only;
+    the host's own verdict and each address's panel are separate blocks, printed by ``cli.py``
+    below this one, because a phishing page on a compromised site is a malicious URL on a host
+    that is itself a victim and merging the two loses one of those facts.
+
+    ``defang`` defaults to ``True`` here, unlike the older renderers. A URL is the indicator most
+    likely to be clicked out of a pasted report, and this renderer is new, so there is no
+    caller relying on literal output.
+    """
+    display = data.get("url_display") or data.get("url") or ""
+    provider_status = data.get("url_provider_status")
+    intel = data.get("url_intel") if isinstance(data.get("url_intel"), Mapping) else {}
+    vt = intel.get("virustotal") if isinstance(intel, Mapping) else None
+    vt_data: Dict[str, Any] = vt if isinstance(vt, dict) else {}
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value", style="none")
+
+    table.add_row("url", indicator_text(display, defang=defang))
+    if data.get("url_raw") and str(data.get("url_raw")) != str(data.get("url")):
+        # The analyst's string exactly as pasted. A tool that silently rewrites its input
+        # produces output that cannot be defended in a case write-up.
+        table.add_row("url_as_pasted", esc(data.get("url_raw")))
+
+    scheme = str(data.get("scheme") or "")
+    if scheme:
+        suffix = f"  [yellow]{_SCHEME_ASSUMED_NOTE}[/]" if data.get("scheme_assumed") else ""
+        table.add_row("scheme", f"{esc(scheme)}{suffix}")
+
+    table.add_row("host", indicator_text(data.get("host"), defang=defang))
+    if data.get("host_kind"):
+        table.add_row("host_kind", esc(data.get("host_kind")))
+    if data.get("host_ascii") and data.get("host_ascii") != data.get("host"):
+        # The two forms of the same host disagree, so the label a resolver sees is not the
+        # label a human reads. That is the homograph case and it belongs on screen.
+        table.add_row("host_ascii", indicator_text(data.get("host_ascii"), defang=defang))
+    if data.get("port") is not None:
+        table.add_row("port", esc(data.get("port")))
+
+    registrable = data.get("registrable_domain")
+    if registrable:
+        table.add_row("registrable_domain", indicator_text(registrable, defang=defang))
+    else:
+        status = str(data.get("registrable_domain_status") or "")
+        table.add_row(
+            "registrable_domain",
+            f"[yellow]{esc(_REGISTRABLE_DOMAIN_STATUS.get(status, _REGISTRABLE_DOMAIN_UNKNOWN))}[/]",
+        )
+    table.add_row("pivot_host", indicator_text(data.get("pivot_host") or data.get("host"), defang=defang))
+
+    if data.get("path"):
+        table.add_row("path", esc(data.get("path")))
+    if data.get("query"):
+        table.add_row("query", esc(data.get("query")))
+    if data.get("userinfo_present"):
+        table.add_row("userinfo", f"[yellow]{_USERINFO_NOTE}[/]")
+
+    chain = data.get("redirect_chain")
+    chain_text = esc(_redirect_chain_text(chain, defang=defang))
+    resolved = bool(chain.get("resolution") == "FROM PASSIVE RECORD") if isinstance(chain, Mapping) else False
+    table.add_row("redirect_chain", chain_text if resolved else f"[yellow]{chain_text}[/]")
+
+    # VirusTotal's URL report. Absence is stated, never rendered as a zero: a URL with no report
+    # has not been scanned by zero engines, it has not been scanned, and that is the ordinary
+    # state of a link that went live an hour ago.
+    stats = vt_data.get("vt_last_analysis_stats")
+    total = sum(int(v or 0) for v in stats.values() if str(v).isdigit()) if isinstance(stats, dict) else 0
+    if total <= 0:
+        cell = (
+            f"[yellow]{esc(_NO_VT_URL_REPORT)}[/]"
+            if data.get("url_report_missing")
+            else _no_data_cell(provider_outcome(provider_status, "virustotal_url"))
+        )
+        table.add_row("virustotal_detections", cell)
+    else:
+        malicious = int(stats.get("malicious", 0) or 0) if isinstance(stats, dict) else 0
+        table.add_row("virustotal_detections", f"[{'red' if malicious > 0 else 'green'}]{malicious}/{total}[/]")
+        table.add_row("virustotal_last_analysis", _fmt_timestamp(vt_data.get("vt_last_analysis_date_iso")))
+        detecting = _fmt_detecting_engines(vt_data.get("vt_detecting_engines"))
+        if detecting:
+            table.add_row("virustotal_detecting_engines", detecting)
+    if vt_data.get("vt_link"):
+        table.add_row("virustotal_analysis_link", esc(vt_data.get("vt_link")))
+
+    table.add_row("depth", esc(data.get("depth") or "unknown"))
+    table.add_row("collection", esc(_collection_line(data.get("collection"))))
+
+    header = render_run_header(
+        f"--- URL lookup for {defang_indicator(display) if defang else display} ---",
+        run_id=data.get("run", {}).get("run_id") if isinstance(data.get("run"), Mapping) else None,
+        generated_at=data.get("run", {}).get("started_at") if isinstance(data.get("run"), Mapping) else None,
+        version=data.get("run", {}).get("tool_version") if isinstance(data.get("run"), Mapping) else None,
+        show_run_line=show_run_line,
+    )
+    notices = [
+        n
+        for n in (
+            render_warnings(_warnings_beyond_coverage(data.get("warnings"), skipped=data.get("skipped_ips"))),
+            render_url_anomalies(data.get("url_anomalies")),
+            render_skipped_ips(data.get("skipped_ips"), defang=defang),
+        )
+        if n is not None
+    ]
+    return compose_report(
+        header,
+        [table, Text("")],
+        verdict=_verdict_slot(data, explain=explain, show_calibration=show_run_line),
+        coverage=render_coverage(data.get("coverage") or provider_status),
+        notices=notices,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Detection and triage output (6.9 `check`, 6.10 `bulk`)
+# --------------------------------------------------------------------------------------
+
+#: Printed above any list of extracted indicators. Bulk extraction reads attacker-authored
+#: prose, so the list is a set of *readings* of that text, not a set of established facts.
+TRIAGE_CAVEAT = "extracted from pasted text and classified locally; no provider was consulted for this list"
+
+
+def render_detection(indicator: Any, *, defang: bool = True, explain: bool = False) -> RenderableType:
+    """One classified indicator: what it is, how firm the reading is, and what was uncertain.
+
+    Every field comes from :func:`tripper_recon.types.indicators.detect`, which is pure -- so
+    this block costs no provider quota and can be produced for a target the analyst has not
+    decided to look up yet.
+    """
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Key", style="bold cyan")
+    table.add_column("Value", style="none")
+
+    table.add_row("input", esc(getattr(indicator, "raw", "")))
+    table.add_row("type", esc(getattr(getattr(indicator, "type", None), "value", "unknown")))
+    confidence = getattr(getattr(indicator, "confidence", None), "value", "none")
+    table.add_row("confidence", esc(confidence) if confidence == "certain" else f"[yellow]{esc(confidence)}[/]")
+    table.add_row("value", indicator_text(getattr(indicator, "value", ""), defang=defang))
+
+    if getattr(indicator, "defanged_input", False):
+        table.add_row("refanged_for_lookup", esc(", ".join(getattr(indicator, "refang_transforms", ()))))
+    alternatives = getattr(indicator, "alternatives", ())
+    if alternatives:
+        table.add_row(
+            "also_parses_as",
+            f"[yellow]{esc(', '.join(alternative.value for alternative in alternatives))}[/]",
+        )
+
+    block: List[RenderableType] = [Text("--- detection only, no provider was consulted ---", style="bold white"), table]
+
+    notes = getattr(indicator, "notes", ())
+    if notes:
+        note_block = Text(f"notes ({len(notes)}):", style="bold yellow")
+        for note in notes:
+            note_block.append("\n")
+            note_block.append(f"  - {note}", style="yellow")
+        block.extend([Text(""), note_block])
+
+    if explain:
+        block.extend([Text(""), Text(str(indicator.explain()), style="dim")])
+    return Group(*block)
+
+
+def render_triage_table(rows: Sequence[Mapping[str, Any]], *, defang: bool = True) -> RenderableType:
+    """The bulk-paste triage list: every distinct indicator, ordered by what to look at first.
+
+    ``rows`` are the mappings ``cli._triage`` builds. The occurrence count travels with each
+    entry because "this address appears once in the alert" and "this address appears in every
+    header" are different starting points, and deduplication would otherwise destroy the
+    difference on its way to the screen.
+    """
+    heading = Text(f"indicators ({len(rows)}) - {TRIAGE_CAVEAT}", style="bold white")
+    if not rows:
+        return Group(heading, Text("  none found in the supplied text", style="yellow"))
+
+    table = Table(show_header=True, box=None, padding=(0, 2), header_style="bold cyan")
+    table.add_column("#", justify="right")
+    table.add_column("type")
+    # Folded, never truncated. An indicator with an ellipsis through the middle of it is one an
+    # analyst cannot copy into the next tool, which is the only thing this table is for.
+    table.add_column("indicator", overflow="fold")
+    table.add_column("seen", justify="right")
+    table.add_column("confidence")
+    table.add_column("note")
+
+    for position, row in enumerate(rows, start=1):
+        confidence = str(row.get("confidence") or "")
+        table.add_row(
+            str(position),
+            esc(row.get("type")),
+            indicator_text(row.get("value"), defang=defang),
+            str(row.get("occurrences") or 1),
+            esc(confidence) if confidence == "certain" else f"[yellow]{esc(confidence)}[/]",
+            esc(row.get("note") or ""),
+        )
+    return Group(heading, table)
+
+
+def render_filtered_indicators(rows: Sequence[Mapping[str, Any]]) -> Optional[RenderableType]:
+    """Indicators that were extracted and then deliberately withheld from the triage list.
+
+    Printed rather than dropped, for the same reason ``render_skipped_ips`` exists one level
+    down: a filter that removes evidence silently is indistinguishable from evidence that was
+    never there, and the analyst has no way to notice that their own mail relay -- or the
+    RFC1918 address that is actually the pivot -- was quietly binned.
+    """
+    if not rows:
+        return None
+    heading = Text(f"withheld from triage ({len(rows)}), extracted but not investigated:", style="bold yellow")
+    table = Table(show_header=True, box=None, padding=(0, 2), header_style="bold yellow")
+    table.add_column("type")
+    table.add_column("indicator", overflow="fold")
+    table.add_column("seen", justify="right")
+    table.add_column("reason")
+    for row in rows:
+        # Deliberately not defanged: everything reaching this table was withheld for being
+        # non-public or infrastructure the operator owns, and bracketing it adds noise.
+        table.add_row(
+            esc(row.get("type")),
+            esc(row.get("value")),
+            str(row.get("occurrences") or 1),
+            esc(row.get("reason") or ""),
+        )
+    return Group(heading, table)

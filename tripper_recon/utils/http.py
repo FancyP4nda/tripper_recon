@@ -71,6 +71,15 @@ ALLOWED_EGRESS_HOSTS: FrozenSet[str] = frozenset(
         "stat.ripe.net",  # RIPEstat data API - providers/ripestat.py
         "api.asrank.caida.org",  # CAIDA AS-Rank - providers/caida.py
         "www.peeringdb.com",  # PeeringDB net/IXP records - providers/peeringdb.py
+        # urlscan.io Search API (GET /api/v1/search/) and Result API (GET /api/v1/result/{uuid}/)
+        # - providers/urlscan.py. Reads of scans a DIFFERENT party already completed. The
+        # submission route on this same API is forbidden permanently and without a flag,
+        # because it loads the target in a real browser and publishes the scan; it is named
+        # with its reason in docs/OPSEC.md section 7 and in tests/test_passivity.py, which
+        # scans this package for the path on every run, so it is not spelled out here. The
+        # screenshot base on this host is emitted as a link and never retrieved, so
+        # allowlisting the host does not authorise fetching it.
+        "urlscan.io",
     }
 )
 
