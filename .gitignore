@@ -77,9 +77,21 @@ Thumbs.db
 *.log
 
 # Investigation outputs
+#
+# Ignored as DIRECTORIES, which is what makes them airtight: git does not descend into an
+# ignored directory, so nothing underneath one can be resurrected by a negation further down
+# this file. The default case directory (`outputs/cases/<scope>-<case id>/<run id>/`) sits under
+# `outputs/` for exactly that reason -- its `case.json`, `report.md` and evidence envelopes are
+# covered by the directory rule and do not depend on the `*.json` rule below.
+#
+# `cases/` is listed separately because `--case-dir ./cases` is the obvious thing to type, and a
+# case directory holds full provider responses about a live investigation. A `--case-dir` pointed
+# anywhere else is the operator's own call and is NOT covered; `write_case` records which of the
+# two it was in the case record's `git_ignored_location` field. See docs/OPSEC.md section 5a.
 outputs/
 results/
 reports/
+cases/
 
 # OSINT data dumps (prevents pushing JSON or CSV data)
 *.json

@@ -156,6 +156,13 @@ from tripper_recon.types.models import (
     coverage_from_result_data,
     current_run,
 )
+from tripper_recon.utils.cache import (
+    CacheLookup,
+    active_cache,
+    format_age,
+    freshness_warnings,
+    summarise_freshness,
+)
 from tripper_recon.utils.http import (
     ALLOWED_EGRESS_HOSTS,
     PassiveBoundaryViolation,
@@ -194,6 +201,24 @@ MAX_CONCURRENT_IPS = 8
 #: How many neighbour ASNs are resolved to names at once. ``--neighbors N`` resolves up to 3N
 #: (upstream, downstream, uncertain) and previously gathered all of them unbounded.
 MAX_CONCURRENT_NEIGHBOUR_LOOKUPS = 8
+
+#: Cache scopes (roadmap 7.7). One provider can be asked different questions about different
+#: kinds of indicator -- abuse.ch answers about a host at ``domain`` scope and about an exact link
+#: at ``url`` scope -- so the scope is part of the cache key and not decoration. The strings match
+#: the subcommand names, which is what makes a case directory's ``scope`` field readable.
+SCOPE_IP = "ip"
+SCOPE_DOMAIN = "domain"
+SCOPE_URL = "url"
+SCOPE_ASN = "asn"
+
+#: The pseudo-provider under which a name resolution is cached.
+#:
+#: Not a provider -- it is the tool's one active step (``docs/OPSEC.md`` §3) -- but it is an
+#: outbound question with an answer that ages, and ``--offline`` is worthless if it cannot avoid
+#: making it. Its lifetime is the shortest in ``cache.yaml`` for the reason recorded there: a DNS
+#: answer has an authoritative TTL of its own, and fast-flux infrastructure exists precisely to
+#: make yesterday's answer wrong.
+DNS_PROVIDER = "dns"
 
 #: Provider error values that mean "no credential, so nothing was asked". Shared by
 #: :func:`_should_suppress` and the envelope builder so the two cannot disagree about which
@@ -355,17 +380,21 @@ def _not_allowlisted_call(provider: str, hosts: Sequence[str]) -> ProviderCall:
 async def _call_if_permitted(
     provider: str,
     factory: Callable[[], Awaitable[Dict[str, Any]]],
+    *,
+    scope: Optional[str] = None,
+    indicator: Optional[str] = None,
 ) -> ProviderCall:
     """Call ``provider`` when its host is allowlisted; otherwise record that it was skipped.
 
     ``factory`` is a callable rather than an awaitable so that the coroutine is never even
     created when the provider is skipped -- an un-awaited coroutine is a warning and, under
-    ``-W error``, a failure.
+    ``-W error``, a failure. The same property is what lets the cache lane serve a hit without
+    building a request.
     """
     missing = _unpermitted_hosts(provider)
     if missing:
         return _not_allowlisted_call(provider, missing)
-    return await _call_provider(provider, factory())
+    return await _call_provider(provider, factory, scope=scope, indicator=indicator)
 
 
 # --------------------------------------------------------------------------------------
@@ -515,13 +544,99 @@ def _envelope(provider: str, payload: Dict[str, Any], elapsed: float) -> Provide
     )
 
 
-async def _call_provider(provider: str, call: Awaitable[Dict[str, Any]]) -> ProviderCall:
+#: What a call site may hand :func:`_call_provider`: a coroutine, or a factory that builds one.
+#:
+#: The factory form is the one that matters. A cache hit must not create a request at all, and a
+#: coroutine created and then not awaited is a ``RuntimeWarning`` -- a failure under ``-W error``.
+#: The awaitable form is retained because it is the shape ``tests/test_http.py`` drives this
+#: function with, and because a call with no indicator to key on cannot be cached anyway.
+CallSource = Any
+
+
+def _resolve_call(call: CallSource) -> Awaitable[Dict[str, Any]]:
+    """Build the coroutine, if it has not been built already."""
+    if callable(call):
+        built: Awaitable[Dict[str, Any]] = call()
+        return built
+    awaitable: Awaitable[Dict[str, Any]] = call
+    return awaitable
+
+
+def _discard_call(call: CallSource) -> None:
+    """Close a coroutine the cache lane decided not to await, so Python does not warn about it.
+
+    A factory has no ``close`` and needs none: its coroutine was never created. Only the eager
+    form -- a coroutine object handed in directly -- has to be closed, and closing it is what
+    keeps ``RuntimeWarning: coroutine ... was never awaited`` out of a cached run.
+    """
+    close = getattr(call, "close", None)
+    if callable(close):
+        close()
+
+
+def _offline_call(provider: str, *, reason: str, lookup: Optional[CacheLookup] = None) -> ProviderCall:
+    """A ``skipped`` envelope for a question ``--offline`` refused to answer.
+
+    **This is the load-bearing half of ``--offline``.** The alternative -- serving the expired
+    entry anyway, because it is right there and nearly fresh -- is the exact behaviour that turns
+    a cache into a mechanism for laundering staleness. A stated gap costs coverage; a stale value
+    presented as current costs the report its defensibility.
+
+    ``suppressed=True`` for the same reason ``_not_allowlisted_call`` uses it: nothing failed, so
+    an operator reading the error list should not be shown an incident. The gap is still stated
+    everywhere it matters -- ``Coverage`` files it under ``skipped``, ``_coverage_warnings`` names
+    it under "never attempted", and the freshness warning names it again as unanswerable offline.
+    """
+    detail: Dict[str, Any] = {
+        "error": "offline_no_usable_cache",
+        "message": f"{provider} was not consulted: --offline is in force and {reason}. No request was made.",
+    }
+    if lookup is not None:
+        detail["cache_state"] = lookup.state.value
+        if lookup.age_seconds is not None:
+            detail["cached_age_seconds"] = round(lookup.age_seconds, 3)
+            detail["cached_age"] = format_age(lookup.age_seconds)
+        if lookup.entry is not None:
+            detail["cached_queried_at"] = lookup.entry.queried_at
+    return ProviderCall(
+        provider=provider,
+        outcome=ProviderStatus.SKIPPED,
+        error=detail,
+        summary=f"{provider} | offline | {reason}",
+        suppressed=True,
+    )
+
+
+async def _call_provider(
+    provider: str,
+    call: CallSource,
+    *,
+    scope: Optional[str] = None,
+    indicator: Optional[str] = None,
+) -> ProviderCall:
     """Await one provider under the concurrency limiter and wrap whatever comes back.
 
     This is the only place in the package that awaits a provider. Everything it guarantees --
     the limiter actually bounding in-flight requests, the elapsed time being recorded, a raised
     exception being redacted rather than escaping -- holds for every provider because there is
-    no second code path.
+    no second code path. That is also why the TTL cache lives here: one gate in, one gate out.
+
+    **The cache is inert unless a caller installed a session** (``utils.cache.use_cache``). With
+    no session this function behaves exactly as it did before: every call goes to the network and
+    nothing is written to disk. ``scope`` and ``indicator`` are what make a call cacheable; a call
+    without them is always live, because a cache key that does not name the thing being asked
+    about would collide across targets.
+
+    Order of operations, and each step is a rule rather than an optimisation:
+
+    1. **Look up before building the request.** A hit returns the stored payload with its original
+       ``queried_at`` intact -- never restamped -- and the disclosure recorded on the session for
+       :func:`_status_map` to publish.
+    2. **In ``--offline``, refuse rather than degrade.** A miss, an expired entry, or a call with
+       nothing to key on all become a stated gap. No socket is opened on any of those paths, which
+       is what makes "exactly zero network calls" a property rather than an aspiration.
+    3. **Store only success.** An error is a state of the world at one instant; replaying it would
+       outlive its cause.
 
     The bare ``except Exception`` is deliberate and is the reason this function exists: one
     provider raising must not take the other four down with it. Two things are NOT absorbed:
@@ -533,10 +648,35 @@ async def _call_provider(provider: str, call: Awaitable[Dict[str, Any]]) -> Prov
       an error list would turn the loudest signal the codebase has into routine noise. It is a
       defect in the tool, and it is meant to stop the run.
     """
+    session = active_cache()
+    cacheable = session is not None and scope is not None and indicator is not None
+
+    if session is not None and scope is not None and indicator is not None:
+        lookup = session.lookup(provider=provider, scope=scope, indicator=indicator)
+        if lookup.is_hit and lookup.entry is not None:
+            _discard_call(call)
+            # The payload is replayed byte-for-byte. `_envelope` reads `ok` and `data` exactly as
+            # it would from a live call, so a cached answer and a fresh one are the same evidence
+            # to every downstream reader -- with the difference recorded, never erased.
+            return _envelope(provider, dict(lookup.entry.payload), 0.0)
+        if session.offline:
+            _discard_call(call)
+            session.note_refusal(provider=provider, scope=scope, indicator=indicator, reason=lookup.reason)
+            return _offline_call(provider, reason=lookup.reason, lookup=lookup)
+    elif session is not None and session.offline:
+        # No indicator to key on, so there is nothing this call could ever have been served from.
+        # Offline is a boundary, not a preference: refuse instead of reaching the network.
+        _discard_call(call)
+        return _offline_call(provider, reason="this call carries no cache key and cannot be served from cache")
+
+    # The session's clock, not the wall clock, when a session pinned one. A run that reads ages
+    # from one clock and stamps new entries from another files them in its own future, and
+    # ``CacheStore.get`` then correctly refuses to date them. One clock per run, read and write.
+    queried_at = session.clock() if session is not None else dt.datetime.now(dt.timezone.utc)
     started = time.monotonic()
     try:
         async with rate_limited():
-            payload = await call
+            payload = await _resolve_call(call)
     except PassiveBoundaryViolation:
         raise
     except Exception as exc:  # noqa: BLE001 - converted to a redacted payload, never swallowed
@@ -549,6 +689,14 @@ async def _call_provider(provider: str, call: Awaitable[Dict[str, Any]]) -> Prov
             "error": "invalid_provider_payload",
             "message": f"{provider} returned {type(payload).__name__}, expected dict",
         }
+    if cacheable and session is not None and scope is not None and indicator is not None:
+        session.store_payload(
+            provider=provider,
+            scope=scope,
+            indicator=indicator,
+            payload=payload,
+            queried_at=queried_at,
+        )
     return _envelope(provider, payload, elapsed)
 
 
@@ -572,12 +720,35 @@ def _collect_errors(
     return provider_errors, messages
 
 
-def _status_map(calls: Mapping[str, ProviderCall]) -> Dict[str, Dict[str, Any]]:
-    """Per-provider outcome, cost and error, for every provider that was considered.
+def _status_map(
+    calls: Mapping[str, ProviderCall],
+    *,
+    scope: Optional[str] = None,
+    indicator: Optional[str] = None,
+    overrides: Optional[Mapping[str, Tuple[str, str]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Per-provider outcome, cost, error and **freshness**, for every provider considered.
 
     This is the record that stops absence from reading as safety. ``data['virustotal'] == {}``
     is ambiguous; ``provider_status['virustotal']['outcome'] == 'not_configured'`` is not.
+
+    ``scope`` and ``indicator`` are what let this function ask the cache session what it did for
+    each provider, and the answer lands on ``entry['cache']``: whether the value was replayed,
+    when it was actually obtained, how old it is, and when it expires. Without that block a
+    consumer reading ``outcome == "ok"`` has no way to tell a lookup from a replay -- which is
+    the one distinction this workstream exists to preserve.
+
+    The cache is asked with ``call.provider``, not with the output key, because the two differ
+    exactly where it matters: the paid Shodan record and the keyless InternetDB extract share the
+    output key ``shodan`` and are two different datasets with two different entries.
+
+    ``overrides`` names the calls in this map whose cache key is NOT ``(scope, indicator)``. There
+    is one today: ``cloudflare_asn`` appears in a per-address status map but answers a question
+    about the ASN, so it is filed at ASN scope and two addresses in one network share the entry.
+    Without the override its record would not be found, and a replayed answer would be counted as
+    a fresh one -- an error in the one direction this module may not make.
     """
+    session = active_cache()
     status: Dict[str, Dict[str, Any]] = {}
     for key, call in calls.items():
         entry: Dict[str, Any] = {
@@ -588,6 +759,13 @@ def _status_map(calls: Mapping[str, ProviderCall]) -> Dict[str, Dict[str, Any]]:
             entry["error"] = call.error
         if call.suppressed:
             entry["suppressed"] = True
+        if session is not None:
+            override = (overrides or {}).get(key)
+            call_scope, call_indicator = override if override is not None else (scope, indicator)
+            if call_scope is not None and call_indicator is not None:
+                record = session.record_for(provider=call.provider, scope=call_scope, indicator=call_indicator)
+                if record is not None:
+                    entry["cache"] = record
         status[key] = entry
     return status
 
@@ -722,6 +900,17 @@ def _finalise(
         suppressed=_suppressed_names(data),
         skipped_addresses=skipped_addresses,
     )
+
+    # Freshness leads the warning list, ahead of the coverage sentences. "N of M answered" is
+    # true of a run that queried everything a second ago and of a run that replayed everything
+    # from last Tuesday; a reader who sees only the first line has to be shown the difference,
+    # because it is the difference between an answer and a claim about the past.
+    session = active_cache()
+    if session is not None:
+        freshness = summarise_freshness(data, offline=session.offline)
+        data["freshness"] = freshness
+        data["cache"] = session.summary()
+        warnings = [*freshness_warnings(freshness), *warnings]
 
     data["coverage"] = coverage.model_dump()
     data["run"] = run.model_dump()
@@ -1019,21 +1208,53 @@ def _exposure_call(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str) -> Awai
     downgrade of something they are paying for.
     """
     if keys.shodan_api_key:
-        return _call_provider("shodan", shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip))
-    # Same coverage key: two implementations of one slot, never two slots.
-    return _call_if_permitted("internetdb", lambda: internetdb_host(client=client, ip=ip))
+        return _call_provider(
+            "shodan",
+            lambda: shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        )
+    # Same coverage key: two implementations of one slot, never two slots. Two cache entries
+    # though -- InternetDB is a strict subset of the paid record, and filing them together would
+    # let a keyless run's thinner answer be replayed to a key-holding one.
+    return _call_if_permitted("internetdb", lambda: internetdb_host(client=client, ip=ip), scope=SCOPE_IP, indicator=ip)
 
 
 async def _ip_provider_wave(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str) -> Dict[str, ProviderCall]:
     """The seven per-IP providers, in one wave."""
     virustotal, ipinfo, shodan, abuseipdb, otx, rdap, abusech = await asyncio.gather(
-        _call_provider("virustotal", vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip)),
-        _call_provider("ipinfo", ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip)),
+        _call_provider(
+            "virustotal",
+            lambda: vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        ),
+        _call_provider(
+            "ipinfo",
+            lambda: ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        ),
         _exposure_call(client=client, keys=keys, ip=ip),
-        _call_provider("abuseipdb", abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip)),
-        _call_provider("otx", otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip)),
-        _call_if_permitted("rdap", lambda: rdap_ip(client=client, ip=ip)),
-        _call_if_permitted("abusech", lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=ip)),
+        _call_provider(
+            "abuseipdb",
+            lambda: abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        ),
+        _call_provider(
+            "otx",
+            lambda: otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        ),
+        _call_if_permitted("rdap", lambda: rdap_ip(client=client, ip=ip), scope=SCOPE_IP, indicator=ip),
+        _call_if_permitted(
+            "abusech",
+            lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=ip),
+            scope=SCOPE_IP,
+            indicator=ip,
+        ),
     )
     return {
         "virustotal": virustotal,
@@ -1047,32 +1268,61 @@ async def _ip_provider_wave(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str
     }
 
 
-async def _asn_meta_for_ip(
-    *, client: httpx.AsyncClient, keys: ApiKeys, ipinfo: ProviderCall
-) -> Tuple[Dict[str, Any], Optional[ProviderCall]]:
+class _AsnMeta(NamedTuple):
+    """Cloudflare's ASN metadata, its call envelope, and the ASN it was asked about.
+
+    The ASN travels back out because it is the cache key that call was filed under, and
+    :func:`_status_map` needs it to find the record. Deriving it again downstream from
+    ``asn_meta['asn']`` would work right up to the run where Cloudflare failed and the dict is
+    empty, which is exactly the run where the distinction matters least and the bug hides best.
+    """
+
+    data: Dict[str, Any]
+    call: Optional[ProviderCall]
+    asn: Optional[int]
+
+
+def _cloudflare_cache_override(asn: Optional[int]) -> Dict[str, Tuple[str, str]]:
+    """The ``overrides`` argument for a status map containing ``cloudflare_asn``."""
+    return {} if asn is None else {"cloudflare_asn": (SCOPE_ASN, str(asn))}
+
+
+async def _asn_meta_for_ip(*, client: httpx.AsyncClient, keys: ApiKeys, ipinfo: ProviderCall) -> _AsnMeta:
     """Cloudflare Radar metadata for the ASN IPinfo reported, when it reported one.
 
     Second wave by necessity, not by oversight: the ASN is not known until IPinfo answers.
     """
     if not ipinfo.ok:
-        return {}, None
+        return _AsnMeta({}, None, None)
     raw_asn = ipinfo.data.get("asn")
     if not raw_asn:
-        return {}, None
+        return _AsnMeta({}, None, None)
     try:
         asn = int(raw_asn)
     except (TypeError, ValueError):
-        return {}, None
+        return _AsnMeta({}, None, None)
 
+    # Cached at ASN scope, not at the address's. The answer is a property of the ASN, so two
+    # addresses in the same network share one entry -- which is where most of the quota relief on
+    # a domain with eight A records actually comes from.
     call = await _call_provider(
-        "cloudflare_asn", fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn)
+        "cloudflare_asn",
+        lambda: fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn),
+        scope=SCOPE_ASN,
+        indicator=str(asn),
     )
-    return (call.data if call.ok else {}), call
+    return _AsnMeta(call.data if call.ok else {}, call, asn)
 
 
-def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, Any]) -> Dict[str, Any]:
+def _ip_entry(
+    ip: str,
+    calls: Mapping[str, ProviderCall],
+    asn_meta: Dict[str, Any],
+    *,
+    asn: Optional[int] = None,
+) -> Dict[str, Any]:
     """The per-IP analysis dict ``reporting.console.render_ip_analysis`` consumes."""
-    status = _status_map(calls)
+    status = _status_map(calls, scope=SCOPE_IP, indicator=ip, overrides=_cloudflare_cache_override(asn))
     return {
         "ip": ip,
         "ptr": None,
@@ -1119,9 +1369,9 @@ async def _investigate_ip(ip: str) -> InvestigationResult:
     keys = _env_keys()
     async with create_client() as client:
         calls = await _ip_provider_wave(client=client, keys=keys, ip=ip)
-        asn_meta, cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
-        if cloudflare is not None:
-            calls["cloudflare_asn"] = cloudflare
+        cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
+        if cloudflare.call is not None:
+            calls["cloudflare_asn"] = cloudflare.call
 
         provider_errors, result_errors = _collect_errors(calls)
 
@@ -1133,8 +1383,13 @@ async def _investigate_ip(ip: str) -> InvestigationResult:
             "otx": calls["otx"].data,
             "rdap": calls["rdap"].data,
             "abusech": calls["abusech"].data,
-            "asn_meta": asn_meta,
-            "provider_status": _status_map(calls),
+            "asn_meta": cloudflare.data,
+            "provider_status": _status_map(
+                calls,
+                scope=SCOPE_IP,
+                indicator=ip,
+                overrides=_cloudflare_cache_override(cloudflare.asn),
+            ),
         }
         if provider_errors:
             data["errors"] = provider_errors
@@ -1198,13 +1453,13 @@ async def _enrich_domain_ip(
 ) -> Tuple[Dict[str, Any], List[str]]:
     """One resolved address of a domain: five providers in one wave, then Cloudflare."""
     calls = await _ip_provider_wave(client=client, keys=keys, ip=ip)
-    asn_meta, cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
-    if cloudflare is not None:
-        calls["cloudflare_asn"] = cloudflare
+    cloudflare = await _asn_meta_for_ip(client=client, keys=keys, ipinfo=calls["ipinfo"])
+    if cloudflare.call is not None:
+        calls["cloudflare_asn"] = cloudflare.call
 
     provider_errors, messages = _collect_errors(calls, prefix=f"{ip} :: ")
 
-    entry = _ip_entry(ip, calls, asn_meta)
+    entry = _ip_entry(ip, calls, cloudflare.data, asn=cloudflare.asn)
     entry["source"] = source
     if provider_errors:
         entry["errors"] = provider_errors
@@ -1258,8 +1513,76 @@ class _DomainCollection(NamedTuple):
     messages: List[str]
     entries: List[Dict[str, Any]]
     skipped: List[SkippedAddress]
-    #: True when the system resolver was used, i.e. when the OPSEC §3 exception was exercised.
+    #: True when the system resolver was used **on this run**, i.e. when the OPSEC §3 exception
+    #: was exercised. A resolution replayed from cache leaves this False: no query left the host,
+    #: which is the whole claim ``collection.passive_only`` makes.
     resolved_actively: bool
+    #: Said out loud whenever the address list is not a live resolution -- a replay, or nothing at
+    #: all under ``--offline``. ``None`` when the resolver ran normally.
+    resolution_note: Optional[str] = None
+
+
+async def _resolve_addresses(domain: str) -> Tuple[List[str], Optional[str], bool]:
+    """Resolve ``domain``, or replay a cached resolution, or refuse under ``--offline``.
+
+    Returns ``(addresses, note, resolved_actively)``.
+
+    The system resolver is the one outbound step this tool takes that is not a provider call
+    (``docs/OPSEC.md`` §3), and ``--offline`` is worth nothing if it cannot avoid it: a run that
+    contacts no provider but still queries DNS has still told a nameserver what the operator is
+    looking at. So resolution goes through the same cache lane as everything else, under the
+    ``dns`` pseudo-provider and the shortest lifetime in the ruleset.
+
+    Two rules that are not obvious:
+
+    * **An empty answer is never stored.** ``resolve_domain`` returns ``[]`` for NXDOMAIN and for
+      a resolver timeout alike, and filing that as a successful observation would let one flaky
+      lookup teach the cache that a domain has no addresses.
+    * **A replayed list means ``resolved_actively`` is False.** No query left this host on this
+      run, so ``collection.passive_only`` says so -- and the note says where the list came from
+      and how old it is, because a cached A record is a historical claim about a mapping that
+      fast-flux infrastructure exists specifically to invalidate.
+    """
+    # utils.dns is the one sanctioned resolution site (docs/OPSEC.md section 3); the import
+    # stays local so tests/test_passivity.py keeps seeing exactly one resolver module.
+    from tripper_recon.utils.dns import resolve_domain
+
+    session = active_cache()
+    if session is None:
+        return list(await resolve_domain(domain)), None, True
+
+    lookup = session.lookup(provider=DNS_PROVIDER, scope=SCOPE_DOMAIN, indicator=domain)
+    if lookup.is_hit and lookup.entry is not None:
+        payload = lookup.entry.payload.get("data")
+        addresses = (
+            [str(value) for value in (payload or {}).get("addresses") or []] if isinstance(payload, dict) else []
+        )
+        note = (
+            f"the address list was replayed from cache: resolved {format_age(lookup.age_seconds)} ago "
+            f"(at {lookup.entry.queried_at}), not now. Nothing was asked of the resolver on this run"
+        )
+        return addresses, note, False
+
+    if session.offline:
+        session.note_refusal(provider=DNS_PROVIDER, scope=SCOPE_DOMAIN, indicator=domain, reason=lookup.reason)
+        note = (
+            "--offline: the host was not resolved and no usable cached resolution exists "
+            f"({lookup.reason}). No address was investigated, which is missing coverage, not a clean result"
+        )
+        return [], note, False
+
+    # The session's clock, for the reason given in ``_call_provider``: one clock per run.
+    queried_at = session.clock()
+    addresses = list(await resolve_domain(domain))
+    if addresses:
+        session.store_payload(
+            provider=DNS_PROVIDER,
+            scope=SCOPE_DOMAIN,
+            indicator=domain,
+            payload={"ok": True, "data": {"addresses": addresses}},
+            queried_at=queried_at,
+        )
+    return addresses, None, True
 
 
 async def _collect_domain(
@@ -1283,11 +1606,30 @@ async def _collect_domain(
     arrive in ``intel``.
     """
     vt_domain, otx_domain, rdap_call, tranco_call, abusech_call = await asyncio.gather(
-        _call_provider("virustotal_domain", vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)),
-        _call_provider("otx_domain", otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)),
-        _call_if_permitted("rdap", lambda: rdap_domain(client=client, domain=domain)),
-        _call_if_permitted("tranco", lambda: tranco_rank(client=client, domain=domain)),
-        _call_if_permitted("abusech", lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=domain)),
+        _call_provider(
+            "virustotal_domain",
+            lambda: vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain),
+            scope=SCOPE_DOMAIN,
+            indicator=domain,
+        ),
+        _call_provider(
+            "otx_domain",
+            lambda: otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain),
+            scope=SCOPE_DOMAIN,
+            indicator=domain,
+        ),
+        _call_if_permitted(
+            "rdap", lambda: rdap_domain(client=client, domain=domain), scope=SCOPE_DOMAIN, indicator=domain
+        ),
+        _call_if_permitted(
+            "tranco", lambda: tranco_rank(client=client, domain=domain), scope=SCOPE_DOMAIN, indicator=domain
+        ),
+        _call_if_permitted(
+            "abusech",
+            lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=domain),
+            scope=SCOPE_DOMAIN,
+            indicator=domain,
+        ),
     )
 
     intel: Dict[str, Any] = {}
@@ -1324,11 +1666,7 @@ async def _collect_domain(
             resolved_actively=False,
         )
 
-    # utils.dns is the one sanctioned resolution site (docs/OPSEC.md section 3); the import
-    # stays local so tests/test_passivity.py keeps seeing exactly one resolver module.
-    from tripper_recon.utils.dns import resolve_domain
-
-    active_ips = await resolve_domain(domain)
+    active_ips, resolution_note, resolved_actively = await _resolve_addresses(domain)
 
     enrichable: List[Tuple[str, str]] = []
     skipped: List[SkippedAddress] = []
@@ -1362,7 +1700,8 @@ async def _collect_domain(
         messages=[*address_messages, *messages],
         entries=entries,
         skipped=skipped,
-        resolved_actively=True,
+        resolved_actively=resolved_actively,
+        resolution_note=resolution_note,
     )
 
 
@@ -1397,9 +1736,15 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
     data: Dict[str, Any] = {
         "domain": domain,
         "ips": out,
-        "domain_provider_status": _status_map(collected.calls),
+        "domain_provider_status": _status_map(collected.calls, scope=SCOPE_DOMAIN, indicator=domain),
         "addresses": _address_accounting(out, skipped),
         "skipped_ips": _skipped_ip_rows(skipped),
+        # Published on the domain path too, not only on the URL path: whether the resolver ran
+        # is a fact about this run's egress, and a replayed address list means it did not.
+        "collection": {
+            "passive_only": not collected.resolved_actively,
+            "active_steps": ["system resolver (docs/OPSEC.md section 3)"] if collected.resolved_actively else [],
+        },
     }
     if collected.intel:
         data["domain_intel"] = collected.intel
@@ -1415,6 +1760,9 @@ async def _investigate_domain(domain: str) -> InvestigationResult:
         domain_expected=DOMAIN_PROVIDERS,
         skipped_addresses=skipped,
     )
+    if collected.resolution_note:
+        result.warnings.insert(0, collected.resolution_note)
+        result.data["warnings"] = list(result.warnings)
     return _adjudicate_domain(result, domain=domain)
 
 
@@ -1609,15 +1957,24 @@ async def _investigate_url(parsed: ParsedURL, *, depth: str) -> InvestigationRes
     domain_intel: Dict[str, Any] = {}
     domain_errors: Dict[str, Dict[str, Any]] = {}
     resolved_actively = False
+    resolution_note: Optional[str] = None
 
     async with create_client() as client:
         vt_url_call, abusech_url_call = await asyncio.gather(
-            _call_provider("virustotal_url", vt_url_summary(client=client, api_key=keys.vt_api_key, url=target)),
+            _call_provider(
+                "virustotal_url",
+                lambda: vt_url_summary(client=client, api_key=keys.vt_api_key, url=target),
+                scope=SCOPE_URL,
+                indicator=target,
+            ),
             # The exact-URL abuse.ch lookup: URLhaus's own URL endpoint plus an EXACT ThreatFox
             # search. This is the strongest form of the abuse.ch observation -- a record for this
             # link rather than for something that once happened on its host.
             _call_if_permitted(
-                "abusech", lambda: abusech_url_summary(client=client, api_key=_abusech_key(), url=target)
+                "abusech",
+                lambda: abusech_url_summary(client=client, api_key=_abusech_key(), url=target),
+                scope=SCOPE_URL,
+                indicator=target,
             ),
         )
         url_calls = {"virustotal_url": vt_url_call, "abusech": abusech_url_call}
@@ -1642,15 +1999,16 @@ async def _investigate_url(parsed: ParsedURL, *, depth: str) -> InvestigationRes
                     domain=host,
                     resolve_addresses=depth == "full",
                 )
-                domain_status = _status_map(collected.calls)
+                domain_status = _status_map(collected.calls, scope=SCOPE_DOMAIN, indicator=host)
                 domain_intel = collected.intel
                 domain_errors = collected.provider_errors
                 entries = collected.entries
                 skipped = collected.skipped
                 resolved_actively = collected.resolved_actively
+                resolution_note = collected.resolution_note
                 result_errors.extend(collected.messages)
 
-    url_status = _status_map(url_calls)
+    url_status = _status_map(url_calls, scope=SCOPE_URL, indicator=target)
     vt_url_data = url_intel.get("virustotal")
     chain = _redirect_chain_from_vt(vt_url_data) if isinstance(vt_url_data, Mapping) else RedirectChain.not_resolved()
 
@@ -1710,6 +2068,9 @@ async def _investigate_url(parsed: ParsedURL, *, depth: str) -> InvestigationRes
         skipped_addresses=skipped,
         coverage=_url_coverage(url_status=url_status, domain_status=domain_status, entries=entries),
     )
+    if resolution_note:
+        result.warnings.insert(0, resolution_note)
+        result.data["warnings"] = list(result.warnings)
     if _has_no_vt_url_report(url_calls["virustotal_url"]):
         # Published as its own flag rather than left for a renderer to re-derive from the error
         # payload. "no report exists" and "the query failed" are different facts and only one
@@ -1795,7 +2156,12 @@ async def _resolve_neighbour_names(*, client: httpx.AsyncClient, asns: Sequence[
 
     async def _one(asn: int) -> Tuple[int, ProviderCall]:
         async with gate:
-            return asn, await _call_provider("ripe_neighbour_overview", as_overview(client=client, asn=asn))
+            return asn, await _call_provider(
+                "ripe_neighbour_overview",
+                lambda: as_overview(client=client, asn=asn),
+                scope=SCOPE_ASN,
+                indicator=str(asn),
+            )
 
     names: Dict[int, str] = {}
     for asn, call in await asyncio.gather(*(_one(a) for a in asns)):
@@ -1805,6 +2171,15 @@ async def _resolve_neighbour_names(*, client: httpx.AsyncClient, asns: Sequence[
         if holder:
             names[asn] = holder.split(" - ", 1)[-1] if " - " in holder else holder
     return names
+
+
+def _asn_call(
+    provider: str,
+    factory: Callable[[], Awaitable[Dict[str, Any]]],
+    asn: int,
+) -> Awaitable[ProviderCall]:
+    """One ASN-scope provider call. Exists only to keep the ten-way gather below readable."""
+    return _call_provider(provider, factory, scope=SCOPE_ASN, indicator=str(asn))
 
 
 async def investigate_asn(
@@ -1857,23 +2232,27 @@ async def _investigate_asn(
             cf,
             rdap_call,
         ) = await asyncio.gather(
-            _call_provider("ipinfo_asn", ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int)),
-            _call_provider("ripe_overview", as_overview(client=client, asn=asn_int)),
-            _call_provider("ripe_abuse", abuse_contact(client=client, asn=asn_int)),
-            _call_provider("caida", caida_asrank(client=client, asn=asn_int)),
-            _call_provider("peeringdb", peeringdb_ixps_for_asn(client=client, asn=asn_int)),
-            _call_provider("ripe_routing_status", routing_status(client=client, asn=asn_int)),
-            _call_provider("ripe_neighbors", asn_neighbours(client=client, asn=asn_int)),
-            _call_provider("ripe_prefixes", announced_prefixes(client=client, asn=asn_int)),
-            _call_provider(
+            _asn_call("ipinfo_asn", lambda: ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int), asn_int),
+            _asn_call("ripe_overview", lambda: as_overview(client=client, asn=asn_int), asn_int),
+            _asn_call("ripe_abuse", lambda: abuse_contact(client=client, asn=asn_int), asn_int),
+            _asn_call("caida", lambda: caida_asrank(client=client, asn=asn_int), asn_int),
+            _asn_call("peeringdb", lambda: peeringdb_ixps_for_asn(client=client, asn=asn_int), asn_int),
+            _asn_call("ripe_routing_status", lambda: routing_status(client=client, asn=asn_int), asn_int),
+            _asn_call("ripe_neighbors", lambda: asn_neighbours(client=client, asn=asn_int), asn_int),
+            _asn_call("ripe_prefixes", lambda: announced_prefixes(client=client, asn=asn_int), asn_int),
+            _asn_call(
                 "cloudflare_bgp",
-                bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+                lambda: bgp_incidents(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+                asn_int,
             ),
-            _call_provider(
+            _asn_call(
                 "cloudflare_asn",
-                fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+                lambda: fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
+                asn_int,
             ),
-            _call_if_permitted("rdap", lambda: rdap_asn(client=client, asn=asn_int)),
+            _call_if_permitted(
+                "rdap", lambda: rdap_asn(client=client, asn=asn_int), scope=SCOPE_ASN, indicator=str(asn_int)
+            ),
         )
 
         calls: Dict[str, ProviderCall] = {
@@ -2033,7 +2412,7 @@ async def _investigate_asn(
             # different provenance, and ``meta`` already resolves conflicts by precedence -- an
             # RDAP field folded in there would become indistinguishable from an IPinfo one.
             "rdap": rdap_call.data,
-            "provider_status": _status_map(calls),
+            "provider_status": _status_map(calls, scope=SCOPE_ASN, indicator=str(asn_int)),
         }
         if provider_errors:
             data["errors"] = provider_errors

@@ -25,6 +25,15 @@ and the semaphore is created inside the running loop and kept per loop.
 **The User-Agent (roadmap 2.6).** The default identifies the tool. Impersonating a browser
 bought nothing -- every authenticated provider already knows exactly who is calling from the
 API key -- while creating a terms-of-service and evidence-chain problem.
+
+**The evidence envelope (roadmap 7.6).** For the same reason the egress check lives here, so
+does the recorder: this is the only place that sees every exchange, so it is the only place a
+uniform record can be made without fourteen provider modules cooperating. ``create_client``
+installs :func:`utils.evidence.record_response` as a RESPONSE hook, BESIDE the request hook
+rather than in place of it -- the allowlist decides whether a request may leave, the recorder
+describes what came back, and neither can disable the other. Capture is off unless an
+``EvidenceRecorder`` is active in the current context, and with capture off the hook returns on
+its first line, so client behaviour is unchanged.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ from typing import AsyncIterator, Dict, FrozenSet, MutableMapping, Optional
 import httpx
 
 from tripper_recon import __version__
+from tripper_recon.utils.evidence import record_response
 from tripper_recon.utils.redact import redact_url
 
 # --------------------------------------------------------------------------------------
@@ -227,13 +237,17 @@ def create_client(timeout: float = 15.0) -> httpx.AsyncClient:
     which silently gave HTTP/1.1 and the 100-connection default instead of the 50 configured
     here. ``AsyncHTTPTransport`` defaults to ``retries=0`` anyway, so the line bought nothing
     (roadmap 3.1).
+
+    Two hooks, two jobs. ``request`` enforces the egress allowlist and can refuse a request.
+    ``response`` records the evidence envelope and can refuse nothing -- it is a no-op unless
+    the caller opted in with ``utils.evidence.capture_evidence``.
     """
     return httpx.AsyncClient(
         headers=default_headers(),
         http2=True,
         timeout=httpx.Timeout(timeout),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-        event_hooks={"request": [_enforce_egress_allowlist]},
+        event_hooks={"request": [_enforce_egress_allowlist], "response": [record_response]},
         verify=True,
     )
 

@@ -152,11 +152,21 @@ read the passive DNS records VirusTotal already returns. The tool parses those p
 records at `orchestrators.py:992` and merges them with the active results at `:1130` — so the
 passive substitute is already present, just not selectable.
 
+**`--offline` also suppresses it.** The resolution goes through the same cache lane as every
+provider call, under a `dns` pseudo-provider, so an offline run either replays a cached address
+list or resolves nothing at all — no query leaves the host either way. Two consequences worth
+stating plainly. First, the `dns` lifetime is the **shortest in `cache.yaml`** (five minutes), on
+purpose: a DNS answer carries an authoritative TTL of its own and fast-flux infrastructure exists
+specifically to make yesterday's answer wrong, so a convenient lifetime here would make `--offline`
+report a mapping that no longer exists. Second, a replayed address list means the resolver did not
+run, and the output says so — `collection.passive_only` is `true` and a warning names when the
+list was actually obtained.
+
 **Settled: this is an accepted risk, not a pending fix.** Live resolution stays the default and is
 disclosed here rather than removed. **There is no `--active-dns` flag and none is planned**
 (`docs/ROADMAP.md` §4b, decision Q2, which resolves item 2.2 to documentation rather than code).
-The controls that do exist are the ones above: `--depth url`, `--depth host`, or investigating the
-addresses directly with `tripper-recon ip`.
+The controls that do exist are the ones above: `--depth url`, `--depth host`, `--offline`, or
+investigating the addresses directly with `tripper-recon ip`.
 
 ## 4. What the third-party providers learn
 
@@ -240,6 +250,53 @@ interactive lookups plausibly sit inside "fair use". Bulk mode is the part that 
 | A pasted email body cannot crash the `bulk` path through its filesystem probe | `cli.py:1214-1217` (`_read_bulk_text`, the `except (OSError, ValueError, RuntimeError)` guard) |
 | Investigation output is gitignored in bulk | `.gitignore:80-92` |
 | No `POST` to any submission endpoint anywhere in the package | `tests/test_passivity.py` sections 3 and 5 |
+| **Evidence capture is off by default**, and cannot be turned on without also naming somewhere to write it | `cli._build_evidence_recorder` — `--evidence` without `--case-dir` is refused |
+| **Credentials cannot reach an evidence file**: request headers are captured by allowlist, not denylist, so an auth header is never recorded at all | `utils/evidence.CAPTURED_REQUEST_HEADERS`, `NEVER_CAPTURED_HEADERS` |
+| **`--offline` contacts nobody**, including the system resolver | `orchestrators._resolve_addresses`, `_offline_call` |
+| The calibration harness refuses to run under a test runner or a CI job, with **no override** | `tools/calibrate.assert_not_test_environment` |
+
+## 5a. Evidence files, the cache, and where they land on disk
+
+Both of these put **provider responses on the analyst's disk**. That is the point — an evidence
+envelope exists so a claim can be defended weeks later — but it means this section has to be
+precise about what is written, where, and whether git can see it.
+
+### What is written
+
+| Artefact | Contains | Written when |
+|---|---|---|
+| Cache entries | The provider payload as the orchestrator received it, plus `queried_at`, the TTL and the redacted indicator | Always, unless `--no-cache`. One JSON file per `(provider, scope, indicator, tool version)` |
+| `case.json` | The whole result: every provider payload, the verdict, the coverage, the freshness record | `--case-dir` |
+| `report.md` | The ticket-ready document | `--case-dir` |
+| `evidence/NNNN-<host>.json` | Per-exchange envelopes: status, timings, hashes, allowlisted headers, and the **redacted response body** | `--evidence` (which requires `--case-dir`) |
+
+### Where they land, and what git sees
+
+| Path | Default | Git |
+|---|---|---|
+| Cache | `$TRIPPER_RECON_CACHE_DIR`, else `$XDG_CACHE_HOME/tripper_recon`, else `~/.cache/tripper_recon` | **Outside the repository on every branch of that chain.** Nothing here can be committed by accident, and it does not depend on a `.gitignore` rule that somebody could edit away |
+| Case directories | `<cwd>/outputs/cases/<scope>-<case id>/<run id>/` | `.gitignore` ignores `outputs/` as a **directory**, and git does not descend into an ignored directory — so `case.json`, `report.md` and every evidence envelope under the default are covered |
+| A custom `--case-dir` | wherever you point it | **Not covered.** This is the operator's own call. `write_case` records the answer in the case record as `git_ignored_location`, so the file itself says whether it is protected |
+
+The directory name is built from the scope and a **hash** of the indicator, never from the
+indicator itself: on the `bulk` path the indicator is attacker-authored text, and a path component
+derived from it is a traversal waiting to happen.
+
+### The handling rule
+
+**An evidence directory is attachable to a ticket, and that is exactly what makes it dangerous.**
+Three controls keep credentials out of it (see `ARCHITECTURE.md` §5a), and they have been verified
+adversarially with literal redaction disabled so that only the structural ones were in play. That
+is not a reason to stop treating these files as sensitive: they carry **full provider responses**
+about an indicator under investigation, which is intelligence about a live case even when it
+carries no secret of yours. Review a case directory before you attach it, the same way you would
+review a packet capture.
+
+### What the cache does *not* change
+
+Caching moves no data to a new party and adds no destination. Every host in section 2 is
+unchanged; a cache hit means one **fewer** third party learns the operator is asking about this
+indicator today. `--offline` reduces the disclosure to zero, resolver included.
 
 ## 6. Gaps this document does not paper over
 

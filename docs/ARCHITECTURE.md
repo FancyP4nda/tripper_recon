@@ -33,8 +33,8 @@ longer means a run makes no requests at all.
 Five layers, and the dependency arrows only ever point one way.
 
 ```
-  cli.py                      argument parsing, exit codes, output selection
-    |
+  cli.py                      argument parsing, exit codes, output selection,
+    |                         the cache session and the evidence recorder
     v
   orchestrators.py            fan-out, envelopes, coverage, adjudication calls
     |
@@ -42,13 +42,24 @@ Five layers, and the dependency arrows only ever point one way.
     |         |
     |         +--> utils/backoff.py     retry policy
     |         +--> utils/http.py        the one client factory + the egress allowlist
+    |                   |
+    |                   +--> utils/evidence.py   the response hook: what came back, and when
+    |
+    +--> utils/cache.py       TTL cache, freshness disclosure, the case directory
     |
     +--> verdict/             pure scoring over collected evidence
     |
     +--> types/models.py      the typed result surface
 
   reporting/console.py        renders result.data. Imports nothing from the layers above it.
+  reporting/markdown.py       the same result, as a document. Reads no clock and no file.
 ```
+
+`utils/cache.py` and `utils/evidence.py` are both **opt-in and inert by default**. Neither is
+threaded through a provider signature; both are carried in a `contextvars` ContextVar that
+`cli.py` installs before `asyncio.run`. With no session and no recorder installed the package
+behaves exactly as it did before either existed, which is what keeps fourteen provider modules
+ignorant of caching and evidence capture alike. Section 5a has the detail.
 
 The dependency direction is verifiable, not aspirational:
 
@@ -229,6 +240,113 @@ constrains nothing.
 `ALLOWED_EGRESS_HOSTS` in `utils/http.py`, `ALLOWED_HOSTS` in `tests/test_passivity.py`, and the
 destination table in `OPSEC.md` section 2. Miss the third and CI fails. Miss the second and the
 provider raises at runtime.
+
+The factory installs a **second** hook, on the response side:
+
+```python
+event_hooks={"request": [_enforce_egress_allowlist], "response": [record_response]}
+```
+
+The two are independent and neither can disable the other. The request hook decides whether a
+request may leave; the response hook describes what came back. A request refused by the allowlist
+produces no evidence record at all, because nothing was sent — which is the correct record.
+
+---
+
+## 5a. The evidence envelope and the TTL cache
+
+Both layers exist to serve one sentence: **a cached fact must never claim to have been queried
+now.** A report that presents a three-week-old answer as a fresh lookup is worse than no report,
+because it launders staleness into apparent currency. Timestamps are the product here, not
+decoration.
+
+### The evidence envelope (`utils/evidence.py`)
+
+One `Evidence` record per request/response exchange, captured at the client hook rather than in
+fourteen provider modules. Capturing centrally is what makes the record uniform: every provider,
+every retry and every redirect hop produces the same envelope with no provider-side cooperation.
+
+Schema tag `tripper-recon.evidence/1`. The model is frozen, `extra="forbid"`. Three consumers sit
+on the one capture: integrity (`body_sha256` over the full raw body, never over the stored
+prefix), offline regeneration, and the cache.
+
+**Two timestamps, never one.** `queried_at` is when this tool sent the request — derived from the
+completion instant minus the measured round trip. `observed_at` is when the *provider* says it
+observed the fact, with `observed_at_source` naming which of the two origins it came from
+(`http_date` or `payload`). Collapsing them hides exactly the staleness the evidence exists to
+expose. `elapsed_ms` of `None` is load-bearing: it means httpx could not report timing, so
+`queried_at` is a completion instant and therefore an upper bound, not the send instant.
+
+**Credentials never reach an envelope.** This is why 7.6 was sequenced after the W0.1 redaction
+work. Shodan and IPinfo authenticate in the query string; VirusTotal, AbuseIPDB, OTX, Cloudflare
+and abuse.ch authenticate in headers; and a provider's own 401 body routinely echoes the key it
+rejected. Three controls, all fail-closed:
+
+1. every URL goes through `redact_url` before it is stored;
+2. headers are captured by **allowlist** (`CAPTURED_REQUEST_HEADERS`, `CAPTURED_RESPONSE_HEADERS`
+   plus the rate-limit prefixes), never by denylist — a denylist fails open on the next provider
+   that invents a header name nobody anticipated, and the cost of failing closed is a missing
+   diagnostic field rather than a leaked key;
+3. every body goes through `redact_text`.
+
+Verified adversarially, not only by unit test: with literal redaction disabled so that *only* the
+structural controls are in play, no auth header appears in any captured record and both `?key=`
+and `?token=` come back as `REDACTED`.
+
+### The TTL cache (`utils/cache.py`, `utils/cache.yaml`)
+
+Lifetimes are **policy in YAML**, not numbers in Python, for the same reason the scoring weights
+are: a value that governs how long a fact may masquerade as current is a decision somebody should
+review. Registration data gets days, reputation feeds get minutes, and DNS gets the shortest
+lifetime in the file because fast-flux infrastructure exists precisely to make yesterday's answer
+wrong.
+
+The key is `sha256(schema | tool version | scope | provider | indicator)`. The tool version is in
+there deliberately: a provider module's extraction shape can change between releases, and
+replaying a payload shaped for the previous parser is a subtler version of the same lie.
+
+Four properties are structural rather than conventional:
+
+| Property | How it is enforced |
+|---|---|
+| A stored `queried_at` is never rewritten on replay | `CacheEntry` is frozen. There is no setter and no `touch()` |
+| Every replay is announced | `CacheSession.lookup` records it; `_status_map` copies it onto `provider_status[<name>]['cache']`; `summarise_freshness` folds it into `data['freshness']`; `freshness_warnings` puts it first in the console warning list. There is no silent path |
+| Only successes are cached | An error is a state of the world at one instant. Replaying a 429 or an unset key would outlive its cause |
+| An entry that cannot be dated is discarded | Unreadable `queried_at`, unknown schema, or a stamp **in the future** all resolve to `DISABLED`, never to a hit |
+
+That last row is not hypothetical. Age arithmetic clamps at zero, so before
+`FUTURE_SKEW_TOLERANCE_SECONDS` was added an entry stamped ahead of the reading clock came back as
+a hit reporting `age: "0s"` and `"obtained 0s ago"` — the strongest freshness claim the tool can
+make, manufactured out of a wrong clock — and it walked straight past `--max-age`, because nothing
+is older than a limit when everything reports zero. Causes are mundane: a cache directory copied
+from another host, a VM resuming with a stepped clock. A few seconds of tolerance absorbs ordinary
+NTP jitter; beyond that the entry is refused and the reason names the skew.
+
+**One clock per run.** `CacheSession.clock()` is the only clock a cached run reads, for writes as
+well as reads. A run that ages entries against a pinned clock while stamping new ones from the
+wall clock files them in its own future, and the skew check above then correctly refuses to date
+them. `orchestrators._call_provider` and `_resolve_addresses` both stamp from `session.clock()`.
+
+**`--offline` refuses rather than degrades.** A miss, an expired entry, or a call with nothing to
+key on all become a stated `skipped` outcome naming the gap — never the stale value. That costs
+coverage, which is the honest price. It covers the system resolver too, under the `dns`
+pseudo-provider: a run that contacts no provider but still resolves the name has still told a
+nameserver what the operator is looking at, and `collection.passive_only` reports `true` only when
+the resolver genuinely did not run.
+
+### The case directory
+
+`write_case` writes `<root>/<scope>-<case id>/<run id>/` holding `case.json` (the result, the
+verdict, the cache record), `report.md`, and `evidence/` when `--evidence` is on. The directory
+name is built from the scope and a **hash** of the indicator, never from the indicator itself: on
+the bulk path the indicator is attacker-authored text, and a path component derived from it is a
+traversal waiting to happen.
+
+`report --from-case` rebuilds the document from that record. It contacts nobody, builds no HTTP
+client, and **carries the original timestamps** — `MarkdownOptions.now` is fed from the saved run's
+`started_at`, so a regenerated report says when the evidence was collected rather than when
+somebody re-rendered it. Restamping there would be the same lie as a cache claiming a replayed
+answer was queried now, one artefact further downstream.
 
 ---
 
@@ -485,6 +603,7 @@ consumer and never reached the screen.
 | `tripper_recon/orchestrators.py` | four entry points, fan-out, envelopes, coverage, adjudication calls |
 | `tripper_recon/providers/` | one module per third party. No shared state, no orchestrator types |
 | `tripper_recon/reporting/console.py` | every rich renderer. Reads `result.data`, imports nothing above it |
+| `tripper_recon/reporting/markdown.py` | the same result as a ticket-ready document. Pure: no clock, no I/O |
 | `tripper_recon/types/models.py` | the typed result surface described in section 9 |
 | `tripper_recon/types/indicators.py` | `detect()`, the pure classifier behind `check` and `bulk` |
 | `tripper_recon/utils/http.py` | the client factory, the egress allowlist, the concurrency limiter |
@@ -493,13 +612,21 @@ consumer and never reached the screen.
 | `tripper_recon/utils/urls.py` | URL parsing, anomaly detection, redirect-chain provenance |
 | `tripper_recon/utils/refang.py` | turning `evil[.]com` back into something the tool can look up |
 | `tripper_recon/utils/redact.py` | stripping credentials out of URLs and exception text |
+| `tripper_recon/utils/evidence.py` | the evidence envelope and the response hook that captures it |
+| `tripper_recon/utils/cache.py` | the TTL cache, the freshness summary, the case directory |
+| `tripper_recon/utils/cache.yaml` | per-provider cache lifetimes. Policy, deliberately not in Python |
 | `tripper_recon/verdict/` | the scoring engine, its ruleset and its known-infrastructure catalogue |
+| `tools/calibrate.py` | the calibration harness. **Operator-run by hand only** — see section 11 |
 | `tests/test_passivity.py` | the static passive-boundary gate |
 
-Two YAML files ship inside the package and are loaded through `importlib.resources`:
-`verdict/scoring.yaml` (the ruleset) and `verdict/known_infrastructure.yaml` (the allowlist
-catalogue). Both are declared in `pyproject.toml` under `[tool.setuptools.package-data]`, because a
-wheel that omits them produces a tool that imports fine and then refuses to adjudicate anything.
+Three YAML files ship inside the package and are loaded through `importlib.resources`:
+`verdict/scoring.yaml` (the ruleset), `verdict/known_infrastructure.yaml` (the allowlist
+catalogue) and `utils/cache.yaml` (the TTL ruleset). The first two are declared in
+`pyproject.toml` under `[tool.setuptools.package-data]`, because a wheel that omits them produces
+a tool that imports fine and then refuses to adjudicate anything. **`utils/cache.yaml` is not yet
+declared there**, so an installed wheel may not carry it; the loader degrades to a short built-in
+default with a source label that says which state it is in, rather than raising, because a cache
+is an optimisation and must never take a run down.
 
 ---
 
@@ -516,12 +643,16 @@ did not exist.
   `url`, so `_adjudicate_url` hands the engine an empty signal list and gets `INSUFFICIENT_DATA`.
   That is the true answer, not a degradation. The scope is wired so the day `url.*` signals land
   needs no change in `orchestrators.py`.
-* **abuse.ch is planned, not built.** Decision Q5 in `ROADMAP.md` section 4b accepts the
-  terms-of-service exposure and commits to building it in full, including bulk mode. No code for
-  it exists today.
 * **GreyNoise is struck**, not deferred. See the same table.
 * **No `--active-dns` flag.** See section 8.2.
-* **No accuracy claim for the verdict engine.** See section 7.
+* **No accuracy claim for the verdict engine.** See section 7. The calibration harness that would
+  produce one (`tools/calibrate.py`) is built, but it is **run by the operator by hand and never
+  by anything else**: it refuses to start under a test runner or a CI job with no override,
+  refuses without an explicit acknowledgement flag, and refuses again when stdin is not a
+  terminal. Until he runs it the ruleset stays `calibration.status: unvalidated`.
+* **`report --from-case` offers no `console` format.** The console renderers are driven from a
+  live result through six code paths, and a half-supported reimplementation would silently differ
+  from what the run actually printed.
 
 ---
 

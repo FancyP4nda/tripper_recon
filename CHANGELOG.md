@@ -40,9 +40,83 @@ the baseline and appear below only where the hardening work changed them.
 - **Secret scanning in CI** (`f7e9d4c`). A gitleaks job scans commit history, not only the
   working tree.
 - **The unauthenticated network listener is gone.** See the FastAPI removal under Removed.
+- **Provider credentials cannot reach an evidence file.** Evidence capture writes provider
+  exchanges to disk precisely so they can be attached to a ticket, which makes a naive recorder a
+  credential-distribution mechanism: Shodan and IPinfo authenticate in the query string;
+  VirusTotal, AbuseIPDB, OTX, Cloudflare and abuse.ch authenticate in headers; and a provider's
+  own 401 body routinely echoes the key it rejected. Three fail-closed controls: URLs go through
+  `redact_url`, bodies through `redact_text`, and request headers are captured by **allowlist**
+  rather than denylist — a denylist fails open on the next provider that invents a header name
+  nobody anticipated, while the cost of failing closed is a missing diagnostic field. Verified
+  adversarially with literal redaction disabled, so the structural controls were proven on their
+  own rather than masked by the belt-and-braces layer.
+- **A password embedded in an indicator URL is redacted before it is stored.** `redact_url`
+  stripped credential-bearing query parameters but left the authority alone, so an analyst
+  investigating a link carrying `user:pass@` in its userinfo wrote that password verbatim into
+  the cache entry's stored indicator and the case record's subject — files on disk that outlive
+  the run, in a function whose own documentation claimed userinfo was handled. The username is
+  kept, because it is diagnostic and is not the secret. Found by adversarial review of the
+  evidence-and-cache write path.
+- **A cache entry stamped in the future is refused instead of being served as brand new.** Age
+  arithmetic clamps at zero, so an entry whose `queried_at` sat ahead of the reading clock came
+  back as a hit reporting `age: "0s"` and `"obtained 0s ago"` — the strongest freshness claim the
+  tool can make, manufactured out of a wrong clock — and it walked straight past `--max-age`,
+  because nothing is older than a limit when everything reports zero. Causes are mundane: a cache
+  directory copied from another host, a VM resuming with a stepped clock. Skew beyond
+  `FUTURE_SKEW_TOLERANCE_SECONDS` (5s, which absorbs ordinary NTP jitter) now discards the entry
+  and names the skew. Found by adversarial review of the cache lane, not by a failing test.
 
 ### Added
 
+- **Provider answers are cached on disk, and every replay is disclosed** (roadmap 7.7), in
+  `tripper_recon/utils/cache.py`, with per-provider lifetimes in `utils/cache.yaml`. A domain with
+  eight A records costs nine VirusTotal calls per run; re-running it an hour later used to pay
+  again. **The rule that governs the whole feature: a cached fact never claims to have been
+  queried now.** Every cached value carries the instant it was actually obtained; that instant is
+  never rewritten on replay (`CacheEntry` is frozen — there is no setter and no `touch()`); and
+  every replay is announced in three places — the first console warning,
+  `provider_status[<name>].cache`, and a `freshness` block in `-o json` stating how many answers
+  were queried now, how many were replayed, and how old the oldest one is. Only successful answers
+  are cached: a 429 or an unset key is a state of the world at one instant, and replaying it would
+  outlive its cause. The cache is **inert unless a caller installs a session**, so library callers
+  see exactly the previous behaviour.
+- **`--offline`, `--max-age`, `--no-cache`, `--cache-dir`.** `--offline` contacts nobody at all,
+  **including the system resolver** — name resolution goes through the same cache lane under a
+  `dns` pseudo-provider carrying the shortest lifetime in the ruleset, because a run that contacts
+  no provider but still resolves the name has still told a nameserver what the operator is looking
+  at. When it cannot answer from cache, `--offline` reports a stated gap with the reason rather
+  than serving an expired value; that costs coverage, which is the honest price. `--offline` with
+  `--no-cache` is refused at parse time: it would consult nobody and serve nothing, producing a run
+  indistinguishable from a total intelligence blackout.
+- **`-o markdown`** (roadmap 7.2), in `tripper_recon/reporting/markdown.py`. The form an analyst
+  pastes into a ticket: ATX headings and GFM pipe tables, no HTML and no box drawing. The console
+  format cannot fill this role because `rich` strips its colour the moment output is redirected,
+  taking the only malice signal with it. Every provider-controlled value is escaped, so a pulse
+  title containing `|`, a leading `#`, raw HTML or `rich` markup cannot break a table, inject a
+  heading or arm a link. The module is pure: it reads no clock and touches no file.
+- **The evidence envelope** (roadmap 7.6), in `tripper_recon/utils/evidence.py`, captured by a
+  response hook on the one client factory so that every provider, retry and redirect hop yields
+  the same record with no provider-side cooperation. It carries status, HTTP version, allowlisted
+  headers, timings, the sha256 of the **full** body, and what was done to the stored copy.
+  **Two timestamps, never one:** `queried_at` (when this tool sent the request) and `observed_at`
+  (when the provider says it observed the fact), with `observed_at_source` naming the origin —
+  collapsing them hides exactly the staleness the evidence exists to expose. Off by default.
+- **`--out`, `--case-dir`, `--evidence`, and `report --from-case`** (roadmap 7.3/7.7). A case
+  directory holds the result, the verdict, the cache record, the report and the evidence
+  envelopes, so a report can be rebuilt weeks later with nobody contacted and no quota spent.
+  **The regenerated report carries the original timestamps** — restamping it would be the same lie
+  as a cache claiming a replayed answer was queried now, one artefact further downstream. The
+  directory name is built from a hash of the indicator, never from the indicator itself, because
+  on the bulk path that is attacker-authored text. `--evidence` without `--case-dir` is refused
+  rather than capturing envelopes into memory that nothing will ever write out.
+- **Calibration harness** (`tools/calibrate.py`), which records fixtures against live providers so
+  the ruleset can eventually carry a held-out accuracy figure instead of none. It is **run by the
+  operator by hand and by nothing else**: it refuses to start under a test runner or a CI job with
+  no override of any kind, refuses without an explicit `--i-understand-this-spends-quota` flag,
+  and refuses again when stdin is not a terminal. The one object that reaches the network
+  self-guards in its own constructor, so a test cannot obtain one however it is written. Until the
+  operator runs it, the ruleset stays `calibration.status: unvalidated` and the tool makes no
+  accuracy claim.
 - **Verdict engine** (`5e698d1`), in `tripper_recon/verdict/`. The tool now adjudicates rather
   than only collecting. Five states: `MALICIOUS`, `SUSPICIOUS`, `NO_ADVERSE_FINDINGS`,
   `INSUFFICIENT_DATA`, `KNOWN_INFRASTRUCTURE`. `NO_ADVERSE_FINDINGS` is deliberately not called
@@ -136,6 +210,19 @@ the baseline and appear below only where the hardening work changed them.
   `tripper_recon.cli` module docstring as the public interface it is. The exit code reports
   whether the lookup worked, not what it found: a `MALICIOUS` indicator with full coverage exits
   `0`, and a pipeline that wants to branch on maliciousness must read `data['verdict']`.
+- **Exit code `1` additionally covers "the run completed but an artefact could not be written".**
+  If `--out` or `--case-dir` was asked for and the write failed, the run exits `1` even though the
+  lookup itself succeeded. Exiting `0` there would leave a pipeline believing it holds a report it
+  does not hold, which is the same class of error as a clean-looking blackout.
+- **`_default_output_dir` resolves against the working directory, not the installed package.** It
+  previously resolved against `Path(__file__).parent.parent`, so after `pip install .` a bare
+  `--prefixes-out foo.txt` wrote the analyst's evidence into `site-packages/outputs/` and reported
+  success. Nothing failed, nothing warned, and the file was not where they looked for it.
+- **`result.data` gains `freshness` and `cache` blocks, and `collection` is now published on the
+  domain path too.** All three appear **only when a cache session is installed**, so every
+  existing payload and every existing test is unchanged. `collection.passive_only` on the domain
+  path reports whether the system resolver ran **on this run** — a replayed address list leaves it
+  `true`, because no query left the host.
 - **User-Agent no longer impersonates Chrome** (`8677b65`). The default is now
   `tripper-recon/<version>`. The API key already identifies the caller, so impersonation bought
   nothing and cost a terms-of-service exposure. `--user-agent` and `TRIPPER_RECON_USER_AGENT`

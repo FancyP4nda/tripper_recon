@@ -1,0 +1,73 @@
+# Per-provider cache lifetimes (roadmap 7.7).
+#
+# These are in YAML rather than in cache.py for the same reason the scoring weights are in
+# scoring.yaml: a number that changes how long a fact is allowed to masquerade as current is a
+# policy decision, and a policy decision buried in a .py file is one nobody reviews.
+#
+# The unit is seconds and the question each value answers is "how long can this provider's
+# answer be replayed before replaying it becomes a claim the tool cannot defend?". Two facts
+# with the same shape can have very different answers: a domain's registration date does not
+# move for months, and an abuse score can move in minutes.
+#
+# Loading precedence, highest first:
+#   1. an explicit path, then $TRIPPER_RECON_CACHE_CONFIG
+#   2. $XDG_CONFIG_HOME/tripper_recon/cache.yaml (else ~/.config/tripper_recon/cache.yaml)
+#   3. this file
+#
+# The keys are provider LABELS as orchestrators.py passes them to _call_provider, not output
+# keys. Where the two differ the label is the one that identifies the endpoint that was called:
+# "shodan" (paid host record) and "internetdb" (keyless extract) share one coverage slot and are
+# two different datasets, so they get two entries.
+#
+# A provider with no entry here uses default_ttl_seconds. That default is deliberately short.
+# Guessing long on an unknown provider is the failure this whole workstream exists to prevent.
+
+schema_version: tripper-recon.cache-config/1
+
+# Set to false to turn the cache off everywhere, including for --offline (which then has
+# nothing to serve and says so).
+enabled: true
+
+# Applied to any provider not named below.
+default_ttl_seconds: 3600
+
+providers:
+  # --- Registry and allocation data. Changes on a registrar/RIR timescale. --------------
+  rdap: 604800 # 7d. Registration dates, registrar, abuse contact. Stable for months.
+  caida: 604800 # 7d. AS-Rank recomputes monthly.
+  peeringdb: 604800 # 7d. IXP presence is a facility fact, not an event.
+  ipinfo: 86400 # 1d. Geolocation and the announcing ASN.
+  ipinfo_asn: 86400 # 1d. ASN record; the paid endpoint, so the quota relief is real.
+  cloudflare_asn: 86400 # 1d. Radar ASN metadata: name, country, allocation date.
+  tranco: 86400 # 1d. The list itself is rebuilt daily.
+
+  # --- Routing. Moves, but not minute to minute. ----------------------------------------
+  ripe_overview: 21600 # 6h
+  ripe_abuse: 86400 # 1d. Abuse contact is registry data wearing a routing hat.
+  ripe_routing_status: 3600 # 1h
+  ripe_neighbors: 3600 # 1h
+  ripe_prefixes: 3600 # 1h
+  ripe_neighbour_overview: 86400 # 1d. Only ever used to turn an ASN into a holder name.
+  cloudflare_bgp: 3600 # 1h. Hijack/leak incidents are events; a stale answer misses one.
+
+  # --- Reputation. The whole point of the tool, and the fastest-moving thing in it. ------
+  virustotal: 3600 # 1h
+  virustotal_domain: 3600 # 1h
+  virustotal_url: 1800 # 30m. A URL verdict can flip inside an hour on a live campaign.
+  abuseipdb: 3600 # 1h
+  otx: 3600 # 1h
+  otx_domain: 3600 # 1h
+  abusech: 1800 # 30m. URLhaus/ThreatFox are near-real-time feeds; treat them as such.
+
+  # --- Exposure. Shodan rescans on its own schedule, not ours. --------------------------
+  shodan: 21600 # 6h
+  internetdb: 21600 # 6h
+
+  # --- Name resolution, which is not a provider but is an outbound question. ------------
+  #
+  # Deliberately the shortest lifetime here. A DNS answer has an authoritative TTL of its own,
+  # frequently 60-300s, and fast-flux infrastructure exists precisely to make yesterday's
+  # answer wrong. Caching a resolution long enough to be convenient would make --offline
+  # report an address mapping that no longer exists, which is the exact lie this cache is
+  # built to prevent.
+  dns: 300 # 5m

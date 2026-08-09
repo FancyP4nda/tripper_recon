@@ -392,3 +392,49 @@ def test_redacted_output_contains_no_secret_material(monkeypatch: pytest.MonkeyP
 
     assert FAKE_KEY not in serialised
     assert "sk_live" not in serialised
+
+
+# --------------------------------------------------------------------------------------
+# Userinfo passwords in an indicator URL
+# --------------------------------------------------------------------------------------
+#
+# These are not provider credentials -- no provider this tool contacts authenticates in the
+# authority -- they are credentials an ANALYST pasted, embedded in the indicator itself. The
+# reason they matter here is that the indicator becomes a stored cache entry's `indicator` field
+# and a case record's subject, both of which are files that outlive the run, and both of which
+# claim to have been redacted.
+
+
+def test_a_userinfo_password_is_redacted_out_of_an_indicator_url() -> None:
+    """`https://user:pass@host/` is a real thing to paste, and the password is a real secret."""
+    redacted = redact_url("https://alice:s3cr3tpassword@evil.example/path?token=abc")
+
+    assert "s3cr3tpassword" not in redacted
+    assert redacted == "https://alice:REDACTED@evil.example/path?token=REDACTED"
+
+
+def test_a_userinfo_password_is_redacted_even_with_no_query_string() -> None:
+    """The no-query branch is a separate code path and used to return the URL untouched."""
+    redacted = redact_url("https://alice:s3cr3tpassword@evil.example/path")
+
+    assert "s3cr3tpassword" not in redacted
+    assert redacted == "https://alice:REDACTED@evil.example/path"
+
+
+def test_the_username_survives_because_it_is_not_the_secret() -> None:
+    """Diagnostic value is kept where it costs nothing: a bare `user@host` has no password."""
+    assert redact_url("https://alice@evil.example/path") == "https://alice@evil.example/path"
+
+
+def test_a_userinfo_password_is_redacted_inside_free_text() -> None:
+    """The error path carries URLs inside exception messages, not only as bare fields."""
+    cleaned = redact_text("Client error for url 'https://bob:hunter2pass@x.example/a?token=t9'")
+
+    assert "hunter2pass" not in cleaned
+    assert "REDACTED" in cleaned
+
+
+def test_userinfo_redaction_is_idempotent() -> None:
+    once = redact_url("https://alice:s3cr3tpassword@evil.example/path")
+
+    assert redact_url(once) == once

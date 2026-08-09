@@ -74,8 +74,32 @@ def _known_secrets() -> list[str]:
     return sorted(set(values), key=len, reverse=True)
 
 
+def _redact_userinfo(netloc: str) -> str:
+    """Replace the password in a ``user:pass@host`` authority, keeping the username.
+
+    The username stays because it is diagnostic and is not the secret; the password goes because
+    it is. This matters for the INDICATOR, not for the provider URL: no provider this tool
+    contacts authenticates this way, but an analyst does paste a link carrying `user:pass@` in
+    its authority, and that string becomes a cache entry's stored indicator and a case record's
+    subject — both of which are files on disk that outlive the run.
+
+    (Deliberately described rather than shown: a URL literal in this package, even inside a
+    docstring, is a `tests/test_passivity.py` failure, and correctly so.)
+    """
+    if "@" not in netloc:
+        return netloc
+    userinfo, _, host = netloc.rpartition("@")
+    if not userinfo:
+        return netloc
+    username, separator, _password = userinfo.partition(":")
+    if not separator:
+        # A bare `user@host` carries no password to remove.
+        return netloc
+    return f"{username}:{REDACTED}@{host}"
+
+
 def redact_url(url: str) -> str:
-    """Replace credential-bearing query parameter values in a URL.
+    """Replace credential-bearing values in a URL: query parameters, and userinfo passwords.
 
     Returns the input unchanged if it cannot be parsed — never raises, because this runs on
     the error path where a second exception would mask the original failure.
@@ -84,11 +108,14 @@ def redact_url(url: str) -> str:
         return url
     try:
         parts = urlsplit(url)
+        netloc = _redact_userinfo(parts.netloc)
         if not parts.query:
-            return _redact_literals(url)
+            if netloc == parts.netloc:
+                return _redact_literals(url)
+            return _redact_literals(urlunsplit((parts.scheme, netloc, parts.path, "", parts.fragment)))
         pairs = parse_qsl(parts.query, keep_blank_values=True)
         cleaned = [(name, REDACTED if name.lower() in _SENSITIVE_PARAMS else value) for name, value in pairs]
-        rebuilt = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(cleaned), parts.fragment))
+        rebuilt = urlunsplit((parts.scheme, netloc, parts.path, urlencode(cleaned), parts.fragment))
         return _redact_literals(rebuilt)
     except Exception:  # noqa: BLE001 - redaction must never raise on the error path
         return _redact_literals(url)

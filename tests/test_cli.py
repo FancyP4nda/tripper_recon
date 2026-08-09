@@ -36,6 +36,7 @@ import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
@@ -60,7 +61,8 @@ from tripper_recon.reporting.console import (
     render_ip_analysis,
     render_triage_table,
 )
-from tripper_recon.types.models import Coverage, InvestigationResult
+from tripper_recon.types.models import Coverage, InvestigationResult, RunMetadata
+from tripper_recon.utils.cache import write_case
 
 # --------------------------------------------------------------------------------------
 # Harness for driving cli.main() without side effects
@@ -1397,3 +1399,410 @@ async def test_cmd_url_prints_the_host_verdict_separately_from_the_url_verdict(
     # The host's own rows come from the shared helper, so the "never asked" wording that stops
     # an unset key looking like a clean result is inherited rather than reimplemented.
     assert "no data - not configured, no API key" in out
+
+
+# ==========================================================================================
+# 7.2 / 7.3 / 7.7 -- markdown output, --out, --case-dir, and the cache flags
+#
+# The failure this whole block exists to catch is one sentence long: a cached fact must never
+# claim to have been queried now. The CLI's share of that is three things -- refusing flag
+# combinations that would produce an unanswerable run, keeping the ORIGINAL timestamps when a
+# report is regenerated from a case, and writing artefacts where the operator said rather than
+# into site-packages.
+# ==========================================================================================
+
+_ALL_COMMANDS = ("_cmd_ip", "_cmd_domain", "_cmd_asn", "_cmd_url", "_cmd_check", "_cmd_bulk")
+
+
+@pytest.fixture
+def run_any(monkeypatch: pytest.MonkeyPatch) -> Callable[[list[str]], tuple[int, list[_Invocation]]]:
+    """``run_cli`` with every command stubbed and no assertion on how many dispatched.
+
+    Needed because the flags under test live on ``url`` as well as ``ip``/``domain``/``asn``,
+    and because several of them are refused BEFORE dispatch -- so "exactly one dispatch" is the
+    wrong expectation for half of these tests.
+    """
+
+    def _run(argv: list[str]) -> tuple[int, list[_Invocation]]:
+        recorded: list[_Invocation] = []
+
+        def _recorder(name: str) -> Callable[..., Any]:
+            async def _fake(*args: Any, **kwargs: Any) -> int:
+                recorded.append(_Invocation(name, args, kwargs))
+                return 0
+
+            return _fake
+
+        monkeypatch.setattr(cli, "load_env", lambda: None)
+        monkeypatch.setattr(cli, "configure_rate_limit", lambda *_a, **_k: None)
+        monkeypatch.setattr(cli, "configure_user_agent", lambda *_a, **_k: None)
+        for name in _ALL_COMMANDS:
+            monkeypatch.setattr(cli, name, _recorder(name))
+        monkeypatch.setattr(sys, "argv", ["tripper-recon", *argv])
+
+        with pytest.raises(SystemExit) as excinfo:
+            cli.main()
+        return int(excinfo.value.code or 0), recorded
+
+    return _run
+
+
+# ------------------------------------------------------------------------------------------
+# -o markdown (roadmap 7.2)
+# ------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cmd", "target", "recorder"),
+    [("ip", "8.8.8.8", "_cmd_ip"), ("domain", "example.com", "_cmd_domain"), ("url", "http://x.test/", "_cmd_url")],
+)
+def test_markdown_is_an_output_format_everywhere(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]], cmd: str, target: str, recorder: str
+) -> None:
+    """``README.md``'s markdown claim was untrue until the format existed. It exists now, and it
+    reaches the command by the same before-or-after-subcommand path ``json`` does."""
+    before_code, before = run_any(["-o", "markdown", cmd, target])
+    after_code, after = run_any([cmd, target, "-o", "markdown"])
+
+    assert before_code == after_code == 0
+    assert before[0].kwargs["output"] == "markdown"
+    assert after[0].kwargs["output"] == "markdown"
+    assert before[0].cmd == after[0].cmd == recorder
+
+
+# ------------------------------------------------------------------------------------------
+# --out and the site-packages defect (roadmap 7.3)
+# ------------------------------------------------------------------------------------------
+
+
+def test_the_default_output_directory_is_the_working_directorys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """THE 7.3 REGRESSION.
+
+    ``_default_output_dir`` resolved against ``Path(__file__).parent.parent``. After the README's
+    own ``pip install .`` that is ``site-packages``, so a bare ``--prefixes-out foo.txt`` wrote
+    the analyst's evidence into the installed package and reported success. Nothing failed and
+    nothing warned; the file was simply not where they looked for it.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    assert cli._default_output_dir() == tmp_path / "outputs"
+    assert "site-packages" not in str(cli._default_output_dir())
+
+
+def test_a_bare_filename_lands_in_the_ignored_outputs_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``outputs/`` is the one directory ``.gitignore`` ignores wholesale, so a bare filename
+    cannot be committed by accident. A path with a directory in it is taken literally."""
+    monkeypatch.chdir(tmp_path)
+
+    assert cli._resolve_artefact_path("report.md") == tmp_path / "outputs" / "report.md"
+    assert cli._resolve_artefact_path("cases/report.md") == Path("cases/report.md")
+
+
+@pytest.mark.parametrize("cmd,target", [("ip", "8.8.8.8"), ("domain", "example.com"), ("url", "http://x.test/")])
+def test_out_and_case_dir_reach_the_command(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]], cmd: str, target: str
+) -> None:
+    """Roadmap 7.3: ``ip``, ``domain`` and ``url`` had no ``--out`` at all."""
+    code, recorded = run_any([cmd, target, "--out", "r.md", "--case-dir", "/tmp/cases"])
+
+    assert code == 0
+    assert recorded[0].kwargs["out"] == "r.md"
+    assert recorded[0].kwargs["case_dir"] == "/tmp/cases"
+
+
+def test_case_dir_defaults_to_the_ignored_outputs_tree(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]],
+) -> None:
+    """``--case-dir`` with no value still has to land somewhere git will not pick up."""
+    code, recorded = run_any(["ip", "8.8.8.8", "--case-dir"])
+
+    assert code == 0
+    assert recorded[0].kwargs["case_dir"] == str(Path.cwd() / "outputs" / "cases")
+
+
+# ------------------------------------------------------------------------------------------
+# The cache flags
+# ------------------------------------------------------------------------------------------
+
+
+def test_offline_and_no_cache_together_are_refused(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]],
+) -> None:
+    """Obeying the pair would consult nobody and serve nothing: every provider reports a gap and
+    the run is indistinguishable, from the exit code, from a total intelligence blackout.
+    Refusing at parse time costs nothing and says which flag to drop."""
+    code, recorded = run_any(["--offline", "--no-cache", "ip", "8.8.8.8"])
+
+    assert code == 2
+    assert recorded == []
+
+
+@pytest.mark.parametrize("value", ["soon", "-1h", "2 hours"])
+def test_an_unparseable_max_age_is_refused_before_anything_runs(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]], value: str
+) -> None:
+    """A guessed freshness window is a guarantee the operator never made."""
+    code, recorded = run_any(["--max-age", value, "ip", "8.8.8.8"])
+
+    assert code == 2
+    assert recorded == []
+
+
+def test_evidence_without_a_case_dir_is_refused(
+    run_any: Callable[[list[str]], tuple[int, list[_Invocation]]],
+) -> None:
+    """Capturing envelopes into memory that nothing will write out is worse than refusing: the
+    operator asked to preserve evidence and would have been given none, silently."""
+    code, recorded = run_any(["ip", "8.8.8.8", "--evidence"])
+
+    assert code == 2
+    assert recorded == []
+
+
+def test_evidence_with_a_case_dir_mints_a_recorder(tmp_path: Path) -> None:
+    args = SimpleNamespace(evidence=True, case_dir=str(tmp_path))
+
+    recorder, error = cli._build_evidence_recorder(args)  # type: ignore[arg-type]
+
+    assert error is None
+    assert recorder is not None
+    assert recorder.records == ()
+
+
+def test_the_cache_session_carries_the_operators_freshness_demand(tmp_path: Path) -> None:
+    args = SimpleNamespace(offline=True, no_cache=False, max_age="15m", cache_dir=str(tmp_path))
+
+    session, error = cli._build_cache_session(args)  # type: ignore[arg-type]
+
+    assert error is None
+    assert session is not None
+    assert session.offline is True
+    assert session.max_age_seconds == 900.0
+    assert session.store is not None and session.store.root == tmp_path
+
+
+def test_no_cache_produces_a_session_that_stores_nothing(tmp_path: Path) -> None:
+    args = SimpleNamespace(offline=False, no_cache=True, max_age=None, cache_dir=None)
+
+    session, error = cli._build_cache_session(args)  # type: ignore[arg-type]
+
+    assert error is None
+    assert session is not None
+    assert session.store is None
+    assert session.enabled is False
+
+
+# ------------------------------------------------------------------------------------------
+# The markdown document, and the clock it is allowed to read
+# ------------------------------------------------------------------------------------------
+
+
+def _domain_result_with_addresses() -> InvestigationResult:
+    run = RunMetadata.new(now=datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc), run_id="20260809T120000Z-abcd1234")
+    data: Dict[str, Any] = {
+        "domain": "evil.example",
+        "run": run.model_dump(),
+        "ips": [
+            {"ip": "203.0.113.7", "provider_status": {"virustotal": {"outcome": "ok"}}},
+            {"ip": "203.0.113.8", "provider_status": {"virustotal": {"outcome": "ok"}}},
+        ],
+        "coverage": Coverage.from_status_map({"virustotal": {"outcome": "ok"}}).model_dump(),
+        "warnings": [],
+    }
+    return InvestigationResult(ok=True, data=data, run=run)
+
+
+def test_the_markdown_report_composes_one_block_per_address() -> None:
+    """``render_markdown`` renders exactly one subject. Composing a domain's addresses under it
+    is the caller's decision, and each block is one heading level deeper so the result is a
+    single well-formed document rather than three reports stapled together."""
+    text = cli._markdown_report(_domain_result_with_addresses(), indicator="evil.example", scope="domain", defang=True)
+
+    assert text.count("# Tripper Recon report") == 3
+    assert "## Tripper Recon report" in text
+    assert "203.0.113.7" in text and "203.0.113.8" in text
+
+
+def test_the_report_clock_is_the_collection_time_not_the_wall_clock() -> None:
+    """The renderer's only clock. Feeding it ``now`` would let a report regenerated in December
+    claim August's evidence was collected in December -- the same lie as a cache that restamps
+    a replayed answer, one artefact further downstream."""
+    assert cli._report_clock(_domain_result_with_addresses()) == datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def test_a_payload_with_no_run_block_has_no_clock_at_all() -> None:
+    """``None`` renders as "not recorded". It never falls back to the wall clock."""
+    assert cli._report_clock({"data": {}}) is None
+    assert cli._report_clock(None) is None
+
+
+def test_out_writes_markdown_even_when_the_format_is_console(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Console output is ANSI-decorated and box-drawn, and `rich` strips the colour the moment it
+    is redirected -- taking the only malice signal with it. That is the defect the markdown lane
+    was built to fix, so ``--out`` writes the document form."""
+    monkeypatch.chdir(tmp_path)
+    result = _domain_result_with_addresses()
+
+    ok = cli._persist_artefacts(
+        result, indicator="evil.example", scope="domain", output="console", defang=True, out="r.md", case_dir=None
+    )
+
+    text = (tmp_path / "outputs" / "r.md").read_text(encoding="utf-8")
+    assert ok is True
+    assert text.startswith("# Tripper Recon report")
+    assert "\x1b[" not in text
+
+
+def test_out_writes_json_when_json_was_asked_for(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    cli._persist_artefacts(
+        _domain_result_with_addresses(),
+        indicator="evil.example",
+        scope="domain",
+        output="json",
+        defang=True,
+        out="r.json",
+        case_dir=None,
+    )
+
+    payload = json.loads((tmp_path / "outputs" / "r.json").read_text(encoding="utf-8"))
+    assert payload["data"]["domain"] == "evil.example"
+
+
+def test_an_artefact_that_could_not_be_written_is_reported_as_a_failure(tmp_path: Path) -> None:
+    """Exiting 0 here would leave a pipeline believing it holds a report it does not hold."""
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory", encoding="utf-8")
+
+    ok = cli._persist_artefacts(
+        _domain_result_with_addresses(),
+        indicator="evil.example",
+        scope="domain",
+        output="markdown",
+        defang=True,
+        out=str(blocked / "nested" / "r.md"),
+        case_dir=None,
+    )
+
+    assert ok is False
+
+
+# ------------------------------------------------------------------------------------------
+# report --from-case: regeneration without re-querying
+# ------------------------------------------------------------------------------------------
+
+
+def test_a_case_regenerates_into_a_report_with_the_original_timestamps(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """THE POINT OF THE CASE DIRECTORY.
+
+    The report is rebuilt from disk with no provider contacted, and the collection time it
+    states is the one the run recorded. A regenerated report that stamped itself with "now"
+    would be a three-week-old answer wearing today's date -- exactly the failure the cache lane
+    exists to prevent, moved one artefact downstream.
+    """
+    result = _domain_result_with_addresses()
+    paths = write_case(
+        tmp_path, result=result, indicator="evil.example", scope="domain", run_id="20260809T120000Z-abcd1234"
+    )
+
+    code = cli._cmd_report(str(paths.directory), output="markdown")
+    text = capsys.readouterr().out
+
+    assert code == 0
+    assert "2026-08-09" in text
+    assert "evil[.]example" in text  # defanged by default: a report goes into a ticket
+
+
+def test_regenerating_a_case_as_json_returns_the_whole_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = write_case(
+        tmp_path, result=_domain_result_with_addresses(), indicator="evil.example", scope="domain", run_id="r"
+    )
+
+    code = cli._cmd_report(str(paths.case_json), output="json")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["schema_version"] == "tripper-recon.case/1"
+    assert payload["result"]["data"]["domain"] == "evil.example"
+
+
+def test_regenerating_a_missing_case_is_a_rejected_input(tmp_path: Path) -> None:
+    """Exit 2: nothing was consulted and nothing could be. Same class as an unparseable target."""
+    assert cli._cmd_report(str(tmp_path / "nope")) == 2
+
+
+def test_report_never_builds_an_event_loop_or_a_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regeneration is a pure function from the saved record to a document. Nothing in this path
+    may reach ``asyncio.run``, and therefore nothing in it can reach a socket."""
+    paths = write_case(
+        tmp_path, result=_domain_result_with_addresses(), indicator="evil.example", scope="domain", run_id="r"
+    )
+
+    def _explode(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("report --from-case started an event loop")
+
+    monkeypatch.setattr(cli, "load_env", lambda: None)
+    monkeypatch.setattr(cli.asyncio, "run", _explode)
+    monkeypatch.setattr(sys, "argv", ["tripper-recon", "report", "--from-case", str(paths.directory)])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert int(excinfo.value.code or 0) == 0
+    assert "Tripper Recon report" in capsys.readouterr().out
+
+
+def test_report_writes_to_a_file_when_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    paths = write_case(
+        tmp_path / "cases", result=_domain_result_with_addresses(), indicator="evil.example", scope="domain", run_id="r"
+    )
+
+    code = cli._cmd_report(str(paths.directory), output="markdown", out="regenerated.md")
+
+    assert code == 0
+    assert (tmp_path / "outputs" / "regenerated.md").read_text(encoding="utf-8").startswith("# Tripper Recon report")
+
+
+def test_the_saved_report_states_which_answers_were_replayed_and_how_old_they_are() -> None:
+    """The last link in the disclosure chain.
+
+    The console warning scrolls away and the JSON is read by a machine. The markdown is what gets
+    pasted into a ticket and read three weeks later by somebody who was not there, so it has to
+    carry the same sentence: these values were obtained then, not now.
+    """
+    result = _domain_result_with_addresses()
+    result.data["freshness"] = {
+        "headline": "3 answers: 1 queried now, 2 from cache (oldest 41m)",
+        "from_cache": [
+            {"provider": "otx", "queried_at": "2026-08-09T11:19:00Z", "age": "41m"},
+            {"provider": "rdap", "queried_at": "2026-08-09T11:50:00Z", "age": "10m"},
+        ],
+        "unanswerable_offline": [{"provider": "virustotal", "reason": "nothing is filed under this key"}],
+    }
+
+    text = cli._markdown_report(result, indicator="evil.example", scope="domain", defang=True)
+
+    assert "## Freshness" in text
+    assert "2026-08-09T11:19:00Z" in text
+    assert "**not** queried when this report was produced" in text
+    assert "missing coverage, not a clean result" in text
+    assert "| `virustotal` | nothing is filed under this key |" in text
+
+
+def test_a_report_from_an_uncached_run_gains_no_freshness_section() -> None:
+    """No cache session, no ``freshness`` block, no section -- the pre-7.7 report, unchanged."""
+    text = cli._markdown_report(_domain_result_with_addresses(), indicator="evil.example", scope="domain", defang=True)
+
+    assert "## Freshness" not in text

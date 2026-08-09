@@ -61,7 +61,7 @@ paths still consult Shodan InternetDB, RDAP and Tranco without one.
 
 ---
 
-## The six subcommands
+## The seven subcommands
 
 | Command | What it does | Provider quota |
 |---|---|---|
@@ -71,6 +71,7 @@ paths still consult Shodan InternetDB, RDAP and Tranco without one.
 | `asn <number>` | Routing, peering, prefixes, registry and rank | 11 declared providers, 8 of which need no key |
 | `check <anything>` | Classify a pasted string and route it to the right lookup | routes; `--detect-only` costs **zero** |
 | `bulk [file\|-\|text]` | Extract and triage every indicator in a wall of pasted text | **zero** unless you pass `--investigate` |
+| `report --from-case <dir>` | Rebuild a report from a saved case directory | **zero** — it contacts nobody |
 
 ### Worked examples
 
@@ -111,11 +112,33 @@ tripper-recon ip 8.8.8.8 --explain
 
 # Machine output. Never defanged, and structured logs go to stderr so this pipes cleanly.
 tripper-recon ip targets.txt -o json | jq '.results[].data.verdict.verdict'
+
+# The form you paste into a ticket: ATX headings and pipe tables, no ANSI, no box drawing.
+tripper-recon ip 8.8.8.8 -o markdown
+
+# Answer from cache only. Contacts nobody at all -- not a provider, not the resolver.
+tripper-recon --offline domain evil.example
+
+# Demand freshness, save everything, and keep the raw provider exchanges.
+tripper-recon --max-age 15m ip 8.8.8.8 -o markdown --case-dir ./cases --evidence
+
+# Rebuild that report weeks later. No quota, no network, and the ORIGINAL timestamps.
+tripper-recon report --from-case ./cases/ip-<case id>/<run id>
 ```
 
 `-o` / `--format` works in either position — `tripper-recon -o json ip 8.8.8.8` and
-`tripper-recon ip 8.8.8.8 -o json` are equivalent. `--rate-limit`, `--user-agent`, `--fanged` and
-`-V` are top-level only and must come **before** the subcommand.
+`tripper-recon ip 8.8.8.8 -o json` are equivalent. `--rate-limit`, `--user-agent`, `--fanged`,
+`--offline`, `--max-age`, `--no-cache`, `--cache-dir` and `-V` are top-level only and must come
+**before** the subcommand. `--out`, `--case-dir` and `--evidence` are per-subcommand and come
+after it.
+
+### Output formats
+
+| `-o` | For | Notes |
+|---|---|---|
+| `console` (default) | Reading now | `rich` tables and colour. **Colour is stripped the moment you redirect it**, which takes the malice signal with it — so do not redirect this into a file |
+| `json` | A machine | Never defanged. Carries everything, including `freshness` and per-provider `cache` blocks |
+| `markdown` | A ticket | ATX headings and GFM pipe tables only; no HTML, no box drawing. Defanged by default. Every provider-controlled value is escaped, so a pasted string containing `\|` or `#` cannot break the table or inject a heading |
 
 ### Defanging
 
@@ -514,6 +537,13 @@ TRIPPER_RECON_USER_AGENT=
 # Verdict tuning (optional). Point these at your own YAML to override the packaged defaults.
 TRIPPER_RECON_SCORING_CONFIG=
 TRIPPER_RECON_KNOWN_INFRASTRUCTURE=
+
+# Cache (optional).
+# Where cached provider answers live. Defaults to $XDG_CACHE_HOME/tripper_recon.
+TRIPPER_RECON_CACHE_DIR=
+# A per-provider TTL ruleset to load instead of the packaged cache.yaml. A path that
+# does not exist is an error, never a silent fallback to a different policy.
+TRIPPER_RECON_CACHE_CONFIG=
 ```
 
 `.env` is read from the current directory first, then the project root, and never overrides a
@@ -523,6 +553,51 @@ Runtime flags: `--rate-limit N` sets the process-wide ceiling on concurrent in-f
 requests (default 10). `--user-agent` overrides the User-Agent for the run. Each target gets a
 180-second wall-clock deadline, and a domain enriches at most 8 addresses concurrently.
 
+---
+
+## Caching, freshness, and saving a report
+
+A domain with eight A records costs nine VirusTotal calls per run, and re-running the same
+investigation an hour later pays for it again. So provider answers are cached on disk with a
+per-provider lifetime — days for registration data, minutes for reputation feeds and DNS. The
+lifetimes are policy rather than code and live in `tripper_recon/utils/cache.yaml`.
+
+**The rule that makes the cache safe to ship: a cached fact never claims to have been queried
+now.** A report that presents a three-week-old answer as a fresh lookup is worse than no report,
+because it launders staleness into apparent currency. So:
+
+* every cached value carries the instant it was **actually** obtained, and that instant is never
+  rewritten on replay;
+* every replay is disclosed in three places — the **first console warning**,
+  `provider_status[<name>].cache` in `-o json`, and the `freshness` block, which states how many
+  answers were queried now, how many were replayed, and how old the oldest one is;
+* only successful answers are cached. A 429 or an unset key is a state of the world at one
+  instant, and replaying it would outlive its cause;
+* an entry that cannot be dated — unreadable timestamp, unknown schema, or a stamp **in the
+  future** because a clock is wrong — is discarded rather than served.
+
+| Flag | Effect |
+|---|---|
+| `--offline` | Contact nobody at all, including the system resolver. A question the cache cannot answer is reported as **missing coverage with the reason**, never served from an expired entry |
+| `--max-age D` | Refuse anything cached older than `D` (`30`, `90s`, `15m`, `6h`, `7d`, `2w`). Online this forces a fresh lookup; offline it turns a stale entry into a stated gap. `--max-age 0` means "query everything now" |
+| `--no-cache` | Read nothing and write nothing. Every answer is queried now |
+| `--cache-dir DIR` | Where cached answers live. Outside the repository by default |
+| `--out PATH` | Write the report to `PATH`. `-o json` writes JSON; `console` and `markdown` both write Markdown, because console output is ANSI-decorated and is not a document. A bare filename lands in `./outputs/` |
+| `--case-dir DIR` | Save the whole run — `case.json`, `report.md`, and the evidence envelopes — so the report can be regenerated later without re-querying. Defaults to `./outputs/cases` |
+| `--evidence` | Also capture the raw provider exchanges: status, timings, hashes and redacted bodies. **Requires `--case-dir`** |
+
+`--offline` with `--no-cache` is refused at parse time rather than obeyed: it would consult nobody
+and serve nothing, producing a run that cannot answer anything and looks, from the exit code, like
+a total intelligence blackout.
+
+**Evidence files hold provider responses and live on your disk.** Credentials cannot reach them —
+request headers are captured by allowlist so an auth header is never recorded at all, and URLs and
+bodies are redacted — but the contents are still intelligence about a live case. The default
+locations keep them out of git: the cache sits outside the repository entirely, and case
+directories default under `outputs/`, which `.gitignore` ignores as a directory. A custom
+`--case-dir` carries no such guarantee, and the case record says which of the two it was. See
+`docs/OPSEC.md` §5a.
+
 ### Exit codes
 
 These are a public interface; a playbook may branch on them.
@@ -530,7 +605,7 @@ These are a public interface; a playbook may branch on them.
 | Code | Meaning |
 |---|---|
 | `0` | The investigation ran and at least one provider answered. **Not** a claim that the indicator is clean, and **not** a claim that the lookup was complete — read the coverage line |
-| `1` | Nothing was learned: an intelligence blackout, a deadline breach, a non-public target the tool refuses to forward, or a target the orchestrator rejected |
+| `1` | Nothing was learned: an intelligence blackout, a deadline breach, a non-public target the tool refuses to forward, or a target the orchestrator rejected. **Also**: the run completed but an artefact you asked for (`--out`, `--case-dir`) could not be written — exiting `0` there would leave a pipeline believing it holds a report it does not hold |
 | `2` | The CLI rejected the input before any provider was consulted: unparseable target, non-numeric ASN, an indicator type no subcommand investigates, or no subcommand |
 
 **The exit code is not the verdict.** A `MALICIOUS` indicator with every provider answering exits

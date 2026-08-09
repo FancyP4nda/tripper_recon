@@ -43,16 +43,38 @@ found: a ``MALICIOUS`` indicator with every provider answering exits ``0``. Read
 field. ``docs/review/design-verdict-engine.md`` §7.1 proposes a ``--fail-on`` flag that would
 fold the verdict into the exit code; it is not implemented, and until it is, the codes above
 mean exactly what this table says and nothing more.
+
+One extension to code ``1``, added with the artefact flags (roadmap 7.3/7.7): a run that
+completed but could not write an artefact the operator explicitly asked for -- ``--out`` or
+``--case-dir`` -- also exits ``1``. Exiting ``0`` there would leave a pipeline believing it holds
+a report it does not hold, which is the same class of error as a clean-looking blackout.
+
+**Caching, and the one rule that governs it** (roadmap 7.7). A domain with eight A records costs
+nine VirusTotal calls per run, and re-running the same investigation an hour later pays for it
+again, so answers are cached on disk with a per-provider lifetime. The rule that makes that
+defensible rather than dangerous: **a cached fact must never claim to have been queried now.**
+
+* Every cached value carries the instant it was actually obtained, and that instant is never
+  rewritten on replay.
+* Every replay is disclosed -- on ``provider_status[<name>]['cache']``, in the ``freshness``
+  block of ``-o json``, and as the first warning on the console.
+* ``--offline`` contacts nobody, including the system resolver. When it cannot answer from cache
+  it says so and loses the coverage, rather than serving an expired value as though it were
+  current.
+* ``--max-age`` is the analyst's freshness demand: anything older is re-queried, or, offline,
+  refused.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Coroutine, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from rich.console import Console
@@ -60,6 +82,10 @@ from rich.console import Console
 from tripper_recon import __version__
 from tripper_recon.orchestrators import (
     DEFAULT_URL_DEPTH,
+    SCOPE_ASN,
+    SCOPE_DOMAIN,
+    SCOPE_IP,
+    SCOPE_URL,
     URL_DEPTHS,
     investigate_asn,
     investigate_domain,
@@ -86,8 +112,22 @@ from tripper_recon.reporting.console import (
     render_verdict,
     run_fields,
 )
+from tripper_recon.reporting.markdown import MarkdownOptions, md_code, md_escape, md_table, render_markdown
 from tripper_recon.types.indicators import Indicator, IndicatorType, detect
+from tripper_recon.types.models import InvestigationResult
+from tripper_recon.utils.cache import (
+    CacheError,
+    CacheSession,
+    CacheStore,
+    default_cache_root,
+    default_case_root,
+    load_case,
+    parse_duration,
+    use_cache,
+    write_case,
+)
 from tripper_recon.utils.env import load_env
+from tripper_recon.utils.evidence import EvidenceRecorder, active_recorder, capture_evidence
 from tripper_recon.utils.http import configure_rate_limit, configure_user_agent
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.refang import refang
@@ -100,6 +140,16 @@ console = Console()
 #: ruleset key that set that ceiling, the provider values behind it, and every confidence
 #: criterion the engine asked. Console output only -- ``-o json`` already carries all of it.
 _EXPLAIN_HELP = "Show the full signal breakdown behind the verdict: every weight, its ruleset key, and its evidence"
+
+#: The output formats every investigating subcommand accepts.
+#:
+#: ``markdown`` is the form that survives the workflow the tool exists for -- an analyst pasting
+#: the answer into a ticket. ``console`` paints a terminal and `rich` strips its colour the moment
+#: the output is redirected, taking the only malice signal with it; ``json`` feeds a machine.
+_FORMATS = ["console", "json", "markdown"]
+
+#: What ``report --from-case`` accepts. ``console`` is deliberately absent: see :func:`_cmd_report`.
+_REPORT_FORMATS = ["json", "markdown"]
 
 
 # --------------------------------------------------------------------------------------
@@ -128,7 +178,8 @@ exit codes:
       provider_coverage line ("N of M providers answered") before concluding anything.
   1   Nothing was learned: no provider answered at all, the wall-clock deadline was breached,
       the target is not public and this tool will not forward it to a third party, or the
-      orchestrator rejected it as malformed.
+      orchestrator rejected it as malformed. Also: the run completed but an artefact you asked
+      for (--out, --case-dir) could not be written.
   2   The input was rejected before any provider was consulted: an unparseable target, a
       non-numeric ASN, an indicator type no subcommand investigates, or no subcommand at all.
       `check --detect-only` and `bulk` also exit 2 when nothing could be classified.
@@ -170,7 +221,17 @@ environment:
     TRIPPER_RECON_KNOWN_INFRASTRUCTURE  A known-infrastructure catalogue to load instead of
                                         the packaged one.
     XDG_CONFIG_HOME                     Where the user ruleset is looked for. Defaults to
-                                        ~/.config."""
+                                        ~/.config.
+
+  Cache:
+    TRIPPER_RECON_CACHE_DIR             Where cached provider answers live. `--cache-dir`
+                                        overrides it. Defaults to
+                                        $XDG_CACHE_HOME/tripper_recon.
+    TRIPPER_RECON_CACHE_CONFIG          A per-provider TTL ruleset to load instead of
+                                        $XDG_CONFIG_HOME/tripper_recon/cache.yaml and the
+                                        packaged default. A path that does not exist is an
+                                        error, never a silent fallback.
+    XDG_CACHE_HOME                      Where the cache is looked for. Defaults to ~/.cache."""
 
 #: The "why is my output empty" answer, and the pointer to the file that answers it in full.
 _EMPTY_OUTPUT = """\
@@ -186,6 +247,49 @@ why is my output empty:
   The verdict engine's weights are unvalidated priors -- calibration.status is "unvalidated"
   and the tool makes no accuracy claim. Treat a verdict as a ranked reading of the evidence
   shown, not as a measurement."""
+
+#: The cache, and the honesty rules that make it safe to ship.
+_CACHING = """\
+caching and freshness:
+  Provider answers are cached on disk with a per-provider lifetime, because a domain with eight
+  A records costs nine VirusTotal calls per run and re-running it an hour later pays again.
+  The lifetimes are policy, not code: they live in cache.yaml, longest for registration data
+  and shortest for reputation feeds and DNS.
+
+  A CACHED FACT NEVER CLAIMS TO HAVE BEEN QUERIED NOW. Every cached value carries the instant
+  it was actually obtained; that instant is never rewritten on replay; and every replay is
+  disclosed in three places -- the first console warning, provider_status[<name>].cache, and
+  the `freshness` block in `-o json`, which states how many answers were queried now, how many
+  were replayed, and how old the oldest one is.
+
+    --offline     Contact nobody at all, including the system resolver. Answers come from
+                  cache or not at all. A question the cache cannot answer is reported as
+                  missing coverage with the reason -- never served from an expired entry.
+    --max-age D   Refuse anything cached older than D (30, 90s, 15m, 6h, 7d, 2w). Online this
+                  forces a fresh lookup; offline it turns a stale entry into a stated gap.
+                  `--max-age 0` means "query everything now".
+    --no-cache    Read nothing from the cache and write nothing to it.
+    --cache-dir   Where cached answers live. Outside the repo by default.
+
+  Only successful answers are cached. An error is a state of the world at one instant, and
+  replaying it would outlive its cause."""
+
+#: Where a report can be written, and what regenerating one does and does not re-query.
+_ARTEFACTS = """\
+saving a report:
+    --out PATH        Write the report to PATH. `-o json` writes JSON; `-o markdown` and the
+                      default `-o console` both write Markdown, because console output is
+                      ANSI-decorated and box-drawn and is not a document. A bare filename
+                      lands in ./outputs/ -- the working directory's, never the package's.
+    --case-dir DIR    Write the whole run to DIR/<scope>-<case id>/<run id>/: case.json (the
+                      result, the verdict, the cache record), report.md, and the evidence
+                      envelopes when --evidence is on. Defaults to ./outputs/cases.
+    --evidence        Capture the raw provider exchanges -- status, timings, hashes, redacted
+                      bodies -- into the case directory. Requires --case-dir.
+
+  tripper-recon report --from-case DIR
+      Rebuild the report from a case directory. Contacts nobody and spends no quota, and the
+      timestamps are the ORIGINAL ones: regenerating a report does not make its facts newer."""
 
 #: Worked examples. Each one is a command that runs as written against the parser below.
 _EXAMPLES = """\
@@ -214,9 +318,20 @@ examples:
   tripper-recon bulk phishing-email.txt --investigate --max-targets 5
       Extract and triage every indicator in a wall of pasted text, then look up the first
       five routable ones. Triage alone costs no provider quota; `--investigate` is the opt-in
-      that spends it."""
+      that spends it.
 
-_EPILOG = "\n\n".join((_EXAMPLES, _EXIT_CODES, _ENVIRONMENT, _EMPTY_OUTPUT))
+  tripper-recon --offline domain evil.example
+      Answer from cache only. Nothing is contacted -- not a provider, not the resolver -- and
+      any question the cache cannot answer is reported as missing coverage with the reason.
+
+  tripper-recon --max-age 15m ip 8.8.8.8 -o markdown --case-dir ./cases --evidence
+      Refuse anything cached older than fifteen minutes, print the ticket-ready markdown, and
+      save the result, the report and the raw provider exchanges for later regeneration.
+
+  (`report --from-case`, which rebuilds a saved case, is in the "saving a report" section
+  below: its example names a real case directory and so cannot be a copy-paste line here.)"""
+
+_EPILOG = "\n\n".join((_EXAMPLES, _EXIT_CODES, _ENVIRONMENT, _EMPTY_OUTPUT, _CACHING, _ARTEFACTS))
 
 _IP_EPILOG = """\
 providers consulted (the denominator of the coverage ratio):
@@ -276,6 +391,19 @@ _CHECK_EPILOG = """\
   An analyst who knows what they are holding should keep saying so: `ip 1.2.3.4` cannot be
   misrouted and `check 1.2.3.4` theoretically can. `check` is for the string of unknown shape,
   possibly defanged, pasted under time pressure."""
+
+_REPORT_EPILOG = """\
+  Rebuilds a report from a case directory written by --case-dir. It contacts nobody, builds no
+  HTTP client, and spends no quota -- regeneration is a pure function from the saved record to
+  a document.
+
+  The timestamps are the ORIGINAL ones. A regenerated report says when the evidence was
+  collected, not when it was re-rendered; re-stamping it would be the same lie as a cache that
+  claims a replayed answer was queried now.
+
+  `console` is not an output format here. The console renderers are driven from a live result
+  through six code paths, and a half-supported reimplementation would differ from what the run
+  actually printed."""
 
 _BULK_EPILOG = """\
   Triage is the default and it costs nothing: extraction and classification are pure, so a run
@@ -432,6 +560,259 @@ def _print_failure_coverage(data: Dict[str, Any]) -> None:
         console.print()
 
 
+# --------------------------------------------------------------------------------------
+# Artefacts: --out, --case-dir, and the markdown document form (roadmap 7.2, 7.3, 7.7)
+# --------------------------------------------------------------------------------------
+
+
+def _default_output_dir() -> Path:
+    """``<cwd>/outputs``. The **working** directory's, which is roadmap 7.3's whole point.
+
+    This used to resolve against ``Path(__file__).parent.parent``. After the README's own
+    ``pip install .`` that is ``site-packages``, so a bare ``--prefixes-out foo.txt`` wrote the
+    analyst's evidence into the installed package and reported success. Nothing failed, nothing
+    warned, and the file was not where they looked for it.
+
+    ``outputs/`` is also the one directory ``.gitignore`` ignores wholesale, so a bare filename
+    lands somewhere that cannot be committed by accident.
+    """
+    return Path.cwd() / "outputs"
+
+
+def _resolve_artefact_path(value: str) -> Path:
+    """A bare filename lands in ``./outputs/``; anything with a directory is taken literally.
+
+    The path comes from the analyst's own argv on the analyst's own workstation, so there is no
+    containment check here and no trust boundary to enforce -- see the roadmap's "deliberately
+    not doing" entry. What there is: the parent directory is created, so ``--out reports/x.md``
+    does not fail on a directory that does not exist yet.
+    """
+    path = Path(value).expanduser()
+    if path.parent == Path("."):
+        return _default_output_dir() / path.name
+    return path
+
+
+def _write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def _result_payload(result: Any) -> Dict[str, Any]:
+    """The ``data`` mapping, whether ``result`` is the model, its dump, or the bare data."""
+    if isinstance(result, InvestigationResult):
+        return result.data
+    if isinstance(result, Mapping):
+        inner = result.get("data")
+        if isinstance(inner, Mapping):
+            return dict(inner)
+        return dict(result)
+    return {}
+
+
+def _report_clock(result: Any) -> Optional[dt.datetime]:
+    """When collection started, as a datetime, or ``None``.
+
+    ``MarkdownOptions.now`` is the renderer's only clock, and handing it the collection start is
+    deliberate: a report regenerated from a case months later must carry the time the evidence
+    was gathered, not the time somebody re-rendered it. ``None`` renders as "not recorded",
+    which is the honest output when the payload never carried a run block -- the renderer will
+    not read the wall clock to fill the gap, and neither will this function.
+    """
+    if isinstance(result, InvestigationResult) and result.run is not None:
+        return result.run.started_at
+    run: Any = result.get("run") if isinstance(result, Mapping) else None
+    if not isinstance(run, Mapping):
+        run = _result_payload(result).get("run")
+    if not isinstance(run, Mapping):
+        return None
+    raw = run.get("started_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _freshness_markdown(data: Mapping[str, Any]) -> List[str]:
+    """The freshness disclosure, as a markdown section. Empty when no cache was in use.
+
+    **This is the artefact the rule is ultimately about.** The console warning scrolls away and
+    the JSON is read by a machine; the markdown is what gets pasted into a ticket and read three
+    weeks later by somebody who was not there. If it does not say which answers were replayed and
+    how old they were, the disclosure chain ends one step short of the reader who needs it.
+
+    Emitted only when ``data['freshness']`` exists -- that is, only when a cache session was in
+    force -- so a report from a run that cached nothing looks exactly as it did before.
+    """
+    freshness = data.get("freshness")
+    if not isinstance(freshness, Mapping):
+        return []
+
+    lines: List[str] = ["## Freshness", "", f"**{md_escape(freshness.get('headline'))}**", ""]
+
+    cached = [row for row in (freshness.get("from_cache") or []) if isinstance(row, Mapping)]
+    if cached:
+        lines.extend(
+            md_table(
+                ["provider", "actually queried at", "age when this report was produced"],
+                [
+                    [
+                        md_code(row.get("provider"), in_table=True),
+                        md_escape(row.get("queried_at") or "not recorded"),
+                        md_escape(row.get("age") or "unknown"),
+                    ]
+                    for row in cached
+                ],
+            )
+        )
+        lines.extend(
+            [
+                "",
+                "Each row above was **replayed from cache**. It was obtained at the time shown and was "
+                "**not** queried when this report was produced.",
+                "",
+            ]
+        )
+
+    refused = [row for row in (freshness.get("unanswerable_offline") or []) if isinstance(row, Mapping)]
+    if refused:
+        lines.extend(
+            md_table(
+                ["not asked", "why"],
+                [[md_code(row.get("provider"), in_table=True), md_escape(row.get("reason"))] for row in refused],
+            )
+        )
+        lines.extend(
+            [
+                "",
+                "These questions were not put to anyone. That is missing coverage, not a clean result.",
+                "",
+            ]
+        )
+
+    if not cached and not refused:
+        lines.append("Every answer in this report was queried during the run that produced it.")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _markdown_report(result: Any, *, indicator: str, scope: str, defang: bool) -> str:
+    """The ticket-ready document form of one result, per-address blocks included.
+
+    ``render_markdown`` renders exactly one subject and says so; composing a domain's or a URL's
+    per-address blocks underneath it is the caller's decision, which is here. Each address block
+    is rendered one heading level deeper so the whole thing is a single well-formed document
+    rather than four reports stapled together.
+    """
+    now = _report_clock(result)
+    data = _result_payload(result)
+    blocks = [
+        render_markdown(
+            result,
+            MarkdownOptions(indicator=indicator, indicator_type=scope, now=now, defang=defang),
+        )
+    ]
+    freshness = _freshness_markdown(data)
+    if freshness:
+        blocks.append("\n".join(freshness) + "\n")
+    for entry in _result_payload(result).get("ips") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        address = str(entry.get("ip") or "").strip()
+        if not address:
+            continue
+        blocks.append(
+            render_markdown(
+                entry,
+                MarkdownOptions(indicator=address, indicator_type=SCOPE_IP, now=now, defang=defang, heading_level=2),
+            )
+        )
+    return "\n".join(blocks)
+
+
+def _report_document(result: Any, *, indicator: str, scope: str, output: str, defang: bool) -> str:
+    """What ``--out`` writes: JSON for ``-o json``, markdown for everything else.
+
+    ``-o console`` deliberately writes markdown rather than the terminal rendering. The console
+    form is ANSI-decorated and box-drawn; `rich` strips the colour the moment it is redirected,
+    which leaves a file whose only malice signal has silently vanished -- the exact defect the
+    markdown lane was built to fix.
+    """
+    if output == "json":
+        payload = result.model_dump(mode="json") if isinstance(result, InvestigationResult) else result
+        return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return _markdown_report(result, indicator=indicator, scope=scope, defang=defang)
+
+
+def _persist_artefacts(
+    result: Any,
+    *,
+    indicator: str,
+    scope: str,
+    output: str,
+    defang: bool,
+    out: Optional[str],
+    case_dir: Optional[str],
+) -> bool:
+    """Write ``--out`` and ``--case-dir``. Returns False when either was asked for and failed.
+
+    The failure is loud and it changes the exit code, because the alternative is a pipeline that
+    believes it holds a report it does not hold. Notices go to the LOG (stderr) rather than to
+    the console, so they cannot land in the middle of ``-o json`` on stdout.
+    """
+    if not out and not case_dir:
+        return True
+
+    ok = True
+    if out:
+        path = _resolve_artefact_path(out)
+        try:
+            _write_text(path, _report_document(result, indicator=indicator, scope=scope, output=output, defang=defang))
+            log["info"]("Wrote report", path=str(path), format="json" if output == "json" else "markdown")
+        except OSError as exc:
+            log["error"]("Failed writing the report", path=str(path), error=str(exc))
+            ok = False
+
+    if case_dir:
+        recorder = active_recorder()
+        run_id, _started, _version = run_fields(_result_payload(result).get("run"))
+        try:
+            paths = write_case(
+                Path(case_dir).expanduser(),
+                result=result,
+                indicator=indicator,
+                scope=scope,
+                run_id=run_id,
+                evidence=recorder.records if recorder is not None else (),
+                evidence_complete=recorder.is_complete if recorder is not None else True,
+                evidence_dropped=recorder.dropped if recorder is not None else 0,
+                report=_markdown_report(result, indicator=indicator, scope=scope, defang=defang),
+                cache_summary=_result_payload(result).get("cache"),
+            )
+            log["info"](
+                "Wrote case directory",
+                path=str(paths.directory),
+                evidence=paths.evidence_written,
+                git_ignored=str(paths.directory).find("outputs") >= 0,
+            )
+            if recorder is not None and not recorder.is_complete:
+                log["warn"](
+                    "The evidence set is INCOMPLETE: records were dropped at the recorder's ceiling",
+                    dropped=recorder.dropped,
+                )
+        except (CacheError, OSError) as exc:
+            log["error"]("Failed writing the case directory", path=str(case_dir), error=str(exc))
+            ok = False
+
+    return ok
+
+
 def _load_ip_targets(value: str) -> tuple[List[str], str | None]:
     p = Path(value).expanduser()
     if not p.is_file():
@@ -453,6 +834,8 @@ async def _cmd_ip(
     ports_limit: str = "25",
     explain: bool = False,
     defang: bool = False,
+    out: Optional[str] = None,
+    case_dir: Optional[str] = None,
 ) -> int:
     targets, source_file = _load_ip_targets(ip)
     if source_file and not targets:
@@ -466,6 +849,7 @@ async def _cmd_ip(
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: List[Dict[str, Any]] = []
+    answered: List[Tuple[str, InvestigationResult]] = []
     failed = 0
     succeeded = 0
 
@@ -502,13 +886,19 @@ async def _cmd_ip(
 
         succeeded += 1
         results.append({"target": target, **res.model_dump()})
+        answered.append((target, res))
         if output == "console":
             panel = render_ip_analysis(target, res.data, ports_limit=ports_limit, explain=explain, defang=defang)
             console.print(panel)
             console.print()
+        elif output == "markdown":
+            # Written raw, never through the console: `rich` would re-wrap the tables and reparse
+            # the brackets defanging deliberately puts in.
+            sys.stdout.write(_markdown_report(res, indicator=target, scope=SCOPE_IP, defang=defang))
+            sys.stdout.write("\n")
 
     if output == "json":
-        out = {
+        payload = {
             "ok": failed == 0,
             "source_file": source_file,
             "total": len(targets),
@@ -516,11 +906,37 @@ async def _cmd_ip(
             "failed": failed,
             "results": results,
         }
-        console.print_json(data=out)
-    else:
+        console.print_json(data=payload)
+    elif output == "console":
         color = "green" if failed == 0 else "yellow"
         console.print(f"[{color}]Summary:[/] total={len(targets)} succeeded={succeeded} failed={failed}")
 
+    # One case directory per target, because a case is about an indicator. `--out`, which is one
+    # file, gets every target's report concatenated -- for a single address, the common case,
+    # the two are the same thing.
+    written = True
+    for target, res in answered:
+        if case_dir and not _persist_artefacts(
+            res, indicator=target, scope=SCOPE_IP, output=output, defang=defang, out=None, case_dir=case_dir
+        ):
+            written = False
+    if out and answered:
+        if output == "json":
+            document = json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        else:
+            document = "\n".join(
+                _markdown_report(res, indicator=target, scope=SCOPE_IP, defang=defang) for target, res in answered
+            )
+        path = _resolve_artefact_path(out)
+        try:
+            _write_text(path, document)
+            log["info"]("Wrote report", path=str(path), targets=len(answered))
+        except OSError as exc:
+            log["error"]("Failed writing the report", path=str(path), error=str(exc))
+            written = False
+
+    if not written:
+        return 1
     return 0 if failed == 0 else 1
 
 
@@ -651,6 +1067,8 @@ async def _cmd_domain(
     ports_limit: str = "25",
     explain: bool = False,
     defang: bool = False,
+    out: Optional[str] = None,
+    case_dir: Optional[str] = None,
 ) -> int:
     # A defanged indicator is the normal thing to paste at 02:00 -- it arrives that way from
     # email, tickets and threat reports. Refang it and say so, rather than refusing and making
@@ -676,9 +1094,17 @@ async def _cmd_domain(
             _print_failure_coverage(res.data)
         return 1
 
+    saved = _persist_artefacts(
+        res, indicator=norm_domain, scope=SCOPE_DOMAIN, output=output, defang=defang, out=out, case_dir=case_dir
+    )
+    failure_code = 0 if saved else 1
+
     if output == "json":
         console.print_json(data=res.model_dump())
-        return 0
+        return failure_code
+    if output == "markdown":
+        sys.stdout.write(_markdown_report(res, indicator=norm_domain, scope=SCOPE_DOMAIN, defang=defang))
+        return failure_code
 
     data = res.data
     domain_intel = data.get("domain_intel") or {}
@@ -751,7 +1177,7 @@ async def _cmd_domain(
             )
         else:
             console.print("No IPs available for IP-level enrichment.\n")
-        return 0
+        return failure_code
 
     for item in ips:
         item_ip = item.get("ip", "")
@@ -771,7 +1197,7 @@ async def _cmd_domain(
         console.print(panel)
         console.print()
 
-    return 0
+    return failure_code
 
 
 # --------------------------------------------------------------------------------------
@@ -787,6 +1213,8 @@ async def _cmd_url(
     ports_limit: str = "25",
     explain: bool = False,
     defang: bool = True,
+    out: Optional[str] = None,
+    case_dir: Optional[str] = None,
 ) -> int:
     """Investigate a URL, then its host, then the addresses its host resolves to.
 
@@ -814,11 +1242,22 @@ async def _cmd_url(
             _print_failure_coverage(res.data)
         return 1
 
+    # `url_display`, not `url`: the case record and the report name the link the way a human
+    # reads it, with any password masked. The evidence form stays byte-for-byte in `data['url']`.
+    subject = str(res.data.get("url_display") or res.data.get("url") or url)
+    saved = _persist_artefacts(
+        res, indicator=subject, scope=SCOPE_URL, output=output, defang=defang, out=out, case_dir=case_dir
+    )
+    failure_code = 0 if saved else 1
+
     if output == "json":
         # Never defanged. The export carries the URL byte-for-byte because a machine consumes
         # it and `evil[.]example` is not a hostname.
         console.print_json(data=res.model_dump())
-        return 0
+        return failure_code
+    if output == "markdown":
+        sys.stdout.write(_markdown_report(res, indicator=subject, scope=SCOPE_URL, defang=defang))
+        return failure_code
 
     data = res.data
     console.print()
@@ -860,7 +1299,7 @@ async def _cmd_url(
         )
         console.print()
 
-    return 0
+    return failure_code
 
 
 # --------------------------------------------------------------------------------------
@@ -919,6 +1358,8 @@ async def _cmd_check(
     if detect_only:
         if output == "json":
             console.print_json(data=_detection_payload(indicator))
+        elif output == "markdown":
+            sys.stdout.write(_detection_markdown(indicator, defang=defang))
         else:
             console.print(render_detection(indicator, defang=defang, explain=explain))
         return 0 if indicator.is_known else 2
@@ -929,6 +1370,8 @@ async def _cmd_check(
         log["error"]("Indicator has no route", indicator=indicator.value, type=indicator.type.value)
         if output == "json":
             console.print_json(data={**_detection_payload(indicator), "routed_to": None, "reason": reason})
+        elif output == "markdown":
+            sys.stdout.write(_detection_markdown(indicator, defang=defang, note=f"Not investigated: {reason}"))
         else:
             console.print(render_detection(indicator, defang=defang, explain=explain))
             console.print(f"\n[bold yellow]Not investigated:[/] {esc(reason)}")
@@ -958,6 +1401,78 @@ async def _cmd_check(
         console.print("[bold red]Error:[/] the ASN classifier matched but reported no number")
         return 2
     return await _cmd_asn(asn_number, output=output)
+
+
+def _detection_markdown(indicator: Indicator, *, defang: bool, note: Optional[str] = None) -> str:
+    """The zero-quota classification, as a markdown block.
+
+    Small on purpose: this is not a report, it is the answer to "what did you read out of that
+    string". Everything paste-controlled goes through the markdown escapers, for the same reason
+    the report does -- a pasted token containing a pipe splits a table row, and one containing a
+    leading ``#`` becomes a heading.
+    """
+    shown = defang_indicator(indicator.value) if defang else indicator.value
+    rows = [
+        ["type", md_code(indicator.type.value, in_table=True)],
+        ["value", md_code(shown, in_table=True)],
+        ["raw", md_code(indicator.raw, in_table=True)],
+        ["confidence", md_escape(indicator.confidence.value)],
+        ["arrived defanged", "yes" if indicator.defanged_input else "no"],
+    ]
+    if indicator.alternatives:
+        rows.append(["also parses as", md_escape(", ".join(a.value for a in indicator.alternatives))])
+    lines = ["# Tripper Recon detection", "", *md_table(["field", "value"], rows)]
+    if indicator.notes:
+        lines.extend(["", "Notes:", *[f"- {md_escape(text)}" for text in indicator.notes]])
+    if note:
+        lines.extend(["", f"> {md_escape(note)}"])
+    return "\n".join(lines) + "\n"
+
+
+def _triage_markdown(kept: Sequence[Mapping[str, Any]], withheld: Sequence[Mapping[str, Any]], *, defang: bool) -> str:
+    """The bulk triage list, as markdown. Withheld indicators are shown, never dropped.
+
+    Same rule as the console table: a filter that removes evidence silently is indistinguishable
+    from evidence that was never there, and the RFC1918 address a filter binned is sometimes the
+    pivot the incident turns on.
+    """
+
+    def _value(row: Mapping[str, Any]) -> str:
+        raw = str(row.get("value") or "")
+        return md_code(defang_indicator(raw) if defang else raw, in_table=True)
+
+    lines = ["# Tripper Recon triage", "", f"> {md_escape(TRIAGE_CAVEAT)}", ""]
+    if kept:
+        lines.extend(
+            md_table(
+                ["type", "indicator", "seen", "confidence", "note"],
+                [
+                    [
+                        md_escape(row.get("type")),
+                        _value(row),
+                        str(row.get("occurrences") or 1),
+                        md_escape(row.get("confidence")),
+                        md_escape(row.get("note") or ""),
+                    ]
+                    for row in kept
+                ],
+            )
+        )
+    else:
+        lines.append("No indicator was extracted from the input.")
+    if withheld:
+        lines.extend(
+            [
+                "",
+                "## Withheld from triage",
+                "",
+                *md_table(
+                    ["type", "indicator", "reason"],
+                    [[md_escape(row.get("type")), _value(row), md_escape(row.get("reason") or "")] for row in withheld],
+                ),
+            ]
+        )
+    return "\n".join(lines) + "\n"
 
 
 def _detection_payload(indicator: Indicator) -> Dict[str, Any]:
@@ -1249,7 +1764,13 @@ async def _cmd_bulk(
     if output == "json" and not investigate:
         console.print_json(data={"ok": True, "caveat": TRIAGE_CAVEAT, "indicators": kept, "withheld": withheld})
         return 0 if kept else 2
+    if output == "markdown" and not investigate:
+        sys.stdout.write(_triage_markdown(kept, withheld, defang=defang))
+        return 0 if kept else 2
 
+    if output == "markdown":
+        sys.stdout.write(_triage_markdown(kept, withheld, defang=defang))
+        sys.stdout.write("\n")
     if output == "console":
         console.print()
         console.print(render_triage_table(kept, defang=defang))
@@ -1291,12 +1812,6 @@ async def _cmd_bulk(
     return 0 if all(code == 0 for code in codes) else 1
 
 
-def _default_output_dir() -> Path:
-    here = Path(__file__).resolve()
-    root = here.parent.parent
-    return root / "outputs"
-
-
 async def _cmd_asn(
     asn: int,
     *,
@@ -1315,6 +1830,8 @@ async def _cmd_asn(
 
     if output == "json":
         console.print_json(data=res.model_dump())
+    elif output == "markdown":
+        sys.stdout.write(_markdown_report(res, indicator=f"AS{asn}", scope=SCOPE_ASN, defang=False))
     else:
         meta = res.data.get("meta", {})
         run_id, started_at, tool_version = run_fields(res.data.get("run"))
@@ -1398,6 +1915,56 @@ async def _cmd_asn(
     return 0
 
 
+# --------------------------------------------------------------------------------------
+# report --from-case (roadmap 7.7)
+# --------------------------------------------------------------------------------------
+
+
+def _cmd_report(source: str, *, output: str = "markdown", defang: bool = True, out: Optional[str] = None) -> int:
+    """Rebuild a report from a saved case. Contacts nobody and spends no quota.
+
+    Not a coroutine, and it never constructs an HTTP client: regeneration is a pure function from
+    the case record to a document. That is the property that makes a case worth keeping -- an
+    incident reviewed in three months can be re-read without asking a provider anything.
+
+    **The timestamps are the originals.** ``MarkdownOptions.now`` is fed from the saved run's
+    ``started_at``, so a regenerated report says when the evidence was collected rather than when
+    somebody re-rendered it. Restamping here would be the same lie as a cache that claims a
+    replayed answer was queried now, one artefact further downstream.
+
+    ``-o console`` is not offered. The console renderers are driven from a live
+    ``InvestigationResult`` through six different code paths, and half-supporting them here would
+    produce a rendering that silently differs from the one the run produced.
+    """
+    try:
+        record = load_case(Path(source))
+    except CacheError as exc:
+        log["error"]("Could not read the case", path=source, error=str(exc))
+        console.print(f"[bold red]Could not read the case:[/] {esc(str(exc))}")
+        return 2
+
+    result = record.get("result")
+    indicator = str(record.get("indicator") or "")
+    scope = str(record.get("scope") or "")
+
+    if output == "json":
+        document = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    else:
+        document = _markdown_report(result, indicator=indicator, scope=scope, defang=defang)
+
+    if out:
+        path = _resolve_artefact_path(out)
+        try:
+            _write_text(path, document)
+            log["info"]("Wrote regenerated report", path=str(path), case=str(source))
+        except OSError as exc:
+            log["error"]("Failed writing the regenerated report", path=str(path), error=str(exc))
+            return 1
+    else:
+        sys.stdout.write(document)
+    return 0
+
+
 def main() -> None:
     load_env()
     parser = argparse.ArgumentParser(
@@ -1411,7 +1978,7 @@ def main() -> None:
     parser.add_argument(
         "-o",
         "--format",
-        choices=["console", "json"],
+        choices=_FORMATS,
         default="console",
         help="Output format (may also be given after the subcommand)",
     )
@@ -1433,6 +2000,41 @@ def main() -> None:
             "-o json is never defanged either way"
         ),
     )
+    # --- cache and freshness (roadmap 7.7) ------------------------------------------------
+    #
+    # Top-level rather than per-subcommand: they are properties of the RUN, and `check` and
+    # `bulk` route into the other verbs, so a per-subcommand flag would silently not apply to
+    # the two commands most likely to spend a lot of quota.
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Answer from cache only. Contacts nobody -- not a provider, not the system resolver. "
+            "A question the cache cannot answer is reported as missing coverage with the reason, "
+            "never served from an expired entry"
+        ),
+    )
+    parser.add_argument(
+        "--max-age",
+        type=str,
+        default=None,
+        metavar="DURATION",
+        help=(
+            "Refuse anything cached older than this (30, 90s, 15m, 6h, 7d, 2w). Online it forces "
+            "a fresh lookup; offline it turns a stale entry into a stated gap. 0 means query now"
+        ),
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Read nothing from the cache and write nothing to it. Every answer is queried now",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Where cached provider answers live (default: $XDG_CACHE_HOME/tripper_recon)",
+    )
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -1445,11 +2047,37 @@ def main() -> None:
     p_ip.add_argument("ip", type=str)
     # default=SUPPRESS so an omitted subcommand flag leaves the top-level value in place.
     # With a real default, argparse overwrote it and `-o json ip 8.8.8.8` silently emitted console text.
-    p_ip.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
+    p_ip.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_ip.add_argument(
         "--ports-limit", type=str, default="25", help="Limit number of ports shown (use 'all' to show all)"
     )
     p_ip.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
+    p_ip.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help=(
+            "Write the report to this path. -o json writes JSON; console and markdown both "
+            "write Markdown. A bare filename lands in ./outputs/"
+        ),
+    )
+    p_ip.add_argument(
+        "--case-dir",
+        type=str,
+        nargs="?",
+        const=str(default_case_root()),
+        default=None,
+        metavar="DIR",
+        help=(
+            "Save the run (result, verdict, report, cache record) so the report can be "
+            "regenerated later without re-querying. Defaults to ./outputs/cases"
+        ),
+    )
+    p_ip.add_argument(
+        "--evidence",
+        action="store_true",
+        help="Also capture the raw provider exchanges into the case directory. Requires --case-dir",
+    )
 
     p_domain = sub.add_parser(
         "domain",
@@ -1458,9 +2086,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_domain.add_argument("domain", type=str)
-    p_domain.add_argument(
-        "-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format"
-    )
+    p_domain.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_domain.add_argument(
         "--ports-limit",
         type=str,
@@ -1468,6 +2094,32 @@ def main() -> None:
         help="Limit number of ports shown per IP in console (use 'all' to show all)",
     )
     p_domain.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
+    p_domain.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help=(
+            "Write the report to this path. -o json writes JSON; console and markdown both "
+            "write Markdown. A bare filename lands in ./outputs/"
+        ),
+    )
+    p_domain.add_argument(
+        "--case-dir",
+        type=str,
+        nargs="?",
+        const=str(default_case_root()),
+        default=None,
+        metavar="DIR",
+        help=(
+            "Save the run (result, verdict, report, cache record) so the report can be "
+            "regenerated later without re-querying. Defaults to ./outputs/cases"
+        ),
+    )
+    p_domain.add_argument(
+        "--evidence",
+        action="store_true",
+        help="Also capture the raw provider exchanges into the case directory. Requires --case-dir",
+    )
 
     p_asn = sub.add_parser(
         "asn",
@@ -1476,7 +2128,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_asn.add_argument("asn", type=str)
-    p_asn.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
+    p_asn.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_asn.add_argument("--neighbors", type=int, default=8, help="Resolve first N neighbors to names")
     # `--enrich`, `--enrich-limit` and `--monochrome` were removed here (roadmap 9.11). All three
     # advertised behaviour the code did not have: `--enrich`'s help named a whois/pWhois path that
@@ -1499,7 +2151,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_url.add_argument("url", type=str)
-    p_url.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
+    p_url.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_url.add_argument(
         "--depth",
         choices=list(URL_DEPTHS),
@@ -1511,6 +2163,32 @@ def main() -> None:
     )
     p_url.add_argument("--ports-limit", type=str, default="25", help="Limit ports shown per address")
     p_url.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
+    p_url.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help=(
+            "Write the report to this path. -o json writes JSON; console and markdown both "
+            "write Markdown. A bare filename lands in ./outputs/"
+        ),
+    )
+    p_url.add_argument(
+        "--case-dir",
+        type=str,
+        nargs="?",
+        const=str(default_case_root()),
+        default=None,
+        metavar="DIR",
+        help=(
+            "Save the run (result, verdict, report, cache record) so the report can be "
+            "regenerated later without re-querying. Defaults to ./outputs/cases"
+        ),
+    )
+    p_url.add_argument(
+        "--evidence",
+        action="store_true",
+        help="Also capture the raw provider exchanges into the case directory. Requires --case-dir",
+    )
 
     p_check = sub.add_parser(
         "check",
@@ -1519,7 +2197,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_check.add_argument("target", type=str)
-    p_check.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
+    p_check.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_check.add_argument(
         "--detect-only",
         action="store_true",
@@ -1542,7 +2220,7 @@ def main() -> None:
         default=None,
         help="A file to read, '-' or omitted for stdin, or the text itself",
     )
-    p_bulk.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
+    p_bulk.add_argument("-o", "--format", choices=_FORMATS, default=argparse.SUPPRESS, help="Output format")
     p_bulk.add_argument(
         "--investigate",
         action="store_true",
@@ -1562,6 +2240,27 @@ def main() -> None:
     p_bulk.add_argument("--ports-limit", type=str, default="25", help="Limit ports shown per address")
     p_bulk.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
+    p_report = sub.add_parser(
+        "report",
+        help="Rebuild a report from a saved case directory, without re-querying anything",
+        epilog=_REPORT_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_report.add_argument(
+        "--from-case",
+        dest="from_case",
+        type=str,
+        required=True,
+        metavar="PATH",
+        help="A case directory written by --case-dir, or the case.json inside it",
+    )
+    # No SUPPRESS here, unlike every other subcommand: `console` is not a format this command
+    # can produce, so a top-level `-o console` must not survive into it.
+    p_report.add_argument(
+        "-o", "--format", choices=_REPORT_FORMATS, default="markdown", help="Output format (default: markdown)"
+    )
+    p_report.add_argument("--out", type=str, default=None, help="Write to this path instead of stdout")
+
     args = parser.parse_args()
 
     if args.cmd is None:
@@ -1576,62 +2275,80 @@ def main() -> None:
     # branch of each command dumps the model and never routes through a renderer.
     defang = not getattr(args, "fanged", False)
 
+    # `report` contacts nobody by construction, so it runs before any cache session or event
+    # loop exists. Nothing below this line applies to it.
+    if args.cmd == "report":
+        raise SystemExit(_cmd_report(args.from_case, output=args.format, defang=defang, out=getattr(args, "out", None)))
+
+    session, setup_error = _build_cache_session(args)
+    if setup_error is not None:
+        log["error"]("Cache options rejected", error=setup_error)
+        console.print(f"[bold red]Error:[/] {esc(setup_error)}")
+        raise SystemExit(2)
+
+    recorder, evidence_error = _build_evidence_recorder(args)
+    if evidence_error is not None:
+        log["error"]("Evidence options rejected", error=evidence_error)
+        console.print(f"[bold red]Error:[/] {esc(evidence_error)}")
+        raise SystemExit(2)
+
+    case_dir = getattr(args, "case_dir", None)
+    out = getattr(args, "out", None)
+
+    coro: Optional[Coroutine[Any, Any, int]] = None
+    code = 2
     match args.cmd:
         case "ip":
-            code = asyncio.run(
-                _cmd_ip(
-                    args.ip,
-                    output=args.format,
-                    ports_limit=getattr(args, "ports_limit", "25"),
-                    explain=getattr(args, "explain", False),
-                    defang=defang,
-                )
+            coro = _cmd_ip(
+                args.ip,
+                output=args.format,
+                ports_limit=getattr(args, "ports_limit", "25"),
+                explain=getattr(args, "explain", False),
+                defang=defang,
+                out=out,
+                case_dir=case_dir,
             )
         case "domain":
-            code = asyncio.run(
-                _cmd_domain(
-                    args.domain,
-                    output=args.format,
-                    ports_limit=getattr(args, "ports_limit", "25"),
-                    explain=getattr(args, "explain", False),
-                    defang=defang,
-                )
+            coro = _cmd_domain(
+                args.domain,
+                output=args.format,
+                ports_limit=getattr(args, "ports_limit", "25"),
+                explain=getattr(args, "explain", False),
+                defang=defang,
+                out=out,
+                case_dir=case_dir,
             )
         case "url":
-            code = asyncio.run(
-                _cmd_url(
-                    args.url,
-                    output=args.format,
-                    depth=getattr(args, "depth", DEFAULT_URL_DEPTH),
-                    ports_limit=getattr(args, "ports_limit", "25"),
-                    explain=getattr(args, "explain", False),
-                    defang=defang,
-                )
+            coro = _cmd_url(
+                args.url,
+                output=args.format,
+                depth=getattr(args, "depth", DEFAULT_URL_DEPTH),
+                ports_limit=getattr(args, "ports_limit", "25"),
+                explain=getattr(args, "explain", False),
+                defang=defang,
+                out=out,
+                case_dir=case_dir,
             )
         case "check":
-            code = asyncio.run(
-                _cmd_check(
-                    args.target,
-                    output=args.format,
-                    detect_only=getattr(args, "detect_only", False),
-                    depth=getattr(args, "depth", DEFAULT_URL_DEPTH),
-                    ports_limit=getattr(args, "ports_limit", "25"),
-                    explain=getattr(args, "explain", False),
-                    defang=defang,
-                )
+            coro = _cmd_check(
+                args.target,
+                output=args.format,
+                detect_only=getattr(args, "detect_only", False),
+                depth=getattr(args, "depth", DEFAULT_URL_DEPTH),
+                ports_limit=getattr(args, "ports_limit", "25"),
+                explain=getattr(args, "explain", False),
+                defang=defang,
             )
         case "bulk":
-            code = asyncio.run(
-                _cmd_bulk(
-                    args.source,
-                    output=args.format,
-                    investigate=getattr(args, "investigate", False),
-                    max_targets=getattr(args, "max_targets", 10),
-                    filter_infrastructure=not getattr(args, "no_filter", False),
-                    ports_limit=getattr(args, "ports_limit", "25"),
-                    explain=getattr(args, "explain", False),
-                    defang=defang,
-                )
+            coro = _cmd_bulk(
+                args.source,
+                output=args.format,
+                investigate=getattr(args, "investigate", False),
+                max_targets=getattr(args, "max_targets", 10),
+                filter_infrastructure=not getattr(args, "no_filter", False),
+                ports_limit=getattr(args, "ports_limit", "25"),
+                explain=getattr(args, "explain", False),
+                defang=defang,
             )
         case "asn":
             asn_str = str(args.asn).strip()
@@ -1644,18 +2361,77 @@ def main() -> None:
                 console.print(f"[bold red]Error:[/] Invalid ASN provided: {args.asn}")
                 code = 2
             else:
-                code = asyncio.run(
-                    _cmd_asn(
-                        asn_int,
-                        output=args.format,
-                        neighbors=args.neighbors,
-                        prefixes_out=getattr(args, "prefixes_out", None),
-                        prefixes=getattr(args, "prefixes", "both"),
-                    )
+                coro = _cmd_asn(
+                    asn_int,
+                    output=args.format,
+                    neighbors=args.neighbors,
+                    prefixes_out=getattr(args, "prefixes_out", None),
+                    prefixes=getattr(args, "prefixes", "both"),
                 )
         case _:
             code = 2
+
+    if coro is not None:
+        code = _run(coro, session=session, recorder=recorder)
     raise SystemExit(code)
+
+
+def _run(
+    coro: Coroutine[Any, Any, int],
+    *,
+    session: Optional[CacheSession],
+    recorder: Optional[EvidenceRecorder],
+) -> int:
+    """Run one command with the cache session and evidence recorder installed.
+
+    Both context managers are entered **outside** ``asyncio.run``, and that ordering is load
+    bearing rather than stylistic: a task copies the current context when it is CREATED, so a
+    ContextVar set inside the loop is invisible to everything the loop already started.
+    """
+    with use_cache(session):
+        if recorder is None:
+            return asyncio.run(coro)
+        with capture_evidence(recorder):
+            return asyncio.run(coro)
+
+
+def _build_cache_session(args: argparse.Namespace) -> Tuple[Optional[CacheSession], Optional[str]]:
+    """Turn the cache flags into a session, or into the reason they were refused.
+
+    ``--offline --no-cache`` is refused rather than obeyed. Obeying it would consult nobody and
+    serve nothing, so every provider would report a gap -- a run that cannot answer anything and
+    looks, from the exit code, exactly like a total intelligence blackout. Refusing at parse time
+    costs nothing and says which of the two flags to drop.
+    """
+    offline = bool(getattr(args, "offline", False))
+    no_cache = bool(getattr(args, "no_cache", False))
+    if offline and no_cache:
+        return None, "--offline with --no-cache would consult nobody and serve nothing. Drop one of them"
+
+    max_age: Optional[float] = None
+    raw_max_age = getattr(args, "max_age", None)
+    if raw_max_age is not None:
+        try:
+            max_age = parse_duration(str(raw_max_age))
+        except ValueError as exc:
+            return None, f"--max-age: {exc}"
+
+    store = None if no_cache else CacheStore(Path(getattr(args, "cache_dir", None) or default_cache_root()))
+    return CacheSession(store, offline=offline, max_age_seconds=max_age), None
+
+
+def _build_evidence_recorder(args: argparse.Namespace) -> Tuple[Optional[EvidenceRecorder], Optional[str]]:
+    """Mint a recorder when ``--evidence`` was asked for, or say why it cannot be honoured.
+
+    ``--evidence`` without ``--case-dir`` is refused instead of quietly capturing envelopes into
+    memory that nothing will ever write out. An operator who asked to preserve evidence and was
+    given none, silently, is worse off than one who was told to add a flag.
+    """
+    if not getattr(args, "evidence", False):
+        return None, None
+    if not getattr(args, "case_dir", None):
+        return None, "--evidence needs somewhere to write: add --case-dir"
+    return EvidenceRecorder(max_body_bytes=262144, max_records=2000), None
 
 
 if __name__ == "__main__":
