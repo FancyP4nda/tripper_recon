@@ -44,6 +44,13 @@ _SECRET_ENV_VARS = (
     "ABUSEIPDB_API_KEY",
     "IPINFO_TOKEN",
     "OTX_API_KEY",
+    # abuse.ch authenticates in a request HEADER rather than the query string, so the
+    # parameter-name redaction above never sees it. This entry is the whole defence: without
+    # it, any provider error whose text happened to carry the header value -- a library
+    # traceback, a debug repr, a future change that logs request headers -- would print the
+    # operator's Auth-Key. Literal redaction is exactly the "arrives by a route this module
+    # does not anticipate" case named in the module docstring.
+    "ABUSECH_AUTH_KEY",
 )
 
 # Shortest value treated as a secret. Guards against a blank or placeholder env var causing

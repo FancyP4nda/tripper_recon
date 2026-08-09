@@ -46,6 +46,12 @@ All rows retrieved **2026-08-09**.
 | CAIDA AS-Rank | `api.asrank.caida.org/dev/restful/asns/{asn}` (`providers/caida.py:9`) | **Not verified** -- no rate limit published on the API documentation page as of this date | [asrank.caida.org/doc](https://asrank.caida.org/doc) |
 | PeeringDB | `www.peeringdb.com/api/net` and `/api/net/{id}` (`providers/peeringdb.py:10`) | Anonymous: **20/minute per IP address**. Authenticated: **40/minute per user or organization**. Repeated anonymous identical requests above 100kb: **1/hour**; of any size: **2/minute** | [docs.peeringdb.com/howto/work_within_peeringdbs_query_limits](https://docs.peeringdb.com/howto/work_within_peeringdbs_query_limits/) |
 | urlscan.io | Search and Result APIs (`providers/urlscan.py`) -- **not wired into any investigation path today**, see 4.5 | No fixed number published; per-account quotas | [urlscan.io/docs/api](https://urlscan.io/docs/api/) |
+| Shodan InternetDB | `internetdb.shodan.io/{ip}` (`providers/internetdb.py:79`) | "rate limit that allows bursts of up to 10,000 requests per second" | [book.shodan.io/developer-apis/internetdb](https://book.shodan.io/developer-apis/internetdb/) |
+| Tranco | `tranco-list.eu/api/ranks/domain/{domain}` (`providers/tranco.py:96`) | **1 query per second**, quoted from the endpoint's own status table: "429: Rate limit exceeded (1 query/second)" | [tranco-list.eu/api_documentation](https://tranco-list.eu/api_documentation) |
+| abuse.ch URLhaus | `urlhaus-api.abuse.ch/v1/url/` and `/v1/host/` (`providers/abusech.py:108`, `:113`) | **Not verified** -- the API documentation states no rate limit or quota. `Auth-Key` header required. See the note below | [urlhaus-api.abuse.ch](https://urlhaus-api.abuse.ch/) |
+| abuse.ch ThreatFox | `threatfox-api.abuse.ch/api/v1/` (`providers/abusech.py:116`) | **Not verified** -- no number published; the documentation states only that the API "is available free of charge under the fair use principles". `Auth-Key` header required. See the note below | [threatfox.abuse.ch/api](https://threatfox.abuse.ch/api/) |
+| IANA RDAP bootstrap | `data.iana.org/rdap/{dns,ipv4,ipv6,asn}.json` (`providers/rdap.py:137`) | **Not verified** -- the directory index publishes no rate limit and no caching guidance. See the note below | [data.iana.org/rdap](https://data.iana.org/rdap/) |
+| RDAP registries | resolved at runtime from the bootstrap file | **Not applicable today** -- no registry host is allowlisted, so no registry is contacted. See the note below | — |
 
 ### Notes on the rows that are not a single number
 
@@ -106,6 +112,38 @@ duplicate-request limits bind, not the authenticated 40/minute.
 action". Every response carries `X-Rate-Limit-Scope`, `X-Rate-Limit-Action`, `X-Rate-Limit-Window`,
 `X-Rate-Limit-Limit`, `X-Rate-Limit-Remaining`, `X-Rate-Limit-Reset` and
 `X-Rate-Limit-Reset-After`. Nothing in this tool reads those headers today.
+
+**Shodan InternetDB -- a burst figure, and it is not the constraint you should plan against.**
+The quoted "bursts of up to 10,000 requests per second" is the only published number, and it is
+generous enough that this tool will never approach it. Two things the same page does say, and both
+matter more: the dataset "is updated weekly at midnight UTC", so a result can be up to a week old
+regardless of quota; and the identifier being limited is your **egress IP**, because the endpoint
+takes no credential -- the ceiling is shared with everything else on your network. This is why
+`providers/internetdb.py` treats HTTP 429 as terminal rather than retrying it.
+
+**abuse.ch -- no published number for either platform, and that is not "no limit".** Neither the
+URLhaus nor the ThreatFox API documentation states a rate limit or a quota (checked 2026-08-09).
+ThreatFox's states the API "is available free of charge under the fair use principles" and directs
+commercial users to the Spamhaus offering. What *is* published, and what actually binds, is the
+terms-of-service position: abuse.ch's Terms and Conditions clause 6.2.1 prohibits access by "any
+'robot', 'bot', 'spider', 'scraper' or other automated device, program, tool, algorithm, code,
+process or methodology". **Do not read the absence of a number as permission to run at volume.**
+The operator's decision to accept that exposure, including for bulk mode, is recorded in
+`docs/OPSEC.md` section 4a with its date.
+
+**IANA RDAP bootstrap -- no limit published, and the tool does not need one.** The directory index
+at `data.iana.org/rdap/` lists the files with modification dates and states no policy. What bounds
+this path is the code rather than a quota: `providers/rdap.py` caches each bootstrap file for
+`BOOTSTRAP_TTL_SECONDS = 3600` per process behind a per-URL lock, so a `bulk --investigate` run
+over a thousand domains fetches `dns.json` **once**, not a thousand times. The file sizes are the
+reason that matters -- `dns.json` was 69K when this was checked.
+
+**RDAP registries -- the limit is per-registry, unpublished, and currently moot.** Each TLD
+registry and each RIR runs its own RDAP server with its own policy; there is no single number and
+no single document, and several publish none at all. It is moot today because **no registry host
+is on the egress allowlist**, so no registry is contacted (`docs/OPSEC.md` section 6, gap 9).
+Whoever allowlists the first registry should retrieve that registry's policy in the same change
+and add a row here, rather than inheriting this "not applicable".
 
 ---
 
@@ -228,16 +266,26 @@ Counted as **provider calls**, each of which is one permit and may be more than 
 
 ### 4.1 `ip <address>`
 
-Six provider calls (`orchestrators.py:185`): VirusTotal, IPinfo, Shodan, AbuseIPDB and OTX in one
-wave (`orchestrators.py:846-861`), then Cloudflare Radar for the ASN **only if IPinfo returned
-one** (`orchestrators.py:864-884`). Providers with no key configured cost nothing -- they return
-`missing_api_key` without a request.
+Eight provider calls (`IP_PROVIDERS`): VirusTotal, IPinfo, the Shodan slot, AbuseIPDB, OTX, RDAP
+and abuse.ch in one wave, then Cloudflare Radar for the ASN **only if IPinfo returned one**.
+
+Three things about that eight:
+
+- **The Shodan slot is one call, not two.** The paid `api.shodan.io` lookup runs when
+  `SHODAN_API_KEY` is set; the keyless `internetdb.shodan.io` extract runs when it is not. Never
+  both.
+- **A missing key still costs nothing** -- the provider returns `missing_api_key` without issuing
+  a request, and the run records it as `not_configured` rather than as a clean result.
+- **But three of the eight have no key to be missing.** The Shodan slot (via InternetDB) and RDAP
+  are consulted on every `ip` run whatever is in `.env`, so an unconfigured run is no longer a
+  zero-request run. RDAP costs at most one IANA bootstrap fetch per process, cached for an hour;
+  the registry call itself is not made today (section 2).
 
 **VirusTotal cost: 1.**
 
 ### 4.2 `domain <name>`
 
-One VirusTotal domain lookup and one OTX domain lookup (`orchestrators.py:188,1095-1097`), then the
+Five domain-level calls (`DOMAIN_PROVIDERS`): VirusTotal, OTX, RDAP, Tranco and abuse.ch, then the
 full per-address wave from 4.1 for **every public address the name resolves to**
 (`_enrich_domain_ip`, `orchestrators.py:1006`; fan-out at `orchestrators.py:1137-1143`).
 
@@ -249,8 +297,12 @@ VirusTotal's passive A **and AAAA** records (`_passive_ips_from_vt`, `orchestrat
 (`orchestrators.py:1130-1135`). A domain with eight A records, two AAAA records and no overlap
 costs **eleven** VirusTotal calls, not nine.
 
-The same multiplication applies to IPinfo, Shodan, AbuseIPDB and OTX, each of which is also called
-once per address, and to Cloudflare Radar once per address whose IPinfo lookup returned an ASN.
+The same multiplication applies to IPinfo, the Shodan slot, AbuseIPDB, OTX, RDAP and abuse.ch,
+each of which is also called once per address, and to Cloudflare Radar once per address whose
+IPinfo lookup returned an ASN. **Tranco is the one exception**: it is asked about the name only,
+never per address, so it costs exactly one call however many addresses the name has -- which
+matters, because its published ceiling is one query per second and it paces itself to meet it
+(`tranco.py:104`).
 
 At most eight addresses are enriched concurrently (`MAX_CONCURRENT_IPS`, `orchestrators.py:164`).
 
@@ -260,8 +312,8 @@ At most eight addresses are enriched concurrently (`MAX_CONCURRENT_IPS`, `orches
 
 | Depth | Provider calls | VirusTotal cost |
 |---|---|---|
-| `url` | 1 -- the VirusTotal URL report only (`orchestrators.py:1409-1412`) | 1 |
-| `host` | The above plus the domain-level pair, no address resolution (`orchestrators.py:1420-1432`) | 2 |
+| `url` | 2 -- the VirusTotal URL report and the abuse.ch URL summary (`URL_PROVIDERS`) | 1 |
+| `host` | The above plus the five domain-level calls, no address resolution | 2 |
 | `full` | The above plus the 4.2 per-address fan-out | **N + 2** |
 
 The table assumes a named host. When the URL's host is an IP literal there is no name to look up,
@@ -273,10 +325,10 @@ passivity exception (`docs/OPSEC.md` section 3).
 
 ### 4.4 `asn <number>`
 
-Ten provider calls in a single wave (`ASN_PROVIDERS`, `orchestrators.py:216-227`;
-`orchestrators.py:1638-1655`), of which **five are RIPEstat** (overview, abuse contact, routing
-status, neighbours, prefixes) and one is Cloudflare BGP, which is itself up to eleven HTTP requests
-(3.1).
+Eleven provider calls in a single wave (`ASN_PROVIDERS`), of which **five are RIPEstat** (overview,
+abuse contact, routing status, neighbours, prefixes), one is Cloudflare BGP, which is itself up to
+eleven HTTP requests (3.1), and one is RDAP, which costs at most one IANA bootstrap fetch per
+process.
 
 Then `--neighbors N` (default 8, `cli.py:1480`) resolves up to **3N** neighbour ASNs to names --
 up to 24 additional RIPEstat `as-overview` calls at the default -- gathered at most eight at a time
@@ -285,19 +337,21 @@ up to 24 additional RIPEstat `as-overview` calls at the default -- gathered at m
 There is no whois or registrar enrichment on this path and no flag that offers it. The `--enrich`
 placeholder was removed (roadmap 9.11) rather than left advertising a capability the tool lacks.
 
-**No VirusTotal, Shodan, AbuseIPDB or OTX call is made on this path.** `asn` runs on RIPEstat,
-CAIDA and PeeringDB, none of which needs a key -- `tripper-recon asn 15169` works with an empty
-`.env`.
+**No VirusTotal, Shodan, AbuseIPDB, OTX or abuse.ch call is made on this path.** `asn` runs on
+RIPEstat, CAIDA, PeeringDB and RDAP, none of which needs a key -- `tripper-recon asn 15169` works
+with an empty `.env`.
 
 ### 4.5 What costs nothing
 
 - `check --detect-only` -- classification only, zero provider calls (`cli.py:919-920`).
 - `bulk` without `--investigate` -- triage only, zero provider calls (`cli.py:1265-1266`).
 - Any provider whose key is unset: it returns `missing_api_key` / `missing_token` without issuing a
-  request, and the run records it as `not_configured` rather than as a clean result.
+  request, and the run records it as `not_configured` rather than as a clean result. **This no
+  longer means an unconfigured run is free of requests** -- Shodan InternetDB, RDAP and Tranco take
+  no key and are asked regardless (4.1, 4.2).
 - **urlscan.io.** `providers/urlscan.py` is written and tested and its host is allowlisted, but no
-  orchestrator imports it -- `URL_PROVIDERS` is `("virustotal_url",)` (`orchestrators.py:201`) and a
-  package-wide search finds no call site outside the module itself. It consumes no quota today. Its
+  orchestrator imports it -- `URL_PROVIDERS` is `("virustotal_url", "abusech")` and a package-wide
+  search finds no urlscan call site outside the module itself. It consumes no quota today. Its
   row in section 2 is there for when it is wired in.
 
 ### 4.6 `bulk --investigate`
@@ -325,6 +379,9 @@ Stated plainly, because nothing in the code prevents any of it.
 | AbuseIPDB: 1,000/day (free) | Reachable the same way; and on the 429, the clamp turns a documented 8-hour `Retry-After` into three more doomed requests | 3.4 |
 | RIPEstat: 8 concurrent per IP | The neighbour-resolution gate is exactly 8, so `asn` sits **at** the ceiling rather than under it. `--rate-limit` below 8 lowers it; above 8 does not raise it | 4.4 |
 | PeeringDB: 2/minute for repeated identical anonymous requests | No cache, so re-running `asn 15169` twice inside a minute sends a byte-identical `/net?asn__in=15169` twice | 3.6 |
+| Tranco: 1 query/second | **Not exceeded, and it is the one exception in this table.** `providers/tranco.py` paces its own requests to at least a second apart, measured between request starts (`MIN_REQUEST_INTERVAL_SECONDS`, `tranco.py:104`), because the global semaphore cannot express a rate. Tranco is also asked once per NAME, never per address | 4.2 |
+| Shodan InternetDB: bursts to 10,000/second | Not reachable by this tool. The real exposure is different: the endpoint takes no key, so the throttle applies to your **egress IP** and is shared with everything else on your network. A 429 is treated as terminal rather than retried | 4.1 |
+| abuse.ch: no number published | The absence of a number is not a licence. Their terms prohibit automated access outright (`docs/OPSEC.md` section 4a); `bulk --investigate` is the shape that breaches it, and the operator accepted that on 2026-08-09 | 4.6 |
 | Cloudflare: the GraphQL figure (300 or 320 per 5 min, section 2) | The nearer of the two Cloudflare ceilings. Every address on the `ip`, `domain` and `url` paths costs one Radar GraphQL post when IPinfo returned an ASN, so a `bulk --investigate` over ten multi-address domains is in the high tens of GraphQL posts per run. The account-wide 1,200/5 min is further away | 4.1, 4.2 |
 
 The honest summary: **the passivity boundary is enforced in code, the quota boundary is not.** One
@@ -358,7 +415,12 @@ job.
    a run is reported as not answering, and absent data never scores as clean. A verdict built on
    two of six providers is a verdict about your quota, not about the indicator.
 8. **`asn` is free of the keyed providers.** When the question is about an ASN, that path costs no
-   VirusTotal, Shodan, AbuseIPDB or OTX quota at all (4.4).
+   VirusTotal, Shodan, AbuseIPDB, OTX or abuse.ch quota at all (4.4).
+9. **An unconfigured run is no longer a free run.** Shodan InternetDB, RDAP and Tranco take no key,
+   so `.env` being empty no longer means nothing leaves the machine. The three of them are cheap
+   -- one InternetDB call per address, one Tranco call per name at one per second, and one IANA
+   bootstrap fetch per process -- but they are logged against your egress IP, which is the only
+   identifier a keyless provider has for you (`docs/OPSEC.md` section 4).
 
 ---
 

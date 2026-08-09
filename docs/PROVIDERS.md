@@ -1,6 +1,6 @@
 # Providers
 
-Ten providers are wired into investigations, in `tripper_recon/providers/`. An eleventh module —
+Fourteen provider modules are wired into investigations, in `tripper_recon/providers/`. One more —
 urlscan.io — is implemented and tested but not yet consulted by any command; it has its own
 section below and is marked accordingly.
 
@@ -21,6 +21,9 @@ what is written here and what the ratio counts are the same list by construction
 | RIPEstat | — | **no** | | | | yes |
 | CAIDA AS-Rank | — | **no** | | | | yes |
 | PeeringDB | — | **no** | | | | yes |
+| Shodan InternetDB | — | **no** | yes | yes | yes | |
+| RDAP | — | **no** | yes | yes | | yes |
+| Tranco | — | **no** | | yes | | |
 | VirusTotal | `VT_API_KEY` | yes | yes | yes | yes | |
 | Shodan | `SHODAN_API_KEY` | yes | yes | yes | yes | |
 | AbuseIPDB | `ABUSEIPDB_API_KEY` | yes | yes | yes | yes | |
@@ -28,19 +31,31 @@ what is written here and what the ratio counts are the same list by construction
 | AlienVault OTX | `OTX_API_KEY` | yes | yes | yes | yes | |
 | Cloudflare Radar | `CLOUDFLARE_API_TOKEN` | yes | yes | yes | yes | yes |
 | Cloudflare BGP | `CLOUDFLARE_API_TOKEN` | yes | | | | yes |
+| abuse.ch (URLhaus + ThreatFox) | `ABUSECH_AUTH_KEY` | yes | yes | yes | yes | |
 | urlscan.io | — *(not wired)* | n/a | | | | |
+
+**Shodan and Shodan InternetDB share ONE coverage slot, named `shodan`.** The paid host lookup runs
+when `SHODAN_API_KEY` is set and the keyless InternetDB extract runs when it is not, so exactly one
+of them can answer for an address. Listing both in `IP_PROVIDERS` would permanently understate
+coverage by one for every operator; the payload's `source` field says which dataset replied.
 
 `check` and `bulk` consult nothing of their own: `check` classifies the string and routes it to
 `ip`, `domain`, `url` or `asn`, and `bulk --investigate` routes each surviving indicator through
 `check`. `check --detect-only` and `bulk` without `--investigate` consult nobody at all.
 
-The `url` column is indirect for everything except VirusTotal. The URL scope itself has exactly
-one provider — VirusTotal's URL report. `--depth host` adds the domain-level providers about the
-host, and `--depth full` (the default) adds the full per-address set for each address the host
-resolves to.
+The `url` column is indirect for everything except VirusTotal and abuse.ch. The URL scope itself
+has exactly two providers — VirusTotal's URL report and the abuse.ch summary. `--depth host` adds
+the domain-level providers about the host, and `--depth full` (the default) adds the full
+per-address set for each address the host resolves to.
 
 **`tripper-recon asn 15169` works with a completely empty `.env`.** RIPEstat, CAIDA, and PeeringDB
-carry that command on their own.
+carry that command on their own; RDAP is asked too and currently reports unknown (see its section).
+
+**A keyless run is no longer a silent run.** Until 2026-08-09 an `ip` lookup with no credentials
+made zero HTTP requests, because every provider short-circuited on its missing key. InternetDB,
+RDAP and Tranco take no credential, so a keyless run now contacts `internetdb.shodan.io` and
+`data.iana.org`. Keyless means unattributable to an account, not invisible: the egress IP is still
+the identifier those providers log and rate-limit on (`docs/OPSEC.md` section 4).
 
 > **A provider with no key is never asked, and never renders as a zero.** Absence and a clean
 > result are kept visibly different: a provider that was not asked renders as "no data", never as
@@ -90,6 +105,91 @@ request is retried **independently**, and the per-net fetches run concurrently b
 `MAX_CONCURRENT_NET_LOOKUPS = 5` (`peeringdb.py:16`). The earlier defect — the whole 1+N sequence
 inside a single retried closure, so one failure on the last sub-request replayed every earlier one
 against a keyless rate-limited provider — is fixed.
+
+### Shodan InternetDB — `providers/internetdb.py`
+
+`https://internetdb.shodan.io/{ip}` (`internetdb.py:79`). The keyless fallback for the `shodan`
+slot: same underlying dataset, no credential, `GET` only. Keeps `ports`, `hostnames`, `cpe`,
+`tags`, `vulns`, `ip` (echoed from the *response*, so a record describing a different address than
+the one asked for is visible rather than hidden) and `source`, which is the literal
+`shodan_internetdb` so a consumer can tell which dataset answered.
+
+**It adds CVEs the paid provider never surfaced here** and restores exposure data on a run with no
+`SHODAN_API_KEY`, which previously returned `missing_api_key` and was silently suppressed.
+
+Two things it is not:
+
+- **Not a replacement for the paid lookup.** The dataset is coarser and, per Shodan's own book,
+  updated weekly rather than continuously. When `SHODAN_API_KEY` is set the paid lookup runs.
+- **Not a clean answer on 404.** `not_found` means InternetDB holds no record, which is absence of
+  a record and not absence of exposure. `429` is `rate_limited` and is deliberately not retried:
+  the identifier being throttled is the egress IP, and retrying into a throttle is how it becomes
+  a ban.
+
+### RDAP — `providers/rdap.py`
+
+Registration data straight from the registry that holds it, for domains (`rdap_domain`), IP
+networks (`rdap_ip`) and AS numbers (`rdap_asn`). No key, no quota, no submission. It answers two
+questions nothing else in this tool can: **when was this registered**, which is the strongest cheap
+phishing signal available, and **who do I send the abuse report to**.
+
+**The bootstrap is done client-side, and that is the whole design.** RDAP has no single endpoint
+(STD 95, RFC 9224). This module fetches IANA's static bootstrap files
+(`IANA_BOOTSTRAP_BASE`, `rdap.py:137`), caches them for an hour per process, resolves the
+authoritative base URL locally, and issues exactly one `GET` to it. It does **not** use the
+`rdap.org` aggregator, which would mean following a `302` to a host chosen at runtime, and it sets
+`follow_redirects=False` on both requests. See `docs/OPSEC.md` section 2 for why that matters more
+here than anywhere else in the package.
+
+> **As shipped, every RDAP lookup answers `registry_not_allowlisted`.** The bootstrap host is on
+> the egress allowlist; the registries it names are not. That is unknown, never clean, and it
+> shows as missing coverage. Adding registry hosts is a deliberate review — `docs/OPSEC.md`
+> section 6, gap 9.
+
+Domain payload, dates first because the date is the reason this provider exists:
+`rdap_registration_date`, `rdap_age_days`, `rdap_is_newly_registered`,
+`rdap_newly_registered_threshold_days` (30, published so a consumer can disagree with the
+judgement explicitly), `rdap_expiration_date`, `rdap_last_changed_date`, `rdap_events`, then
+`rdap_registrar_name` / `_iana_id` / `_handle`, `rdap_registrant_name` / `_organization`,
+`rdap_abuse_email` / `_phone` / `_handle` / `_contact_source`, `rdap_status` (+ `_raw`),
+`rdap_adverse_status`, `rdap_has_adverse_status`, `rdap_is_inactive`, `rdap_nameservers` (+
+`_names`, `_count`, `_glue_addresses`), `rdap_dnssec_*`, and the routing provenance
+`rdap_server` / `_server_host` / `_bootstrap_entry` / `_bootstrap_publication`.
+
+Four readings worth carrying:
+
+- **A `404` is unknown, not clean.** A registry returns it for a name never registered, for one
+  that just dropped, and for names it holds but will not answer for.
+- **The caller passes the name to look up, and RDAP holds the *registrable* name.** So
+  `login.secure.example.com` returns `404` while `example.com` returns the record. Deriving the
+  boundary would be right for `com` and wrong for `co.uk`, so the module reports the miss instead
+  of silently rewriting the indicator. Every envelope, success or failure, carries the resource
+  actually queried.
+- **`rdap_abuse_contact_source` distinguishes a designated abuse address from a registrar
+  fallback.** They are different queues with different obligations.
+- **A missing `delegationSigned` stays `None`.** An unsigned delegation and an unreported one are
+  different claims, and only one of them is the registry's.
+
+### Tranco — `providers/tranco.py`
+
+`https://tranco-list.eu/api/ranks/domain/{domain}` (`tranco.py:96`). Keyless. A **false-positive
+suppressor**, and the payload says so in a field: `tranco_suppression_only` is hard-coded `True`,
+and a consumer that finds itself raising a score from anything in this payload has a defect.
+
+Keeps `tranco_rank`, `tranco_rank_date`, `tranco_in_list`, `tranco_best_rank`,
+`tranco_days_ranked`, `tranco_history`, `tranco_suppression_only`, and — when the domain is
+unranked — `tranco_absence_note`, which carries the "this is not adverse" sentence *with the data*
+rather than leaving it in a docstring nobody downstream reads. The Tranco list holds roughly a
+million domains against a public web of hundreds of millions, so **absence is the ordinary state
+of a legitimate small site** and scoring it would flag the honest long tail.
+
+`tranco_in_list: False` and a `404` are deliberately not collapsed: the first is Tranco telling you
+the domain is unranked, the second is Tranco telling you nothing.
+
+**It paces itself.** The published limit is one query per second and a global concurrency semaphore
+cannot express that, so this module holds its own inter-request spacing
+(`MIN_REQUEST_INTERVAL_SECONDS`, `tranco.py:104`) measured between request *starts*, because the
+server measures arrival rather than departure.
 
 ---
 
@@ -218,6 +318,63 @@ answered with an ASN — the ASN is not known until IPinfo replies. It stays in 
 denominator either way (`orchestrators.py:185`), so a failed IPinfo lookup does not quietly
 shrink the denominator and report better coverage for the worse run.
 
+### abuse.ch — URLhaus and ThreatFox — `providers/abusech.py`
+
+Two platforms, **one Auth-Key** (`ABUSECH_AUTH_KEY`, free from the abuse.ch authentication portal),
+travelling in an `Auth-Key` request **header**. Both APIs now require it; an unauthenticated
+request is rejected.
+
+> **Read `docs/OPSEC.md` section 4a before enabling this.** abuse.ch's terms prohibit automated
+> access by "robot, bot, spider, scraper" while their API documentation issues keys and publishes
+> `curl` examples. The operator accepted that exposure on 2026-08-09, bulk mode included, and it
+> is recorded rather than mitigated.
+
+**Both calls are `POST`, and both are queries.** URLhaus takes the indicator as a form field,
+ThreatFox as a JSON body with a `query` selector; neither makes abuse.ch retrieve the target and
+neither publishes anything. The selector this module sends is pinned to one constant,
+`THREATFOX_SEARCH_QUERY = "search_ioc"` (`abusech.py:121`), because the ThreatFox endpoint is
+shared between read and write operations and the *selector*, not the URL, is what makes the call
+passive. `docs/OPSEC.md` section 7 has the register and the tests that hold it there.
+
+Three endpoints, composed into two public functions:
+
+| Function | Calls | Used by |
+|---|---|---|
+| `abusech_url_summary` | URLhaus `POST /v1/url/` + ThreatFox exact-match search on the same URL | `url` scope |
+| `abusech_host_summary` | URLhaus `POST /v1/host/` + ThreatFox search | `ip` and `domain` scopes — the host endpoint takes an IPv4 address, a hostname or a domain, which is why one function serves both |
+
+**Why both platforms, always.** They index different things: URLhaus is malware-*distribution*
+URLs somebody reported, with the retrieved file behind them; ThreatFox is IOCs somebody submitted
+with an actor attached. Asking one answers half the question.
+
+Keeps, from URLhaus: `urlhaus_url`, `urlhaus_host`, `urlhaus_id`, `urlhaus_url_status`,
+`urlhaus_online`, `urlhaus_date_added`, `urlhaus_firstseen`, `urlhaus_last_online`,
+`urlhaus_threat` / `_threats`, `urlhaus_tags`, `urlhaus_reporter` / `_reporters`,
+`urlhaus_blacklists`, `urlhaus_larted`, `urlhaus_takedown_time_seconds`, `urlhaus_reference`,
+`urlhaus_payloads` (capped at 25, with `urlhaus_payloads_truncated` and an uncapped
+`urlhaus_payload_count`), `urlhaus_signatures`, `urlhaus_payload_first_seen` / `_last_seen`, and
+on the host route `urlhaus_urls` (capped at 25) with `urlhaus_url_count` and
+`urlhaus_online_urls_in_response`.
+
+From ThreatFox: `threatfox_iocs` (capped at 50), `threatfox_ioc_count`,
+`threatfox_returned_count`, `threatfox_iocs_truncated`, `threatfox_malware_families` / `_ids`,
+`threatfox_threat_types`, `threatfox_tags`, `threatfox_reporters`,
+`threatfox_confidence_min` / `_max`, `threatfox_first_seen` / `_last_seen`,
+`threatfox_search_term`, `threatfox_exact_match`, `threatfox_discarded_partial_matches`.
+
+And three merged fields a consumer should read first: `abusech_sources` (which platforms actually
+answered), `abusech_actor_attribution` (the union of URLhaus payload signatures and ThreatFox
+malware families — the attribution sentence an incident report wants), and `abusech_online`, which
+is `True` only when a platform positively says the indicator is live now and stays `None` when
+neither spoke to liveness.
+
+**Half an answer is reported as half an answer.** When one platform succeeds and the other fails,
+the result is a success carrying `abusech_urlhaus_error` / `abusech_threatfox_error` so a consumer
+can see which half went unanswered rather than inferring it from missing keys. Two identical
+failures collapse to that one slug; two different failures become `lookup_failed` carrying both,
+because folding an `unauthorized` and a `no_results` into either one would be a lie in one
+direction or the other.
+
 ### Cloudflare BGP — `providers/cloudflare_rest.py`
 
 BGP hijack and route-leak incident counts for an ASN.
@@ -289,10 +446,9 @@ key for all API requests, so unauthenticated search would be a deliberate depart
 
 ### Planned
 
-- **abuse.ch (URLhaus + ThreatFox)**, roadmap 8.7 — one Auth-Key, actor-attributed and
-  payload-backed observations. **Not built.** Decision Q5 in `docs/ROADMAP.md`: build it in full
-  including bulk mode, with the terms-of-service exposure accepted and recorded in
-  `docs/OPSEC.md` rather than mitigated.
+- **abuse.ch (URLhaus + ThreatFox)**, roadmap 8.7 — **built and wired**; see its section above.
+  Decision Q5 in `docs/ROADMAP.md` stands: full build including bulk mode, terms-of-service
+  exposure accepted and recorded in `docs/OPSEC.md` section 4a rather than mitigated.
 - **GreyNoise** (roadmap 8.8) is **struck** (decision Q10 — no eligible non-consumer email
   address, so it can never be started) and will not be built.
 
@@ -301,8 +457,14 @@ key for all API requests, so unauthenticated search would be a deliberate depart
 ## Credential handling
 
 **Header:** VirusTotal (`x-apikey`), AbuseIPDB (`Key`), OTX (`X-OTX-API-KEY`), Cloudflare
-(`Authorization: Bearer`), urlscan (`API-Key`, unwired).
+(`Authorization: Bearer`), abuse.ch (`Auth-Key`, `abusech.py:371`), urlscan (`API-Key`, unwired).
 **Query string:** Shodan (`?key=`, `shodan_api.py:68`), IPInfo (`?token=`, `ipinfo.py:17`, `:61`).
+**None:** Shodan InternetDB, RDAP and Tranco.
+
+The abuse.ch key is the one that query-parameter redaction cannot help with, because it never
+appears in a URL. It is covered instead by literal redaction: `ABUSECH_AUTH_KEY` is listed in
+`utils.redact._SECRET_ENV_VARS`, so its *value* is substituted wherever it appears in any string
+the tool emits.
 
 For the two query-string providers the API key is part of the request URL, so a failing request
 carries it in both `str(request.url)` and the exception text.
@@ -341,9 +503,11 @@ What the code does today:
   *await* of a provider call, not `asyncio.create_task` — a limiter around task creation acquires
   and releases in the same tick and constrains nothing. The permit is held across a provider's
   retry sleeps as well as its request, because a retry spends the provider's quota too.
-- **No per-provider budget exists.** A semaphore bounds concurrency and cannot express "4 per
-  minute". Roadmap item 3.4, and it is blocked on retrieving each provider's published limits
-  rather than recalling them.
+- **No per-provider budget exists — with one exception.** A semaphore bounds concurrency and
+  cannot express "4 per minute". Roadmap item 3.4, blocked on retrieving each provider's published
+  limits rather than recalling them. The exception is `providers/tranco.py`, whose published
+  ceiling is one query per second and which therefore paces its own requests
+  (`MIN_REQUEST_INTERVAL_SECONDS`, `tranco.py:104`), measured between request starts.
 - **`429` and `Retry-After` are handled.** `408`, `425`, `429`, `500`, `502`, `503` and `504` are
   retried; everything else — `401`, `403`, `404`, any other 4xx, and non-httpx failures such as a
   JSON decode error — is permanent for this key and this indicator and is raised on the first

@@ -10,15 +10,17 @@ on success -- that is the shape the orchestrator copies into the analysis dict a
 from __future__ import annotations
 
 import io
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
 from rich.console import Console, RenderableType
 
-# Every environment variable the package reads: five provider credentials, the Cloudflare
+# Every environment variable the package reads: six provider credentials, the Cloudflare
 # token, and the two behaviour knobs.
-#   credentials -> orchestrators._env_keys / utils.redact._SECRET_ENV_VARS
+#   credentials -> orchestrators._env_keys / orchestrators.ABUSECH_ENV_VAR
+#                  / utils.redact._SECRET_ENV_VARS
 #   behaviour   -> utils.http (user agent), utils.logging (log level)
 PROVIDER_ENV_VARS: tuple[str, ...] = (
     "CLOUDFLARE_API_TOKEN",
@@ -27,9 +29,25 @@ PROVIDER_ENV_VARS: tuple[str, ...] = (
     "ABUSEIPDB_API_KEY",
     "IPINFO_TOKEN",
     "OTX_API_KEY",
+    "ABUSECH_AUTH_KEY",
     "TRIPPER_RECON_USER_AGENT",
     "TRIPPER_RECON_LOG_LEVEL",
 )
+
+# Variables that force `rich` to emit ANSI escapes regardless of whether stdout is a terminal.
+# Several tests parse captured stdout as JSON or assert on plain substrings, and an escape
+# sequence in the middle of a value breaks both -- so the suite passes or fails depending on the
+# shell it was launched from. Cleared for the same reason `render` pins `force_terminal=False`:
+# a gate whose result depends on the operator's terminal is not a gate.
+#
+# Cleared HERE, at conftest import time, and not in a fixture: `rich` reads these when a
+# `Console` is CONSTRUCTED, and `tripper_recon.cli` builds its console at module import -- which
+# happens when a test module imports it, before any fixture has run. A per-test fixture is too
+# late and leaves the failures in place.
+COLOUR_FORCING_ENV_VARS: tuple[str, ...] = ("FORCE_COLOR", "CLICOLOR_FORCE")
+
+for _colour_var in COLOUR_FORCING_ENV_VARS:
+    os.environ.pop(_colour_var, None)
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +72,33 @@ def clear_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     for name in PROVIDER_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_real_network() -> Iterator[None]:
+    """Intercept every request for the whole session, so an unmocked test cannot reach a provider.
+
+    This is a SAFETY CONTROL, like ``clear_provider_env`` above, and it exists because a test
+    that forgets ``@respx.mock`` does not fail -- it succeeds, by contacting the real provider.
+
+    That is worse here than in an ordinary project. Every host this tool talks to is an OSINT
+    provider, so an unmocked test spends the operator's quota and writes his egress IP and the
+    test's indicator into that provider's logs, on every run. The keyless providers (Tranco,
+    Shodan InternetDB, the IANA RDAP bootstrap) make it likelier still, because nothing stops
+    them for want of a credential: on the run that first wired them,
+    ``test_domain_coverage_spans_both_scopes`` reached ``tranco-list.eu`` and ``data.iana.org``
+    for real and counted the answers as provider coverage.
+
+    Implemented as an outer respx router with no routes rather than as a transport patch.
+    ``respx.mocks.Mocker.handler`` walks every registered router and returns the first response
+    one of them produces, so a test's own router still serves its routes and this one only ever
+    sees what nothing else claimed -- which it refuses, with ``AllMockedAssertionError``.
+    Patching httpcore or httpx directly does NOT work: respx patches those same objects and
+    only patches once, so whichever landed last silently wins.
+    """
+    respx = pytest.importorskip("respx", reason="respx is required to keep tests off the network")
+    with respx.mock(assert_all_called=False, assert_all_mocked=True):
+        yield
 
 
 @pytest.fixture

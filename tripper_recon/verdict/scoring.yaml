@@ -21,7 +21,11 @@
 #   3. this file, shipped in-package
 # Tier 3 must always work with no configuration at all. Keep it self-sufficient.
 
-version: "0.1.0-draft"
+# 0.2.0-draft: four passive sources wired in (roadmap W8.1/8.2/8.3/8.7). New weights for RDAP
+# registration data, abuse.ch curated feeds and Shodan InternetDB; Tranco added as an observation
+# with no weight. `calibration.status` is UNCHANGED at `unvalidated` -- adding sources does not
+# validate anything, and the new numbers are informed priors exactly like the old ones.
+version: "0.2.0-draft"
 ruleset_name: "tripper-recon-default"
 
 # ---------------------------------------------------------------------------------------------
@@ -272,7 +276,13 @@ signals:
 
   shodan.exposure:
     family: exposure
-    providers: [shodan]
+    # Two implementations of one slot. `shodan` is the paid host record; `internetdb` is the
+    # keyless InternetDB extract the orchestrator falls back to when SHODAN_API_KEY is unset.
+    # They are alternatives and exactly one of them can ever answer for a given address, which is
+    # why they share this signal and its ceiling instead of holding two. InternetDB carries no
+    # observation date, so its emission is undated and priced by `undated_evidence` -- the fact
+    # that its age is unknown is stated in the observation rather than guessed at.
+    providers: [shodan, internetdb]
     applies_to: [ip]
     max_points: 10
     enabled: true
@@ -282,6 +292,81 @@ signals:
     # it may never contribute to a MALICIOUS verdict. Scoring an unpatched intranet box as
     # malicious is how a tool teaches its analysts to ignore it.
     notes: Risky exposed ports plus associated CVEs, decayed by Shodan last_update.
+
+  urlhaus.listing:
+    family: curated_feeds
+    # `abusech`, not `urlhaus`: the provider list names the orchestrator key that was actually
+    # called, which is what a family map has to be checkable against. The signal ID and its
+    # observation say which of the two platforms behind that call saw the thing.
+    providers: [abusech]
+    applies_to: [ip, domain, url]
+    max_points: 40
+    enabled: true
+    # The heaviest single weight in the ruleset, above VirusTotal, and the reason is a difference
+    # in KIND rather than in degree. Every other reputation input here is an aggregate of
+    # opinions; a URLhaus record means somebody retrieved a file from that URL and published its
+    # SHA-256. An observation with a payload behind it outranks a detection ratio, and a clean VT
+    # score against a live URLhaus payload means VT is stale, not that the URL is clean.
+    #
+    # Still below the MALICIOUS band, because `require_corroboration_for_malicious` is structural
+    # and this signal is not exempt from it. The path to MALICIOUS on one live hit is the
+    # escalation rule below, which states its condition and is recorded by id in the verdict --
+    # not a weight quietly large enough to get there on its own.
+    notes: >-
+      URLhaus record for the URL or its host, scaled by match precision, liveness, whether a
+      payload was retrieved, and recency.
+
+  threatfox.ioc:
+    family: curated_feeds
+    providers: [abusech]
+    applies_to: [ip, domain, url]
+    max_points: 30
+    enabled: true
+    # Below URLhaus because the evidence is an ATTRIBUTION rather than a retrieval: somebody
+    # asserts this indicator is Cobalt Strike C2 and states how confident they are. That is the
+    # sentence an incident report wants, and it is one reporter's claim. abuse.ch's own
+    # confidence level is read as confidence in the attribution and drives the magnitude, so a
+    # low-confidence row lands well short of the decisiveness threshold and cannot escalate.
+    notes: >-
+      ThreatFox IOC match, scaled by abuse.ch's own confidence level and whether a malware family
+      is named.
+
+  rdap.domain_age:
+    family: registry_meta
+    providers: [rdap]
+    applies_to: [domain]
+    max_points: 15
+    enabled: true
+    # Same ceiling and the same `domain_age.bands` as the whois-derived `domain.age`, because it
+    # is the same fact from a better source: RDAP is the registry's own structured answer, while
+    # `domain.age` parses free-text whois from hundreds of registrars. The extractor prefers RDAP
+    # and SUPPRESSES `domain.age` when RDAP established a date, so a new domain is never counted
+    # twice -- and the family differs, so an age never corroborates a multiscanner detection.
+    notes: Age bands from the RDAP registration event; see the domain_age block.
+
+  rdap.adverse_status:
+    family: registry_meta
+    providers: [rdap]
+    applies_to: [domain]
+    max_points: 10
+    enabled: true
+    # `client hold` is what a registrar sets when it has ACCEPTED an abuse report and pulled the
+    # name out of DNS. That is a third party acting on evidence, which is worth more than most
+    # feed entries -- but it is registry metadata, so `registry_meta` is non-corroborating and it
+    # can never stand in for an independent confirming family.
+    notes: EPP statuses indicating registry or registrar action; see the rdap block.
+
+  rdap.abuse_contact_missing:
+    family: registry_meta
+    providers: [rdap]
+    applies_to: [domain]
+    max_points: 3
+    enabled: true
+    # Deliberately near-zero. Privacy proxying is legal, routine and used by an enormous number
+    # of entirely ordinary domains; scoring it hard would flag the honest long tail. It is here
+    # because "there is nobody to report abuse to" is a real operational fact an analyst needs in
+    # the ticket, and because its PRESENCE is the incident-report field this provider exists for.
+    notes: No published abuse contact, or only a registrar fallback; see the rdap block.
 
   asn.reputation:
     family: network_meta
@@ -361,11 +446,32 @@ signals:
 # Names are the orchestrator's own provider keys (orchestrators.IP_PROVIDERS / DOMAIN_PROVIDERS /
 # ASN_PROVIDERS), not display names, so a family map can be checked against what actually ran.
 provider_families:
-  multiscanner: [virustotal]
+  multiscanner: [virustotal, virustotal_url]
   abuse_reports: [abuseipdb]
   community_ti: [otx, otx_domain]
-  curated_feeds: [urlhaus, threatfox]
-  exposure: [shodan]
+  # abuse.ch is ONE provider here, called once per indicator, and `abusech` is the orchestrator
+  # key the signals are attributed to. `urlhaus` and `threatfox` are listed beside it as the two
+  # platforms underneath that one call; they stay in `providers.planned` because neither is a
+  # provider slot of its own -- WHICH platform observed something is carried by the signal id
+  # (`urlhaus.listing` / `threatfox.ioc`) and by its observation sentence, not by a second
+  # coverage denominator entry that could never be answered independently.
+  #
+  # One family whatever the spelling: two platforms run by the same organisation, drawing on
+  # overlapping submitters, are not two independent confirmations.
+  #
+  # It is deliberately NOT in the same family as VirusTotal or OTX, which both re-ingest abuse.ch
+  # among other feeds. Putting them together would make a VT detection derived from URLhaus
+  # corroborate URLhaus; keeping them apart is the whole point of the independence model. The
+  # residual risk runs the other way and is not modelled: a VT hit may itself be an echo of the
+  # URLhaus record, so the corroboration between those two families is weaker than it looks.
+  curated_feeds: [abusech, urlhaus, threatfox]
+  exposure: [shodan, internetdb]
+  # Registration data. Facts about who registered what and when, from the registry itself. Never
+  # corroborating -- see non_corroborating_families -- because knowing a domain is fourteen days
+  # old is not a second party confirming it is malicious.
+  registry_meta: [rdap]
+  # Popularity. Suppression-only by construction; see the tranco block.
+  popularity: [tranco]
   network_meta:
     - ipinfo
     - ipinfo_asn
@@ -383,7 +489,14 @@ provider_families:
 # Families that never count toward corroboration however many of their providers answer. Network
 # metadata is context, not evidence: knowing an address is in AS13335 tells you where it lives,
 # not what it did.
-non_corroborating_families: [network_meta]
+#
+# `registry_meta` and `popularity` are here for the same reason and it is worth stating plainly,
+# because both of them CAN carry points. A domain registered nine days ago scores, and a registrar
+# hold scores; neither is a second party confirming a detection, and letting an age corroborate a
+# VirusTotal hit would manufacture HIGH confidence out of one observation plus a calendar. Tranco
+# is on this list for the mirror-image reason: it may only ever suppress, so it must never be
+# counted as a source that agreed with anybody.
+non_corroborating_families: [network_meta, registry_meta, popularity]
 
 # ---------------------------------------------------------------------------------------------
 # Provider inventory
@@ -395,11 +508,21 @@ non_corroborating_families: [network_meta]
 providers:
   implemented:
     - virustotal
+    - virustotal_url
     - ipinfo
     - shodan
+    # Keyless fallback for the shodan slot -- providers/internetdb.py. Wired in 0.2.0-draft.
+    - internetdb
     - abuseipdb
     - otx
     - otx_domain
+    # providers/abusech.py, wired in 0.2.0-draft. One key for the composed lookup; the two
+    # platforms stay under `planned` because neither is a provider slot of its own.
+    - abusech
+    # providers/rdap.py -- registration data for domains, networks and AS numbers.
+    - rdap
+    # providers/tranco.py -- popularity rank, suppression only.
+    - tranco
     - cloudflare_asn
     - cloudflare_bgp
     - ipinfo_asn
@@ -412,8 +535,16 @@ providers:
     - ripe_prefixes
     - ripe_neighbour_overview
   planned:
+    # The two abuse.ch platforms as SEPARATE provider slots. The code calls them through one
+    # composed `abusech` lookup and files one coverage entry, so a rule keyed on either name
+    # alone can never fire and must stay disabled -- which is exactly what
+    # `escalation.curated_feed_hit` below records. They become implemented the day the
+    # orchestrator gives each platform its own slot, and not before.
     - urlhaus
     - threatfox
+    # providers/urlscan.py exists and is tested, but nothing consumes it: it is not in any
+    # orchestrator provider set and no extractor reads it. Planned, not implemented, is the
+    # honest state and it keeps any rule that names it from being enabled.
     - urlscan
 
 # ---------------------------------------------------------------------------------------------
@@ -530,6 +661,93 @@ certificate:
   points_cn_mismatch: 4.0
   points_self_signed: 3.0
   points_expired_but_serving: 1.0
+
+rdap:
+  # Registration data from the registry that holds it (providers/rdap.py). No decay profile here
+  # on purpose: a registration date is a fact with a date, not an observation that goes stale, and
+  # the age bands already price how much the date is worth.
+  #
+  # 5 per adverse status, capped at 10, so one hold scores half the signal and two or more
+  # saturate it. `client hold` and `server hold` together are the registry AND the registrar
+  # having acted, which is as strong as this signal gets; adding a third would say nothing new.
+  points_per_adverse_status: 5.0
+  max_adverse_status_points: 10.0
+  # No abuse address at all. Kept at 3 -- see the note on the signal: privacy proxying is the
+  # normal state of a very large share of ordinary domains and scoring it hard is a
+  # false-positive engine aimed at the honest long tail.
+  missing_abuse_contact_points: 3.0
+  # Only the registrar's general contact was published, with no entity holding the abuse role.
+  # Somebody can be told, but not through the queue that carries the obligation. Half the
+  # absence, and the loader refuses a value above it.
+  fallback_abuse_contact_points: 1.5
+
+tranco:
+  # THERE ARE NO POINTS IN THIS BLOCK AND THAT IS THE DESIGN. Read the TrancoConfig docstring in
+  # config.py before adding one.
+  #
+  # Rank is a false-positive SUPPRESSOR. It may lower suspicion; it may never raise it. "Not in
+  # the top million" is the state of essentially every legitimate small site on the web, so
+  # scoring absence would flag the honest long tail and detect nothing.
+  #
+  # The engine has no negative-points mechanism and no suppression tier keyed on a provider
+  # payload, so what this ruleset can honestly express today is an observation: `tranco.rank`
+  # carries zero points, states the rank and the steadiness in words, and is NOT counted as an
+  # affirmative negative -- a popularity rank is not a provider saying "asked, nothing here".
+  # These two numbers only choose which sentence is emitted.
+  #
+  # 100000: inside the global top hundred thousand a domain is a household name or close to it,
+  # and the claim "this is established infrastructure" is defensible on sight. Below that the
+  # ranking is still meaningful but the sentence would overstate it.
+  strong_rank: 100000
+  # 25 of the 30 daily lists the endpoint returns. A domain that appeared once yesterday and one
+  # that has been ranked every day for a month are different findings, and the second is the one
+  # that means anything. Validated against the 30-day window the API actually returns.
+  steady_days: 25
+
+abusech:
+  # Multipliers only, all in [0, 1], so no combination can push either signal past the ceiling
+  # the signals table granted it. Each is a way the observation can be less than it first looks.
+  #
+  # URLhaus, match precision. An exact-URL record describes the URL; a host record describes
+  # something that happened SOMEWHERE on the host, which on shared hosting is a statement about
+  # the hoster and not about the tenant. 0.85 rather than something harsher because a host-level
+  # URLhaus record is still a specific retrieved file, not a reputation score.
+  urlhaus_exact_match_factor: 1.0
+  urlhaus_host_match_factor: 0.85
+  # Liveness. `online` is the present tense and gets full marks. `offline` at 0.6 keeps
+  # historical badness as real evidence while leaving room for the common innocent reading -- a
+  # compromised legitimate site that has since been cleaned, which the `abused_legit_malware`
+  # blacklist value hints at directly and which the observation string surfaces.
+  urlhaus_online_factor: 1.0
+  urlhaus_offline_factor: 0.6
+  # Neither platform spoke to liveness. Between the two: the engine does not know, and treating
+  # silence as either answer would be inventing one.
+  urlhaus_unknown_liveness_factor: 0.75
+  # A payload hash or signature attached means a file was actually retrieved and analysed. A
+  # listing with nothing behind it is a report; 0.7 is the discount for the difference.
+  urlhaus_payload_factor: 1.0
+  urlhaus_no_payload_factor: 0.7
+  # `fast`, not `slow`. "This URL is distributing malware" is a present-tense claim about a
+  # resource somebody else controls, and it is the claim most likely to have stopped being true.
+  urlhaus_recency_profile: fast
+
+  # ThreatFox. abuse.ch publishes a confidence level with each IOC; read it as their confidence
+  # in the ATTRIBUTION and let it drive the magnitude directly. 75 for full marks matches the
+  # level at which the platform's own guidance treats a row as solid.
+  #
+  # The consequence to check the arithmetic on: at confidence 50 the magnitude is 0.67, below the
+  # 0.8 decisiveness fraction, so the escalation rule below cannot fire on that row alone and the
+  # verdict lands at SUSPICIOUS. That is the "below ~50, treat as suspicious not malicious"
+  # instruction expressed as arithmetic instead of as a second threshold nobody would maintain.
+  threatfox_confidence_saturation: 75
+  # A named malware family is the difference between "Cobalt Strike C2, first seen 2020-12-06"
+  # and "somebody flagged this". Both go in a report; only one of them is worth a full signal.
+  threatfox_attributed_factor: 1.0
+  threatfox_unattributed_factor: 0.7
+  # `standard` rather than `fast`: an attribution to a malware family ages more slowly than a
+  # claim that a URL is serving right now, but the association between the family and this
+  # indicator still decays -- C2 addresses are recycled.
+  threatfox_recency_profile: standard
 
 # ---------------------------------------------------------------------------------------------
 # Overrides (roadmap 5.6)
@@ -670,9 +888,12 @@ overrides:
   escalation:
     enabled: true
     rules:
-      # DEAD CONFIG UNTIL THE PROVIDERS EXIST, and disabled so it cannot pretend otherwise.
-      # urlhaus and threatfox are in providers.planned, not providers.implemented; the loader
-      # rejects this rule being enabled while that is true.
+      # STILL DEAD CONFIG, and still disabled, but for a narrower reason than in 0.1.0-draft.
+      # The two platforms are now called -- through one composed `abusech` lookup filling one
+      # coverage slot -- so `urlhaus` and `threatfox` remain in `providers.planned` as the
+      # separate provider slots they are not yet. A rule keyed on either name alone can still
+      # never fire. `escalation.abusech_observation` below is the form that works today; enable
+      # this one on the day each platform gets its own slot, and delete that one.
       - id: escalation.curated_feed_hit
         description: >-
           A live URLhaus or ThreatFox entry is a specific, current, actor-attributed observation
@@ -692,6 +913,42 @@ overrides:
         enabled: false
         requires_providers: [virustotal]
         requires_high_confidence_engines: true
+        verdict: MALICIOUS
+        confidence: HIGH
+      # THE abuse.ch RULE, and the only new escalation path in 0.2.0-draft.
+      #
+      # `min_families: 1` is what makes it honest rather than a hair trigger. The condition reads:
+      # abuse.ch contributed adverse points AND at least one adverse signal reached its own
+      # decisiveness threshold (`confidence.decisive_signal_fraction`, 0.8 of its ceiling). Work
+      # the two ends through:
+      #
+      # * A live, payload-backed URLhaus record for the exact URL clears it on its own -- match
+      #   1.0 x online 1.0 x payload 1.0 x fresh 1.0 = decisive. That is the case this rule
+      #   exists for: a file was retrieved from that URL and hashed, and no detection ratio
+      #   argues it away.
+      # * A five-year-old dead listing on a shared hoster does NOT clear it -- host match 0.85 x
+      #   offline 0.6 x no-payload 0.7 x the `fast` profile's tail. It scores, it lands at
+      #   SUSPICIOUS, and the observation names what was actually seen.
+      #
+      # That second case is deliberately more conservative than "any abuse.ch hit forces
+      # MALICIOUS", and it is the one that decided the design: `urlhaus_host` returns a record
+      # for any host that has ever carried a malware URL, which on shared hosting is a fact about
+      # the hoster. Forcing MALICIOUS there is guilt-by-netblock, and it is the failure mode that
+      # would teach an analyst to stop believing the verdict line.
+      #
+      # The stated confidence can only ever LOWER the computed one (the engine takes the weakest
+      # of the two), so HIGH here is a ceiling and not a claim: the same hit on a panel where two
+      # providers answered still renders LOW, and `demote_malicious_when_confidence_low` shows it
+      # as SUSPICIOUS with the raw score beside it.
+      - id: escalation.abusech_observation
+        description: >-
+          abuse.ch holds a record for this indicator and the evidence reached its own decisiveness
+          threshold -- a live payload-backed URLhaus listing, or a ThreatFox IOC attributed to a
+          named malware family at abuse.ch's own high confidence. This is the only source in the
+          panel that observed something rather than aggregating opinions about it.
+        enabled: true
+        requires_providers: [abusech]
+        min_families: 1
         verdict: MALICIOUS
         confidence: HIGH
       - id: escalation.multi_family_corroboration

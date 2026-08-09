@@ -20,6 +20,10 @@ The cases are chosen as the ways a scoring engine gets a SOC to stop trusting it
 ``f`` the control. An engine that can never say "nothing found" is not conservative, it is
       broken, and every clean indicator would burn analyst time.
 ``g`` decade-old abuse reports still scoring at full strength.
+``h`` the two asymmetric providers wired in on 2026-08-09. Tranco may only ever LOWER suspicion,
+      so an unranked domain reading as adverse would flag the honest long tail of the web; RDAP's
+      registration date is the one field that may raise it alone, and an UNKNOWN date must not
+      read as an old one.
 
 Every provider is mocked. Nothing in this file may reach the network -- see the
 ``assert_all_called=False`` respx contexts, which register every route the orchestrator can
@@ -28,7 +32,8 @@ take, and ``tests/conftest.py``'s credential isolation.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional
+import datetime as dt
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import httpx
 import pytest
@@ -42,6 +47,10 @@ SHODAN = "https://api.shodan.io"
 ABUSE = "https://api.abuseipdb.com/api/v2"
 IPINFO = "https://ipinfo.io"
 CF_GRAPHQL = "https://api.cloudflare.com/client/v4/radar/graphql"
+INTERNETDB = "https://internetdb.shodan.io"
+IANA_RDAP = "https://data.iana.org/rdap"
+URLHAUS_HOST = "https://urlhaus-api.abuse.ch/v1/host/"
+THREATFOX = "https://threatfox-api.abuse.ch/api/v1/"
 
 #: Documentation ranges are refused by the non-public guard (``203.0.113.0/24`` is
 #: ``is_private`` in the stdlib), so the unknown-indicator cases use addresses that are public
@@ -53,11 +62,14 @@ PHISH_DOMAIN = "phish-example.test"
 
 @pytest.fixture(autouse=True)
 def provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fake keys for all six providers.
+    """Fake keys for every credentialled provider.
 
     Without them every provider short-circuits to ``missing_api_key`` and each case would
     degrade into a duplicate of the blackout test. The values are obviously fake and
     ``conftest.clear_provider_env`` has already removed the operator's real ones.
+
+    RDAP and Tranco take no credential and are therefore always attempted; there is nothing to
+    set for them.
     """
     for name in (
         "VT_API_KEY",
@@ -66,8 +78,26 @@ def provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "IPINFO_TOKEN",
         "OTX_API_KEY",
         "CLOUDFLARE_API_TOKEN",
+        "ABUSECH_AUTH_KEY",
     ):
         monkeypatch.setenv(name, f"fake-{name.lower()}")
+
+
+@pytest.fixture(autouse=True)
+def no_backoff_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the retry schedule out of the clock.
+
+    Most cases here answer 500 from most providers, and 500 is retryable, so the file otherwise
+    spends its wall-clock sleeping through a schedule none of these tests are about. Widening
+    the panel to eight providers made that cost roughly triple. ``tests/test_backoff.py`` is
+    where the schedule itself is asserted.
+    """
+    import tripper_recon.utils.backoff as backoff
+
+    async def _instant(delay: float, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(backoff.asyncio, "sleep", _instant)
 
 
 # --------------------------------------------------------------------------------------
@@ -158,10 +188,16 @@ def route_ip_providers(
     sh: Optional[Dict[str, Any]] = None,
     ipi: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Register all five per-IP providers plus Cloudflare. ``None`` means a 500, not a silence.
+    """Register every per-IP provider plus Cloudflare. ``None`` means a 500, not a silence.
 
     Every route is registered even when it answers 500, so an unrouted request -- which respx
     would raise on -- stays a signal that the orchestrator went somewhere unexpected.
+
+    The three providers added in roadmap 8.1/8.2/8.7 have no keyword of their own because no
+    case here needs them to succeed; they are routed to 500 so they land in ``errored`` rather
+    than reaching the network. Note the shodan pair: ``api.shodan.io`` and
+    ``internetdb.shodan.io`` fill ONE coverage slot, and which of them runs depends on whether
+    ``SHODAN_API_KEY`` is set, so both are routed and only one is ever called.
     """
     for url, body in (
         (f"{VT}/ip_addresses/{ip}", vt),
@@ -172,6 +208,10 @@ def route_ip_providers(
     ):
         response = httpx.Response(500) if body is None else httpx.Response(200, json=body)
         mock.get(url).mock(return_value=response)
+    mock.get(f"{INTERNETDB}/{ip}").mock(return_value=httpx.Response(500))
+    mock.get(url__startswith=IANA_RDAP).mock(return_value=httpx.Response(500))
+    mock.post(URLHAUS_HOST).mock(return_value=httpx.Response(500))
+    mock.post(THREATFOX).mock(return_value=httpx.Response(500))
     mock.post(CF_GRAPHQL).mock(return_value=httpx.Response(200, json=CF_ASN_OK))
 
 
@@ -267,9 +307,21 @@ async def test_b_unconfigured_providers_are_missing_coverage_not_an_excuse(
 
     verdict = verdict_of(result.data)
     coverage = verdict["coverage"]
-    assert set(coverage["unconfigured"]) >= {"shodan", "otx", "abuseipdb"}
+    assert set(coverage["unconfigured"]) >= {"otx", "abuseipdb"}
     assert coverage["ratio"] < 1.0
     assert verdict["verdict"] == "INSUFFICIENT_DATA"
+
+    # The keyless providers must read as ATTEMPTED, never as unconfigured. Roadmap 8.1 gave the
+    # shodan slot a keyless implementation (InternetDB), and 8.2 added RDAP, which needs no
+    # credential at all. Filing either under "never asked - no API key configured" would be a
+    # false statement about what the tool did, and it would understate the panel a verdict was
+    # actually computed from. Both are routed to 500 above, so both land in ``errored``.
+    unconfigured = set(coverage["unconfigured"])
+    assert "shodan" not in unconfigured, "SHODAN_API_KEY is unset but InternetDB was asked; that is not 'unconfigured'"
+    assert "rdap" not in unconfigured, "RDAP takes no credential and can never be unconfigured"
+    assert {"shodan", "rdap"} <= set(coverage["errored"])
+    # abuse.ch does need a key, so with one set it is attempted rather than filed as absent.
+    assert "abusech" not in unconfigured
 
 
 # --------------------------------------------------------------------------------------
@@ -553,3 +605,224 @@ async def test_g_a_missing_report_date_does_not_discount_the_report() -> None:
     assert "date not reported" in observation
     # And it is the confidence axis, not the score, that absorbs the missing freshness evidence.
     assert results["undated"]["confidence_score"] < results["dated"]["confidence_score"]
+
+
+# --------------------------------------------------------------------------------------
+# h -- the two providers wired in on 2026-08-09 that can move a verdict on their own.
+#
+# Both are asymmetric by design and both fail in a way the unit suites would not catch, because
+# the failure is in what the ASSEMBLED pipeline does with the payload rather than in the
+# extractor. Tranco can only ever lower suspicion, so an unranked domain reading as suspicious
+# would flag the entire honest long tail of the web. RDAP is the opposite: a registration date is
+# the one field in the domain path that can raise suspicion with no reputation evidence at all,
+# and an UNKNOWN date must not read as an old one.
+# --------------------------------------------------------------------------------------
+
+RDAP_REGISTRY = "https://rdap.registry.test/rdap/"
+
+#: A bootstrap file naming a registry host, plus that host added to the allowlist for the test.
+#: Production allowlists no registry at all (docs/OPSEC.md section 6, gap 9), which would make
+#: every one of these cases answer `registry_not_allowlisted` and assert nothing about scoring.
+RDAP_BOOTSTRAP: Dict[str, Any] = {
+    "version": "1.0",
+    "publication": "2026-07-23T00:00:00Z",
+    "services": [[["test"], [RDAP_REGISTRY]]],
+}
+
+
+@pytest.fixture
+def rdap_registry_allowlisted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the fake registry at BOTH places the allowlist is read.
+
+    The runtime hook in ``utils/http`` reads the module global; ``providers/rdap`` reads its own
+    import of the same object. Widening one and not the other raises ``PassiveBoundaryViolation``
+    mid-test -- which is itself a useful demonstration that the hook, not the provider's courtesy
+    check, is the enforcement.
+    """
+    import tripper_recon.utils.http as http_module
+    from tripper_recon.providers import rdap as rdap_module
+
+    wide = frozenset(http_module.ALLOWED_EGRESS_HOSTS | {"rdap.registry.test"})
+    monkeypatch.setattr(http_module, "ALLOWED_EGRESS_HOSTS", wide)
+    monkeypatch.setattr(rdap_module, "ALLOWED_EGRESS_HOSTS", wide)
+    rdap_module.clear_bootstrap_cache()
+
+
+def _rdap_domain_response(registration: Optional[str]) -> Dict[str, Any]:
+    """A minimal, entirely unremarkable RDAP domain object. Only the date varies."""
+    body: Dict[str, Any] = {
+        "objectClassName": "domain",
+        "ldhName": "quiet-domain.test",
+        "status": ["active"],
+        "entities": [
+            {
+                "roles": ["registrar"],
+                "vcardArray": ["vcard", [["fn", {}, "text", "Example Registrar"]]],
+                "entities": [
+                    {"roles": ["abuse"], "vcardArray": ["vcard", [["email", {}, "text", "abuse@registrar.test"]]]}
+                ],
+            }
+        ],
+    }
+    if registration is not None:
+        body["events"] = [{"eventAction": "registration", "eventDate": registration}]
+    return body
+
+
+def _route_quiet_domain(
+    mock: respx.MockRouter,
+    domain: str,
+    *,
+    registration: Optional[str],
+    ranks: List[Dict[str, Any]],
+) -> None:
+    """Every domain-scope provider answering, and none of them adverse except possibly RDAP."""
+    mock.get(f"{VT}/domains/{domain}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "attributes": {
+                        "last_analysis_stats": {"malicious": 0, "suspicious": 0, "harmless": 80, "undetected": 10},
+                        "reputation": 0,
+                        "categories": {},
+                        "last_dns_records": [],
+                        "last_analysis_results": {},
+                        "last_analysis_date": 1754697600,
+                    }
+                }
+            },
+        )
+    )
+    mock.get(f"{OTX}/indicators/domain/{domain}/general").mock(
+        return_value=httpx.Response(200, json={"pulse_info": {"pulses": []}, "malware": [], "passive_dns": []})
+    )
+    mock.get(url__startswith=f"{IANA_RDAP}/dns.json").mock(return_value=httpx.Response(200, json=RDAP_BOOTSTRAP))
+    mock.get(url__startswith=RDAP_REGISTRY).mock(
+        return_value=httpx.Response(200, json=_rdap_domain_response(registration))
+    )
+    mock.get(url__startswith="https://tranco-list.eu/api/ranks/domain/").mock(
+        return_value=httpx.Response(200, json={"ranks": ranks})
+    )
+    mock.post(URLHAUS_HOST).mock(return_value=httpx.Response(200, json={"query_status": "no_results"}))
+    mock.post(THREATFOX).mock(return_value=httpx.Response(200, json={"query_status": "no_result"}))
+
+
+async def _no_addresses(*_args: Any, **_kwargs: Any) -> Sequence[str]:
+    """Resolve to nothing.
+
+    These four cases are about the DOMAIN-level verdict. Letting the name resolve would fan out
+    the eight-provider per-address wave and mix address-scope signals into the assertion, which
+    is a different question with its own tests above.
+    """
+    return []
+
+
+def _iso_days_ago(days: int) -> str:
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _steady_ranks(rank: int) -> List[Dict[str, Any]]:
+    today = dt.datetime.now(dt.timezone.utc).date()
+    return [{"date": str(today - dt.timedelta(days=i)), "rank": rank} for i in range(30)]
+
+
+async def test_h_an_unranked_domain_is_not_suspicious_on_rank_alone(
+    monkeypatch: pytest.MonkeyPatch, rdap_registry_allowlisted: None
+) -> None:
+    """Tranco is a suppressor. Absence from the list must cost a domain nothing.
+
+    The list holds roughly a million names against a public web of hundreds of millions, so
+    "unranked" is the ordinary state of every legitimate small business, hobby project and
+    parish newsletter on the internet. An engine that reads it as adverse does not detect
+    phishing, it detects obscurity -- and it would fire on almost every domain an analyst pastes.
+    """
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _no_addresses)
+
+    with respx.mock(assert_all_called=False) as mock:
+        _route_quiet_domain(mock, "quiet-domain.test", registration=_iso_days_ago(3650), ranks=[])
+        result = await investigate_domain("quiet-domain.test")
+
+    verdict = verdict_of(result.data)
+    assert verdict["verdict"] == "NO_ADVERSE_FINDINGS"
+    assert verdict["score"] == 0
+    # Not merely "the total came out low" -- no Tranco signal may carry points in either
+    # direction, and none may be adverse.
+    tranco_signals = [s for s in verdict["signals"] if s["id"].startswith("tranco.")]
+    assert tranco_signals, "Tranco answered but emitted no signal at all"
+    for signal in tranco_signals:
+        assert signal["points"] == 0
+        assert signal["direction"] != "ADVERSE"
+
+
+async def test_h_being_ranked_does_not_change_the_score_either(
+    monkeypatch: pytest.MonkeyPatch, rdap_registry_allowlisted: None
+) -> None:
+    """The control for the test above: a top-100 rank is worth zero points too.
+
+    Popularity is carried as an observation for a human, not as arithmetic. If a rank could move
+    the score downward it could be gamed upward, and a newly popular malicious domain would buy
+    itself a discount.
+    """
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _no_addresses)
+
+    with respx.mock(assert_all_called=False) as mock:
+        _route_quiet_domain(mock, "quiet-domain.test", registration=_iso_days_ago(3650), ranks=_steady_ranks(42))
+        result = await investigate_domain("quiet-domain.test")
+
+    verdict = verdict_of(result.data)
+    assert verdict["score"] == 0
+    assert all(s["points"] == 0 for s in verdict["signals"] if s["id"].startswith("tranco."))
+
+
+async def test_h_a_three_day_old_domain_is_suspicious_with_no_other_signal(
+    monkeypatch: pytest.MonkeyPatch, rdap_registry_allowlisted: None
+) -> None:
+    """The reason RDAP was added at all.
+
+    Every reputation provider answers "nothing here" for a domain registered on Tuesday, because
+    nobody has reported it yet. That is precisely when the registration date is the only evidence
+    on the screen, and it has to be able to move the verdict on its own.
+    """
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _no_addresses)
+
+    with respx.mock(assert_all_called=False) as mock:
+        _route_quiet_domain(mock, "quiet-domain.test", registration=_iso_days_ago(3), ranks=[])
+        result = await investigate_domain("quiet-domain.test")
+
+    verdict = verdict_of(result.data)
+    assert verdict["verdict"] == "SUSPICIOUS"
+    assert verdict["verdict"] != "NO_ADVERSE_FINDINGS"
+    assert signal_points(verdict, "rdap.domain_age")
+    # And it did so alone: nothing else scored.
+    scoring = [s["id"] for s in verdict["signals"] if s["points"]]
+    assert scoring == ["rdap.domain_age"]
+
+
+async def test_h_an_unknown_registration_date_does_not_read_as_old(
+    monkeypatch: pytest.MonkeyPatch, rdap_registry_allowlisted: None
+) -> None:
+    """A registry that published no registration event told us nothing, not "this is fine".
+
+    Scoring an absent date as zero would make an unanswerable domain indistinguishable from a
+    ten-year-old one -- the exact absence-reads-as-safety failure this whole package is written
+    against. It scores ``domain_age.unknown_points`` instead, which is deliberately smaller than
+    a genuinely new domain scores.
+    """
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _no_addresses)
+
+    with respx.mock(assert_all_called=False) as mock:
+        _route_quiet_domain(mock, "quiet-domain.test", registration=None, ranks=[])
+        result = await investigate_domain("quiet-domain.test")
+
+    verdict = verdict_of(result.data)
+    unknown_points = signal_points(verdict, "rdap.domain_age")
+    assert unknown_points, "an unknown registration date scored nothing, so absence read as safety"
+    assert verdict["verdict"] != "NO_ADVERSE_FINDINGS"
+
+    # Bounded above as well as below: unknown must be worth less than three-days-old, or the
+    # engine would treat every registry that omits the event as a fresh registration.
+    with respx.mock(assert_all_called=False) as mock:
+        _route_quiet_domain(mock, "quiet-domain.test", registration=_iso_days_ago(3), ranks=[])
+        fresh = verdict_of((await investigate_domain("quiet-domain.test")).data)
+    assert unknown_points < signal_points(fresh, "rdap.domain_age")

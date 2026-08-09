@@ -45,6 +45,10 @@ PAYLOAD_EXTRACTORS: Dict[str, Extractor] = {
     "ipinfo": sig.extract_ipinfo_signals,
     "asn_metadata": sig.extract_asn_metadata_signals,
     "domain": sig.extract_domain_signals,
+    "rdap": sig.extract_rdap_signals,
+    "tranco": sig.extract_tranco_signals,
+    "abusech": sig.extract_abusech_signals,
+    "internetdb": sig.extract_internetdb_signals,
 }
 
 
@@ -1193,3 +1197,506 @@ class TestDispatchers:
         # IP-only signals must not appear on the domain path.
         assert SignalId.SHODAN_EXPOSURE.value not in emitted
         assert SignalId.ABUSEIPDB_CONFIDENCE.value not in emitted
+
+
+# =======================================================================================
+# W8 -- the four passive sources wired into the verdict
+# =======================================================================================
+
+
+def _rdap_domain_payload(**overrides: Any) -> Dict[str, Any]:
+    """An RDAP domain record, shaped like ``providers.rdap._domain_payload``."""
+    payload: Dict[str, Any] = {
+        "rdap_registration_date": _iso(400),
+        "rdap_age_days": 400.0,
+        "rdap_expiration_date": _iso(-300),
+        "rdap_registrar_name": "Example Registrar, Inc.",
+        "rdap_status": ["client transfer prohibited"],
+        "rdap_adverse_status": [],
+        "rdap_nameservers": [{"name": "ns1.example.test", "ipv4": [], "ipv6": []}],
+        "rdap_nameserver_names": ["ns1.example.test"],
+        "rdap_nameserver_count": 1,
+        "rdap_dnssec_delegation_signed": False,
+        "rdap_abuse_email": "abuse@registrar.test",
+        "rdap_abuse_phone": "+1.5555550100",
+        "rdap_abuse_contact_source": "abuse_role",
+        "rdap_server_host": "rdap.example-registry.test",
+        "rdap_query_name": "example.test",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestRdapAge:
+    """The reason this provider exists: a domain registered days ago."""
+
+    def test_a_days_old_domain_scores_the_youngest_band(self, cfg: ScoringConfig) -> None:
+        signals = sig.extract_rdap_signals(_rdap_domain_payload(rdap_registration_date=_iso(3)), cfg, NOW)
+        age = _one(signals, SignalId.RDAP_DOMAIN_AGE.value)
+        assert age.direction is sig.SignalDirection.ADVERSE
+        assert age.points == pytest.approx(cfg.domain_age.bands[0].points)
+        assert age.evidence["age_days"] == pytest.approx(3.0, abs=0.01)
+
+    def test_the_age_curve_is_the_shared_domain_age_band_table(self, cfg: ScoringConfig) -> None:
+        """One curve for both age signals: which registry surface reported it changes the
+        provider and therefore the family, never the arithmetic."""
+        for band in cfg.domain_age.bands:
+            days = 1.0 if band.max_age_days is None else float(band.max_age_days) - 0.5
+            if band.max_age_days is None:
+                days = 4000.0
+            signals = sig.extract_rdap_signals(_rdap_domain_payload(rdap_registration_date=_iso(days)), cfg, NOW)
+            assert _one(signals, SignalId.RDAP_DOMAIN_AGE.value).points == pytest.approx(band.points)
+
+    def test_an_unknown_registration_date_is_not_a_safe_one(self, cfg: ScoringConfig) -> None:
+        """The registry answered and published no creation event. Scoring that zero would make
+        it identical to "comfortably old", which is the clean end of the signal."""
+        payload = _rdap_domain_payload(rdap_registration_date=None, rdap_age_days=None)
+        age = _one(sig.extract_rdap_signals(payload, cfg, NOW), SignalId.RDAP_DOMAIN_AGE.value)
+        assert cfg.domain_age.unknown_points > 0
+        assert age.points == pytest.approx(cfg.domain_age.unknown_points)
+        assert age.direction is sig.SignalDirection.ADVERSE
+        assert "not age fine" in age.observation
+
+    def test_the_age_is_recomputed_from_the_injected_clock_not_the_providers_own_figure(
+        self, cfg: ScoringConfig
+    ) -> None:
+        """``rdap_age_days`` was computed against whatever the provider thought the time was.
+        A saved case re-scored later must reproduce the same signal from the same ``now``."""
+        payload = _rdap_domain_payload(rdap_registration_date=_iso(3), rdap_age_days=9999.0)
+        age = _one(sig.extract_rdap_signals(payload, cfg, NOW), SignalId.RDAP_DOMAIN_AGE.value)
+        assert age.evidence["age_days"] == pytest.approx(3.0, abs=0.01)
+        assert age.points == pytest.approx(cfg.domain_age.bands[0].points)
+
+    def test_an_old_domain_earns_no_discount(self, cfg: ScoringConfig) -> None:
+        """An old domain is not clean, it is compromise-eligible. Zero points, never negative,
+        and never EXCULPATORY."""
+        age = _one(sig.extract_rdap_signals(_rdap_domain_payload(), cfg, NOW), SignalId.RDAP_DOMAIN_AGE.value)
+        assert age.points == 0.0
+        assert age.direction is sig.SignalDirection.CONTEXT
+
+    def test_age_does_not_score_on_the_ip_path(self, cfg: ScoringConfig) -> None:
+        signals = sig.extract_rdap_signals(
+            {"rdap_registration_date": _iso(2), "rdap_network_name": "EXAMPLE-NET"},
+            cfg,
+            NOW,
+            scope=IndicatorScope.IP,
+        )
+        assert _by_id(signals, SignalId.RDAP_DOMAIN_AGE.value) == []
+        assert all(signal.points == 0.0 for signal in signals)
+
+
+class TestRdapStatusAndContact:
+    def test_a_registrar_hold_scores(self, cfg: ScoringConfig) -> None:
+        payload = _rdap_domain_payload(
+            rdap_status=["client hold", "pending delete"],
+            rdap_adverse_status=["client hold", "pending delete"],
+        )
+        signal = _one(sig.extract_rdap_signals(payload, cfg, NOW), SignalId.RDAP_ADVERSE_STATUS.value)
+        assert signal.direction is sig.SignalDirection.ADVERSE
+        expected = min(2 * cfg.rdap.points_per_adverse_status, cfg.rdap.max_adverse_status_points)
+        assert signal.points == pytest.approx(expected)
+        assert "client hold" in signal.observation
+
+    def test_no_adverse_status_emits_no_status_signal(self, cfg: ScoringConfig) -> None:
+        assert (
+            _by_id(sig.extract_rdap_signals(_rdap_domain_payload(), cfg, NOW), SignalId.RDAP_ADVERSE_STATUS.value) == []
+        )
+
+    def test_registry_metadata_never_corroborates(self, cfg: ScoringConfig) -> None:
+        """A fourteen-day-old domain plus a registrar hold is one source, not two, and it must
+        never stand in for an independent confirmation of a detection."""
+        payload = _rdap_domain_payload(rdap_registration_date=_iso(3), rdap_adverse_status=["client hold"])
+        for signal in sig.extract_rdap_signals(payload, cfg, NOW):
+            assert signal.family == "registry_meta"
+            assert cfg.counts_toward_corroboration(signal.family) is False
+
+    def test_a_published_abuse_contact_is_reported_and_scores_nothing(self, cfg: ScoringConfig) -> None:
+        signal = _one(sig.extract_rdap_signals(_rdap_domain_payload(), cfg, NOW), sig.RDAP_ABUSE_CONTACT)
+        assert signal.points == 0.0
+        assert signal.direction is sig.SignalDirection.CONTEXT
+        assert "abuse@registrar.test" in signal.observation
+
+    def test_a_missing_abuse_contact_is_mildly_notable(self, cfg: ScoringConfig) -> None:
+        payload = _rdap_domain_payload(rdap_abuse_email=None, rdap_abuse_phone=None, rdap_abuse_contact_source=None)
+        signal = _one(sig.extract_rdap_signals(payload, cfg, NOW), SignalId.RDAP_ABUSE_CONTACT_MISSING.value)
+        assert signal.points == pytest.approx(cfg.rdap.missing_abuse_contact_points)
+        assert "not damning" in signal.observation
+        # Near-zero on purpose: privacy proxying is routine and scoring it hard would flag the
+        # honest long tail.
+        assert signal.max_points < cfg.signals[SignalId.RDAP_DOMAIN_AGE].max_points
+
+    def test_a_registrar_fallback_scores_less_than_nothing_published(self, cfg: ScoringConfig) -> None:
+        payload = _rdap_domain_payload(rdap_abuse_contact_source="registrar_entity_fallback")
+        signal = _one(sig.extract_rdap_signals(payload, cfg, NOW), SignalId.RDAP_ABUSE_CONTACT_MISSING.value)
+        assert signal.points == pytest.approx(cfg.rdap.fallback_abuse_contact_points)
+        assert signal.points < cfg.rdap.missing_abuse_contact_points
+
+    def test_the_registration_note_is_the_incident_report_line(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_rdap_signals(_rdap_domain_payload(), cfg, NOW, indicator="example.test"), sig.RDAP_REGISTRATION
+        )
+        assert signal.points == 0.0
+        assert "Example Registrar" in signal.observation
+        assert "example.test" in signal.observation
+
+
+class TestRdapSupersedesWhois:
+    """One registration date, scored once."""
+
+    def test_rdap_suppresses_the_whois_derived_age(self, cfg: ScoringConfig) -> None:
+        domain_intel = {
+            "virustotal": {**_vt_payload(), "vt_whois": _whois(_iso(4))},
+            "rdap": _rdap_domain_payload(rdap_registration_date=_iso(4)),
+        }
+        emitted = {s.id for s in sig.extract_domain_intel_signals(domain_intel, cfg, NOW, domain="evil.example")}
+        assert SignalId.RDAP_DOMAIN_AGE.value in emitted
+        assert SignalId.DOMAIN_AGE.value not in emitted
+
+    def test_an_rdap_unknown_age_still_suppresses_whois(self, cfg: ScoringConfig) -> None:
+        """Both would otherwise fire at ``unknown_points`` and one unknown would score twice."""
+        domain_intel = {
+            "virustotal": {**_vt_payload(), "vt_whois": "Registrar: Example\n"},
+            "rdap": _rdap_domain_payload(rdap_registration_date=None, rdap_age_days=None),
+        }
+        signals = sig.extract_domain_intel_signals(domain_intel, cfg, NOW, domain="evil.example")
+        assert len(_by_id(signals, SignalId.RDAP_DOMAIN_AGE.value)) == 1
+        assert _by_id(signals, SignalId.DOMAIN_AGE.value) == []
+
+    def test_whois_still_answers_when_rdap_did_not(self, cfg: ScoringConfig) -> None:
+        domain_intel = {"virustotal": {**_vt_payload(), "vt_whois": _whois(_iso(4))}}
+        emitted = {s.id for s in sig.extract_domain_intel_signals(domain_intel, cfg, NOW, domain="evil.example")}
+        assert SignalId.DOMAIN_AGE.value in emitted
+
+
+class TestTrancoIsSuppressionOnly:
+    """Getting this backwards would flag every small legitimate site on the internet."""
+
+    def test_an_unranked_domain_scores_nothing_adverse(self, cfg: ScoringConfig) -> None:
+        signals = sig.extract_tranco_signals(
+            {"tranco_in_list": False, "tranco_days_ranked": 0, "tranco_absence_note": "Not in the Tranco list."},
+            cfg,
+            NOW,
+        )
+        signal = _one(signals, sig.TRANCO_UNRANKED)
+        assert signal.points == 0.0
+        assert signal.direction is not sig.SignalDirection.ADVERSE
+
+    def test_a_ranked_domain_scores_nothing_either(self, cfg: ScoringConfig) -> None:
+        signals = sig.extract_tranco_signals(
+            {"tranco_in_list": True, "tranco_rank": 42, "tranco_best_rank": 40, "tranco_days_ranked": 30},
+            cfg,
+            NOW,
+        )
+        signal = _one(signals, sig.TRANCO_RANK)
+        assert signal.points == 0.0
+        assert signal.max_points == 0.0
+        assert signal.direction is sig.SignalDirection.EXCULPATORY
+
+    def test_no_tranco_payload_can_produce_an_adverse_signal(self, cfg: ScoringConfig) -> None:
+        for payload in (
+            {"tranco_in_list": False, "tranco_days_ranked": 0},
+            {"tranco_in_list": True, "tranco_rank": 1, "tranco_days_ranked": 30},
+            {"tranco_in_list": True, "tranco_rank": 999_999, "tranco_days_ranked": 1},
+        ):
+            for signal in sig.extract_tranco_signals(payload, cfg, NOW):
+                assert signal.direction is not sig.SignalDirection.ADVERSE
+                assert signal.points == 0.0
+
+    def test_a_rank_is_not_an_affirmative_negative(self, cfg: ScoringConfig) -> None:
+        """A popularity rank is not a provider saying "asked, nothing here". Admitting it would
+        let Tranco alone unlock NO_ADVERSE_FINDINGS."""
+        assert sig.TRANCO_RANK not in sig.AFFIRMATIVE_NEGATIVE_SIGNAL_IDS
+        assert sig.TRANCO_UNRANKED not in sig.AFFIRMATIVE_NEGATIVE_SIGNAL_IDS
+
+    def test_the_thresholds_come_from_the_ruleset(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_tranco_signals({"tranco_in_list": True, "tranco_rank": 5, "tranco_days_ranked": 30}, cfg, NOW),
+            sig.TRANCO_RANK,
+        )
+        assert signal.evidence["strong_rank_threshold"] == cfg.tranco.strong_rank
+        assert signal.evidence["steady_days_threshold"] == cfg.tranco.steady_days
+        assert signal.evidence["is_strong"] is True
+        assert signal.evidence["is_steady"] is True
+
+
+def _urlhaus_url_payload(**overrides: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "urlhaus_id": "12345",
+        "urlhaus_url": "http://evil.example/a.bin",
+        "urlhaus_url_status": "online",
+        "urlhaus_online": True,
+        "urlhaus_reference": "https://urlhaus.abuse.ch/url/12345/",
+        "urlhaus_date_added": _iso(2),
+        "urlhaus_payload_count": 1,
+        "urlhaus_payload_last_seen": _iso(1),
+        "urlhaus_signatures": ["CobaltStrike"],
+        "urlhaus_blacklists": {"spamhaus_dbl": "not listed"},
+        "abusech_sources": ["urlhaus"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _threatfox_payload(**overrides: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "threatfox_ioc_count": 2,
+        "threatfox_malware_families": ["Cobalt Strike"],
+        "threatfox_threat_types": ["botnet_cc"],
+        "threatfox_confidence_max": 100,
+        "threatfox_confidence_min": 75,
+        "threatfox_first_seen": _iso(30),
+        "threatfox_last_seen": _iso(5),
+        "threatfox_discarded_partial_matches": 0,
+        "abusech_sources": ["threatfox"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestAbusechIsAnObservation:
+    def test_a_live_payload_backed_url_record_saturates_and_is_decisive(self, cfg: ScoringConfig) -> None:
+        """The case the escalation rule exists for: a file was retrieved from that URL."""
+        signal = _one(
+            sig.extract_abusech_signals(_urlhaus_url_payload(), cfg, NOW, scope=IndicatorScope.URL),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        assert signal.direction is sig.SignalDirection.ADVERSE
+        assert signal.magnitude == pytest.approx(1.0)
+        assert signal.magnitude >= cfg.confidence.decisive_signal_fraction
+        assert "CobaltStrike" in signal.observation
+
+    def test_a_host_level_record_cannot_reach_the_decisive_threshold_alone(self, cfg: ScoringConfig) -> None:
+        """On shared hosting a host hit measures the hoster. Forcing MALICIOUS there is
+        guilt-by-netblock, and this is the arithmetic that stops it."""
+        payload = {
+            "urlhaus_url_count": 12,
+            "urlhaus_urls_returned": 12,
+            "urlhaus_online_urls_in_response": 12,
+            "urlhaus_online": True,
+            "urlhaus_firstseen": _iso(1),
+            "urlhaus_blacklists": {},
+        }
+        signal = _one(
+            sig.extract_abusech_signals(payload, cfg, NOW, scope=IndicatorScope.IP),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        assert signal.points > 0
+        assert signal.magnitude < cfg.confidence.decisive_signal_fraction
+
+    def test_volume_is_not_counted_linearly(self, cfg: ScoringConfig) -> None:
+        """``urlhaus_url_count`` on a shared hoster measures the hoster, not the target."""
+
+        def _magnitude(count: int) -> float:
+            payload = {
+                "urlhaus_url_count": count,
+                "urlhaus_urls_returned": count,
+                "urlhaus_online_urls_in_response": count,
+                "urlhaus_online": True,
+                "urlhaus_firstseen": _iso(1),
+            }
+            return _one(
+                sig.extract_abusech_signals(payload, cfg, NOW, scope=IndicatorScope.IP),
+                SignalId.URLHAUS_LISTING.value,
+            ).magnitude
+
+        assert _magnitude(1) == pytest.approx(_magnitude(500))
+
+    def test_an_offline_record_is_weaker_than_a_live_one(self, cfg: ScoringConfig) -> None:
+        live = _one(
+            sig.extract_abusech_signals(_urlhaus_url_payload(), cfg, NOW, scope=IndicatorScope.URL),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        dead = _one(
+            sig.extract_abusech_signals(
+                _urlhaus_url_payload(urlhaus_online=False, urlhaus_url_status="offline"),
+                cfg,
+                NOW,
+                scope=IndicatorScope.URL,
+            ),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        assert dead.points < live.points
+        assert dead.points > 0
+
+    def test_a_stale_dead_listing_is_not_decisive(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_abusech_signals(
+                _urlhaus_url_payload(
+                    urlhaus_online=False,
+                    urlhaus_url_status="offline",
+                    urlhaus_date_added=_iso(1500),
+                    urlhaus_payload_last_seen=_iso(1500),
+                ),
+                cfg,
+                NOW,
+                scope=IndicatorScope.URL,
+            ),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        assert signal.magnitude < cfg.confidence.decisive_signal_fraction
+
+    def test_the_compromised_legitimate_hint_is_surfaced(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_abusech_signals(
+                _urlhaus_url_payload(urlhaus_blacklists={"spamhaus_dbl": "abused_legit_malware"}),
+                cfg,
+                NOW,
+                scope=IndicatorScope.URL,
+            ),
+            SignalId.URLHAUS_LISTING.value,
+        )
+        assert "compromised" in signal.observation
+
+    def test_a_high_confidence_attributed_ioc_is_decisive(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_abusech_signals(_threatfox_payload(), cfg, NOW, scope=IndicatorScope.IP),
+            SignalId.THREATFOX_IOC.value,
+        )
+        assert signal.magnitude >= cfg.confidence.decisive_signal_fraction
+        assert "Cobalt Strike" in signal.observation
+
+    def test_a_low_confidence_attribution_is_not_decisive(self, cfg: ScoringConfig) -> None:
+        """abuse.ch's own confidence in the ATTRIBUTION drives the magnitude, so a row they are
+        unsure of scores and cannot escalate."""
+        signal = _one(
+            sig.extract_abusech_signals(
+                _threatfox_payload(threatfox_confidence_max=50), cfg, NOW, scope=IndicatorScope.IP
+            ),
+            SignalId.THREATFOX_IOC.value,
+        )
+        assert signal.points > 0
+        assert signal.magnitude < cfg.confidence.decisive_signal_fraction
+
+    def test_a_missing_confidence_level_does_not_discount_the_finding(self, cfg: ScoringConfig) -> None:
+        """Same rule as undated evidence: absent metadata must not argue an indicator cleaner
+        than what the provider actually reported."""
+        signal = _one(
+            sig.extract_abusech_signals(
+                _threatfox_payload(threatfox_confidence_max=None, threatfox_confidence_min=None),
+                cfg,
+                NOW,
+                scope=IndicatorScope.IP,
+            ),
+            SignalId.THREATFOX_IOC.value,
+        )
+        assert signal.evidence["confidence_factor"] == pytest.approx(1.0)
+        assert "no confidence level" in signal.observation
+
+    def test_an_unattributed_ioc_is_weaker(self, cfg: ScoringConfig) -> None:
+        attributed = _one(
+            sig.extract_abusech_signals(_threatfox_payload(), cfg, NOW, scope=IndicatorScope.IP),
+            SignalId.THREATFOX_IOC.value,
+        )
+        bare = _one(
+            sig.extract_abusech_signals(
+                _threatfox_payload(threatfox_malware_families=[]), cfg, NOW, scope=IndicatorScope.IP
+            ),
+            SignalId.THREATFOX_IOC.value,
+        )
+        assert bare.points < attributed.points
+
+    def test_the_wildcard_collision_count_is_surfaced(self, cfg: ScoringConfig) -> None:
+        signal = _one(
+            sig.extract_abusech_signals(
+                _threatfox_payload(threatfox_discarded_partial_matches=40), cfg, NOW, scope=IndicatorScope.IP
+            ),
+            SignalId.THREATFOX_IOC.value,
+        )
+        assert signal.evidence["discarded_partial_matches"] == 40
+        assert "substring collisions" in signal.observation
+
+    def test_a_miss_emits_nothing_and_is_not_an_affirmative_negative(self, cfg: ScoringConfig) -> None:
+        """The provider returns a FAILURE envelope on a miss, so nothing reaches this extractor.
+        "abuse.ch holds no record" is the state of most of the internet."""
+        assert sig.extract_abusech_signals({}, cfg, NOW, scope=IndicatorScope.IP) == []
+        assert sig.extract_abusech_signals({"ok": False, "error": "no_results"}, cfg, NOW) == []
+        assert not any(
+            signal_id.startswith(("urlhaus", "threatfox", "abusech"))
+            for signal_id in sig.AFFIRMATIVE_NEGATIVE_SIGNAL_IDS
+        )
+
+    def test_a_partial_platform_failure_keeps_the_other_half(self, cfg: ScoringConfig) -> None:
+        payload = {**_urlhaus_url_payload(), "abusech_threatfox_error": "no_results"}
+        signals = sig.extract_abusech_signals(payload, cfg, NOW, scope=IndicatorScope.URL)
+        assert len(_by_id(signals, SignalId.URLHAUS_LISTING.value)) == 1
+        assert _by_id(signals, SignalId.THREATFOX_IOC.value) == []
+
+    def test_abusech_is_its_own_family_and_never_shares_one_with_the_aggregators(self, cfg: ScoringConfig) -> None:
+        """VirusTotal and OTX both re-ingest abuse.ch. Sharing a family would make a VT hit
+        derived from URLhaus corroborate URLhaus."""
+        payload = {**_urlhaus_url_payload(), **_threatfox_payload()}
+        families = {s.family for s in sig.extract_abusech_signals(payload, cfg, NOW, scope=IndicatorScope.URL)}
+        assert families == {"curated_feeds"}
+        vt_family = cfg.signals[SignalId.VT_WEIGHTED_DETECTIONS].family
+        otx_family = cfg.signals[SignalId.OTX_PULSE_QUALITY].family
+        assert "curated_feeds" not in {vt_family, otx_family}
+        assert cfg.counts_toward_corroboration("curated_feeds") is True
+
+
+class TestInternetDbSharesTheExposureSlot:
+    INTERNETDB = {
+        "ports": [22, 3389],
+        "hostnames": ["host.example"],
+        "cpe": ["cpe:/a:example:thing"],
+        "tags": ["cloud"],
+        "vulns": ["CVE-2021-44228"],
+        "ip": "198.51.100.7",
+        "source": "shodan_internetdb",
+    }
+
+    def test_the_dispatcher_attributes_the_payload_to_the_dataset_that_produced_it(self, cfg: ScoringConfig) -> None:
+        analysis = {"ip": "198.51.100.7", "shodan": self.INTERNETDB}
+        signal = _one(sig.extract_ip_signals(analysis, cfg, NOW), SignalId.SHODAN_EXPOSURE.value)
+        assert signal.provider == "internetdb"
+        assert "InternetDB" in signal.observation
+
+    def test_the_paid_record_keeps_its_own_attribution(self, cfg: ScoringConfig) -> None:
+        analysis = {
+            "ip": "198.51.100.7",
+            "shodan": {"ports": [3389], "vulns": [], "last_update": _iso(10), "org": "Example"},
+        }
+        signal = _one(sig.extract_ip_signals(analysis, cfg, NOW), SignalId.SHODAN_EXPOSURE.value)
+        assert signal.provider == "shodan"
+        assert signal.observation.startswith("Shodan:")
+
+    def test_the_source_discriminator_matches_the_provider_module(self) -> None:
+        from tripper_recon.providers.internetdb import INTERNETDB_SOURCE
+
+        assert sig.INTERNETDB_SOURCE_VALUE == INTERNETDB_SOURCE
+
+    def test_a_missing_observation_date_is_reported_not_priced_in(self, cfg: ScoringConfig) -> None:
+        """InternetDB carries no ``last_update``. Discounting for that would let a dataset's
+        missing metadata field argue an exposed host cleaner than it is."""
+        signal = _one(sig.extract_internetdb_signals(self.INTERNETDB, cfg, NOW), SignalId.SHODAN_EXPOSURE.value)
+        assert signal.evidence["recency_factor"] == pytest.approx(cfg.undated_evidence.factor)
+        assert "date not reported" in signal.observation
+        assert signal.observed_at is None
+
+    def test_exposure_stays_context_and_ceiling_only_whichever_dataset_answered(self, cfg: ScoringConfig) -> None:
+        signal = _one(sig.extract_internetdb_signals(self.INTERNETDB, cfg, NOW), SignalId.SHODAN_EXPOSURE.value)
+        assert signal.direction is sig.SignalDirection.CONTEXT
+        assert signal.ceiling_only is True
+
+    def test_both_datasets_share_one_family_and_one_ceiling(self, cfg: ScoringConfig) -> None:
+        wiring = cfg.signals[SignalId.SHODAN_EXPOSURE]
+        assert set(wiring.providers) == {"shodan", "internetdb"}
+        assert cfg.family_of("internetdb") == cfg.family_of("shodan")
+
+
+class TestUrlDispatcher:
+    def test_the_url_scope_scores_from_abusech(self, cfg: ScoringConfig) -> None:
+        url_intel = {"abusech": _urlhaus_url_payload(), "virustotal": {"vt_last_analysis_stats": {"malicious": 9}}}
+        signals = sig.extract_url_signals(url_intel, cfg, NOW, url="http://evil.example/a.bin")
+        assert _by_id(signals, SignalId.URLHAUS_LISTING.value)
+
+    def test_virustotal_is_not_scored_at_url_scope_until_the_ruleset_says_so(self, cfg: ScoringConfig) -> None:
+        """Inventing a weight in code for a scope the ruleset has not weighted would put a
+        scoring constant in a .py file."""
+        url_intel = {"virustotal": _vt_payload()}
+        assert sig.extract_url_signals(url_intel, cfg, NOW, url="http://evil.example/") == []
+        url_scoped = {sid.value for sid, s in cfg.signals.items() if IndicatorScope.URL in s.applies_to}
+        assert url_scoped == {SignalId.URLHAUS_LISTING.value, SignalId.THREATFOX_IOC.value}
+
+    def test_an_empty_url_intel_scores_nothing(self, cfg: ScoringConfig) -> None:
+        assert sig.extract_url_signals(None, cfg, NOW) == []
+        assert sig.extract_url_signals({}, cfg, NOW) == []

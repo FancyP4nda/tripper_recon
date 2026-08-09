@@ -55,8 +55,9 @@ pip install .            # or: pip install -e ".[dev]" for the test/lint toolcha
 Runtime dependencies: `httpx[http2]`, `pydantic`, `python-dotenv`, `pyyaml`, `rich`
 ([`pyproject.toml`](pyproject.toml)).
 
-**No configuration is required to try it.** Three providers need no key at all, so
-`tripper-recon asn 15169` works against a completely empty `.env`.
+**No configuration is required to try it.** Six providers need no key at all, so
+`tripper-recon asn 15169` works against a completely empty `.env` — and the `ip` and `domain`
+paths still consult Shodan InternetDB, RDAP and Tranco without one.
 
 ---
 
@@ -64,17 +65,17 @@ Runtime dependencies: `httpx[http2]`, `pydantic`, `python-dotenv`, `pyyaml`, `ri
 
 | Command | What it does | Provider quota |
 |---|---|---|
-| `ip <addr\|file>` | One address, or a file of addresses processed concurrently | 6 providers per address |
-| `domain <name>` | The name itself, then each public address it resolves to | 2 at the domain level, then 6 per address |
-| `url <link>` | The link, then optionally its host and that host's addresses | 1 at the URL level, plus the depths you ask for |
-| `asn <number>` | Routing, peering, prefixes, registry and rank | 10 declared providers, 7 of which need no key |
+| `ip <addr\|file>` | One address, or a file of addresses processed concurrently | 8 providers per address |
+| `domain <name>` | The name itself, then each public address it resolves to | 5 at the domain level, then 8 per address |
+| `url <link>` | The link, then optionally its host and that host's addresses | 2 at the URL level, plus the depths you ask for |
+| `asn <number>` | Routing, peering, prefixes, registry and rank | 11 declared providers, 8 of which need no key |
 | `check <anything>` | Classify a pasted string and route it to the right lookup | routes; `--detect-only` costs **zero** |
 | `bulk [file\|-\|text]` | Extract and triage every indicator in a wall of pasted text | **zero** unless you pass `--investigate` |
 
 ### Worked examples
 
 ```bash
-# An address. Six providers in one wave.
+# An address. Eight providers in one wave.
 tripper-recon ip 8.8.8.8
 
 # A file of addresses: one per line, '#' comments skipped, duplicates collapsed.
@@ -129,9 +130,16 @@ either mode, because a machine consumes it and `evil[.]example` is not a hostnam
 
 ## What the output looks like
 
-> Every block below is real rendered output from this build, captured with the provider responses
-> mocked (`respx`) rather than by querying anyone. The provider payloads are synthetic; the
-> rendering, the scoring and the coverage arithmetic are the code's own.
+> Every block below is real rendered output, captured with the provider responses mocked
+> (`respx`) rather than by querying anyone. The provider payloads are synthetic; the rendering,
+> the scoring and the coverage arithmetic are the code's own.
+>
+> **Captured before the provider panel widened, and not yet re-captured.** Shodan InternetDB,
+> RDAP, Tranco and abuse.ch were wired in on 2026-08-09, taking the `ip` scope from six providers
+> to eight and the `domain` scope from two to five. The denominators in the blocks below —
+> "5 of 6", "0 of 6" — are therefore the old panel. The shapes, the wording and the arithmetic
+> rules are current; the numbers are one release behind. Re-rendering them is outstanding work,
+> and inventing corrected output by hand would be worse than saying so.
 
 ### An address the allowlist recognises, with one provider unconfigured
 
@@ -244,9 +252,13 @@ single engine hit is decisive
 
 ### No keys configured — the most common first run
 
-This is not mocked. With no credentials set, every IP-scope provider returns its missing-key
-envelope before issuing a request, so the run makes **zero** HTTP requests. (An `httpx` client is
-still constructed — `_investigate_ip` opens one around the wave — it is simply never used.)
+**This claim has changed and the block below is the old behaviour.** It used to be true that a
+keyless `ip` run made **zero** HTTP requests, because every IP-scope provider returned its
+missing-key envelope before issuing one. That stopped being true on 2026-08-09: Shodan InternetDB
+and RDAP take no credential, so a keyless run now contacts `internetdb.shodan.io` and
+`data.iana.org` — a keyless run is cheaper, not silent. See [`docs/OPSEC.md`](docs/OPSEC.md)
+section 4. The verdict logic the block illustrates is unchanged: absent data is
+`INSUFFICIENT_DATA`, never `NO_ADVERSE_FINDINGS`.
 
 ```text
 --- IP lookup for 45[.]33[.]32[.]156 ---
@@ -430,10 +442,21 @@ Detail per provider — endpoints, fields kept, fields discarded — is in
 | [RIPEstat](https://stat.ripe.net/) | `asn` | AS overview, abuse contact, routing status, neighbours, announced prefixes |
 | [CAIDA AS-Rank](https://asrank.caida.org/) | `asn` | AS rank, customer cone, transit/peer/customer degree |
 | [PeeringDB](https://www.peeringdb.com/) | `asn` | IXP presence |
+| [Shodan InternetDB](https://internetdb.shodan.io/) | `ip` | Open ports, hostnames, tags, CPEs **and CVEs** — the keyless fallback for the Shodan slot, used when `SHODAN_API_KEY` is unset |
+| [RDAP](https://www.rfc-editor.org/rfc/rfc9224) | `ip`, `domain`, `asn` | Registration date, registrar, abuse contact, EPP status, nameservers, DNSSEC — read from the registry that holds the record. **See the caveat below** |
+| [Tranco](https://tranco-list.eu/) | `domain` | Popularity rank and its steadiness. A false-positive **suppressor**: it can lower suspicion and can never raise it |
 
-**`tripper-recon asn 15169` runs on these three alone, against an empty `.env`.** They cover seven
-of the ten declared ASN providers — RIPEstat contributes five endpoints — so the run reports
-`7 of 10 providers answered` and names the three it could not ask.
+**`tripper-recon asn 15169` runs on RIPEstat, CAIDA and PeeringDB alone, against an empty `.env`.**
+They cover seven of the eleven declared ASN providers — RIPEstat contributes five endpoints — so
+the run reports `7 of 11 providers answered` and names the ones it could not ask.
+
+> **RDAP answers UNKNOWN today, by design, and it is worth understanding why before you rely on
+> it.** RDAP has no single endpoint: a client finds the authoritative registry through IANA's
+> bootstrap files (RFC 9224), so the final host is chosen at runtime. This tool refuses to contact
+> a host nobody reviewed, and no registry host is on the egress allowlist yet — so every RDAP
+> lookup reports `registry_not_allowlisted`, which is **unknown, never clean**, and shows up as
+> missing coverage. Adding registry hosts is a deliberate review step, not a code change:
+> [`docs/OPSEC.md`](docs/OPSEC.md) section 2 and section 6 gap 9.
 
 ### API key required
 
@@ -446,11 +469,18 @@ of the ten declared ASN providers — RIPEstat contributes five endpoints — so
 | [AlienVault OTX](https://otx.alienvault.com/) | `OTX_API_KEY` | `ip`, `domain` | Pulse counts, titles, authors, dates |
 | [Cloudflare Radar](https://radar.cloudflare.com/) | `CLOUDFLARE_API_TOKEN` | `ip`, `asn` | ASN metadata, registry, IXPs |
 | Cloudflare BGP | same token | `asn` | BGP hijack and leak incident counts |
+| [abuse.ch](https://abuse.ch/) URLhaus + ThreatFox | `ABUSECH_AUTH_KEY` | `ip`, `domain`, `url` | Malware-distribution URLs with the retrieved payload's hash, and actor/malware-family attributed IOCs. One free Auth-Key covers both platforms |
 
-Providers used per scope: `ip` intends six, `domain` intends two at the name level and then six per
-resolved address, `url` intends one at the link level plus the depths you request, `asn` intends
-ten. Those declared sets are the denominator of every "N of M answered" line — the tool never
-shrinks the denominator to the providers that happened to be configured.
+> **abuse.ch carries an accepted terms-of-service exposure**, decided 2026-08-09 and recorded
+> rather than mitigated: their terms prohibit automated access by "robot, bot, spider, scraper",
+> and `bulk --investigate` is arguably that. The decision, the exact clauses and the counter-reading
+> are in [`docs/OPSEC.md`](docs/OPSEC.md) section 4a. Nothing about it touches the passive boundary
+> — abuse.ch never contacts the target.
+
+Providers used per scope: `ip` intends eight, `domain` intends five at the name level and then
+eight per resolved address, `url` intends two at the link level plus the depths you request, `asn`
+intends eleven. Those declared sets are the denominator of every "N of M answered" line — the tool
+never shrinks the denominator to the providers that happened to be configured.
 
 A [urlscan.io](https://urlscan.io/) provider (search and result reads only — never submission)
 is implemented and tested, but **no orchestrator calls it yet**. It is not a source of output today.
@@ -470,6 +500,10 @@ ABUSEIPDB_API_KEY=
 IPINFO_TOKEN=
 OTX_API_KEY=
 CLOUDFLARE_API_TOKEN=
+# One free key from https://auth.abuse.ch/ covers both URLhaus and ThreatFox.
+# Read docs/OPSEC.md section 4a before turning this on: the terms-of-service exposure
+# is an accepted risk, not an absent one.
+ABUSECH_AUTH_KEY=
 
 # Behaviour
 # Log level: a number (10=DEBUG, 20=INFO, 30=WARN, 40=ERROR) or a name (DEBUG/INFO/WARN/ERROR).

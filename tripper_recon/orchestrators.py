@@ -97,17 +97,38 @@ import datetime as dt
 import os
 import time
 from ipaddress import ip_address
-from typing import Any, Awaitable, Coroutine, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Dict,
+    FrozenSet,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
+from urllib.parse import urlsplit
 
 import httpx
 
+from tripper_recon.providers import abusech as abusech_provider
+from tripper_recon.providers import internetdb as internetdb_provider
+from tripper_recon.providers import rdap as rdap_provider
+from tripper_recon.providers import tranco as tranco_provider
+from tripper_recon.providers.abusech import abusech_host_summary, abusech_url_summary
 from tripper_recon.providers.abuseipdb import abuseipdb_check
 from tripper_recon.providers.caida import caida_asrank
 from tripper_recon.providers.cloudflare_radar import fetch_asn_metadata
 from tripper_recon.providers.cloudflare_rest import bgp_incidents
+from tripper_recon.providers.internetdb import internetdb_host
 from tripper_recon.providers.ipinfo import ipinfo_asn, ipinfo_ip
 from tripper_recon.providers.otx import otx_domain_pulses, otx_ip_pulses
 from tripper_recon.providers.peeringdb import peeringdb_ixps_for_asn
+from tripper_recon.providers.rdap import rdap_asn, rdap_domain, rdap_ip
 from tripper_recon.providers.ripestat import (
     abuse_contact,
     announced_prefixes,
@@ -116,6 +137,7 @@ from tripper_recon.providers.ripestat import (
     routing_status,
 )
 from tripper_recon.providers.shodan_api import shodan_host
+from tripper_recon.providers.tranco import tranco_rank
 from tripper_recon.providers.virustotal import (
     VT_URL_NO_REPORT_ERROR,
     vt_domain_summary,
@@ -134,12 +156,18 @@ from tripper_recon.types.models import (
     coverage_from_result_data,
     current_run,
 )
-from tripper_recon.utils.http import PassiveBoundaryViolation, create_client, rate_limited
+from tripper_recon.utils.http import (
+    ALLOWED_EGRESS_HOSTS,
+    PassiveBoundaryViolation,
+    create_client,
+    rate_limited,
+)
 from tripper_recon.utils.logging import logger
 from tripper_recon.utils.redact import redact_text, redact_url
 from tripper_recon.utils.urls import HostKind, ParsedURL, RedirectChain, parse_url
 from tripper_recon.utils.validation import dedupe_preserve_order, is_valid_domain, is_valid_ip, normalize_asn
 from tripper_recon.verdict import engine as verdict_engine
+from tripper_recon.verdict import signals as verdict_signals
 from tripper_recon.verdict.config import IndicatorScope, ScoringConfig, default_config
 from tripper_recon.verdict.known_infrastructure import KnownInfrastructure, load_catalogue
 from tripper_recon.verdict.models import Verdict
@@ -182,10 +210,24 @@ NOT_CONFIGURED_ERRORS: FrozenSet[str] = frozenset(
 #: denominator derived from attempts would quietly shrink from six to five and report better
 #: coverage for the worse run. :meth:`Coverage.from_status_map` files an expected provider with
 #: no status entry as ``skipped``, which keeps it in the denominator where it belongs.
-IP_PROVIDERS: Tuple[str, ...] = ("virustotal", "ipinfo", "shodan", "abuseipdb", "otx", "cloudflare_asn")
+#:
+#: ``shodan`` is ONE slot with two implementations (roadmap 8.1). The paid host lookup runs when
+#: ``SHODAN_API_KEY`` is set and the keyless InternetDB extract runs when it is not, so exactly
+#: one of them can ever answer for an address. Listing both would permanently understate coverage
+#: by one for every operator; the payload's ``source`` field says which dataset replied.
+IP_PROVIDERS: Tuple[str, ...] = (
+    "virustotal",
+    "ipinfo",
+    "shodan",
+    "abuseipdb",
+    "otx",
+    "cloudflare_asn",
+    "rdap",
+    "abusech",
+)
 
 #: The domain-level providers, asked about the name itself rather than about an address.
-DOMAIN_PROVIDERS: Tuple[str, ...] = ("virustotal", "otx")
+DOMAIN_PROVIDERS: Tuple[str, ...] = ("virustotal", "otx", "rdap", "tranco", "abusech")
 
 #: The URL-level providers, asked about the whole link rather than about its host.
 #:
@@ -198,7 +240,11 @@ DOMAIN_PROVIDERS: Tuple[str, ...] = ("virustotal", "otx")
 #: section 6 gap 3 records the interim state and why the allowlist entry leads the wiring.
 #: Declared as a tuple rather than counted from the calls made, for the reason on
 #: :data:`IP_PROVIDERS`.
-URL_PROVIDERS: Tuple[str, ...] = ("virustotal_url",)
+#:
+#: abuse.ch joined in the 0.2.0 ruleset. URLhaus is a database *of malware distribution URLs*, so
+#: this scope is where it is strongest: an exact-URL record carries a retrieved file and its hash,
+#: with none of the shared-hosting ambiguity a host-level hit inherits.
+URL_PROVIDERS: Tuple[str, ...] = ("virustotal_url", "abusech")
 
 #: How far a URL investigation pivots, shallowest first. See :func:`investigate_url`.
 #:
@@ -224,7 +270,102 @@ ASN_PROVIDERS: Tuple[str, ...] = (
     "ripe_prefixes",
     "cloudflare_bgp",
     "cloudflare_asn",
+    "rdap",
 )
+
+
+# --------------------------------------------------------------------------------------
+# The egress gate for newly-wired providers
+# --------------------------------------------------------------------------------------
+#
+# Adding a provider to the sets above is only half of wiring it: its host also has to be on
+# ``utils.http.ALLOWED_EGRESS_HOSTS``, on ``ALLOWED_HOSTS`` in ``tests/test_passivity.py``, and in
+# the ``docs/OPSEC.md`` section 2 table. Those three live in files this change does not own, and
+# they land together in the integration commit.
+#
+# Until they do, calling one of these providers would raise ``PassiveBoundaryViolation`` from the
+# httpx request hook -- and ``_call_provider`` re-raises that deliberately, so a single unlisted
+# host would abort every investigation the tool performs. Missing coverage is a gap; an
+# investigation that dies at the first provider is an outage.
+#
+# So the host is checked before the call is built, and an unlisted one becomes an explicit
+# ``skipped`` status entry with the reason attached: the provider stays in the coverage
+# denominator, ``_coverage_warnings`` names it under "never attempted", and nothing goes near a
+# socket. ``providers/rdap.py`` already took this approach for the registry hosts it resolves at
+# runtime, and its reasoning applies unchanged here.
+#
+# **This is not the enforcement.** The request hook is, and it is untouched. This check exists so
+# that an un-allowlisted provider reports missing coverage instead of taking the run down with it,
+# and it reads ``ALLOWED_EGRESS_HOSTS`` live rather than copying it, so it starts passing the
+# moment the integrator adds the entries -- with no second edit here.
+
+
+def _host_of(url: str) -> str:
+    """The hostname of a provider's base URL, lowercased. ``""`` when there is not one."""
+    return (urlsplit(url).hostname or "").lower()
+
+
+#: Every host a newly-wired provider needs, derived from that provider's own module constants
+#: rather than written out here. Two reasons: a literal would drift from the module it describes,
+#: and ``tests/test_passivity.py`` scans this package for URL literals, so the honest way to name
+#: a host in this file is to ask the module that owns it.
+NEW_PROVIDER_EGRESS_HOSTS: Dict[str, Tuple[str, ...]] = {
+    "internetdb": (_host_of(internetdb_provider.INTERNETDB_BASE),),
+    # Only the IANA bootstrap file. The registry host is chosen at runtime from that file and is
+    # checked against the same allowlist inside ``providers/rdap.py``, which reports
+    # ``registry_not_allowlisted`` for a TLD nobody has reviewed.
+    "rdap": (_host_of(rdap_provider.IANA_BOOTSTRAP_BASE),),
+    "tranco": (_host_of(tranco_provider.TRANCO_BASE),),
+    "abusech": (
+        _host_of(abusech_provider.URLHAUS_URL_ENDPOINT),
+        _host_of(abusech_provider.THREATFOX_ENDPOINT),
+    ),
+}
+
+
+def _unpermitted_hosts(provider: str) -> Tuple[str, ...]:
+    """The hosts ``provider`` needs that the egress allowlist does not yet carry."""
+    return tuple(host for host in NEW_PROVIDER_EGRESS_HOSTS.get(provider, ()) if host not in ALLOWED_EGRESS_HOSTS)
+
+
+def _not_allowlisted_call(provider: str, hosts: Sequence[str]) -> ProviderCall:
+    """A ``skipped`` envelope for a provider whose host is not yet permitted.
+
+    ``suppressed`` keeps it out of ``errors``: nothing failed, and an operator reading an error
+    list should not be told an incident occurred because a wiring step is outstanding. The gap
+    is still stated -- ``Coverage`` files it under ``skipped`` and the warning line names it.
+    """
+    joined = ", ".join(hosts)
+    return ProviderCall(
+        provider=provider,
+        outcome=ProviderStatus.SKIPPED,
+        error={
+            "error": "host_not_allowlisted",
+            "hosts": list(hosts),
+            "message": (
+                f"{provider} was not consulted: {joined} is not on the egress allowlist "
+                "(utils/http.ALLOWED_EGRESS_HOSTS). No request was made."
+            ),
+        },
+        summary=f"{provider} | host_not_allowlisted | {joined}",
+        suppressed=True,
+    )
+
+
+async def _call_if_permitted(
+    provider: str,
+    factory: Callable[[], Awaitable[Dict[str, Any]]],
+) -> ProviderCall:
+    """Call ``provider`` when its host is allowlisted; otherwise record that it was skipped.
+
+    ``factory`` is a callable rather than an awaitable so that the coroutine is never even
+    created when the provider is skipped -- an un-awaited coroutine is a warning and, under
+    ``-W error``, a failure.
+    """
+    missing = _unpermitted_hosts(provider)
+    if missing:
+        return _not_allowlisted_call(provider, missing)
+    return await _call_provider(provider, factory())
 
 
 # --------------------------------------------------------------------------------------
@@ -325,6 +466,23 @@ def _env_keys() -> ApiKeys:
         ipinfo_token=os.getenv("IPINFO_TOKEN"),
         otx_api_key=os.getenv("OTX_API_KEY"),
     )
+
+
+#: The abuse.ch Auth-Key variable. Read separately rather than added to :class:`ApiKeys` because
+#: that model lives in ``types/models.py``, which the change that introduced it did not own.
+#:
+#: The two load-bearing pieces are now in place. ``utils.redact._SECRET_ENV_VARS`` carries it,
+#: so the value is stripped from error payloads like every other credential -- and it needs
+#: that more than the others do, because abuse.ch authenticates in a request HEADER, which the
+#: query-parameter redaction cannot see. ``tests/conftest.PROVIDER_ENV_VARS`` clears it, so the
+#: operator's real key cannot reach a test run. Folding the variable into ``ApiKeys`` is
+#: tidying that buys no behaviour and is deliberately left alone.
+ABUSECH_ENV_VAR = "ABUSECH_AUTH_KEY"
+
+
+def _abusech_key() -> Optional[str]:
+    """The abuse.ch Auth-Key, or ``None``. Absence yields ``missing_api_key``, never a request."""
+    return os.getenv(ABUSECH_ENV_VAR)
 
 
 # --------------------------------------------------------------------------------------
@@ -461,7 +619,10 @@ def _suppressed_names(data: Mapping[str, Any]) -> List[str]:
         for name, entry in status_map.items():
             if not isinstance(entry, Mapping) or not entry.get("suppressed"):
                 continue
-            if entry.get("outcome") == ProviderStatus.NOT_CONFIGURED.value:
+            # NOT_CONFIGURED is named by ``Coverage.unconfigured`` and SKIPPED by
+            # ``Coverage.skipped``; repeating either here reads as a second, separate problem.
+            # This list is for calls that were MADE and failed in an expected way.
+            if entry.get("outcome") in {ProviderStatus.NOT_CONFIGURED.value, ProviderStatus.SKIPPED.value}:
                 continue
             names.append(f"{prefix}{name}")
 
@@ -843,21 +1004,46 @@ async def _with_deadline(
 # --------------------------------------------------------------------------------------
 
 
+def _exposure_call(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str) -> Awaitable[ProviderCall]:
+    """One exposure lookup for ``ip``, choosing the paid Shodan record or the keyless extract.
+
+    **The choice is made on key presence, not on the paid call's outcome** (roadmap 8.1). Falling
+    back on a paid 404 would re-ask a second Shodan surface about the same address, doubling the
+    egress to learn nothing: a paid 404 is already a terminal "no record", which is an
+    observation, not a failure to be retried elsewhere.
+
+    The paid record is preferred whenever a key exists, because InternetDB is a strict subset --
+    it drops the per-service banners, the network owner, and ``last_update``. Losing the
+    observation date is the worst of the three: it removes the tool's only means of saying how
+    old an open-port list is, and preferring it for a key-holding operator would be a silent
+    downgrade of something they are paying for.
+    """
+    if keys.shodan_api_key:
+        return _call_provider("shodan", shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip))
+    # Same coverage key: two implementations of one slot, never two slots.
+    return _call_if_permitted("internetdb", lambda: internetdb_host(client=client, ip=ip))
+
+
 async def _ip_provider_wave(*, client: httpx.AsyncClient, keys: ApiKeys, ip: str) -> Dict[str, ProviderCall]:
-    """The five per-IP providers, in one wave."""
-    virustotal, ipinfo, shodan, abuseipdb, otx = await asyncio.gather(
+    """The seven per-IP providers, in one wave."""
+    virustotal, ipinfo, shodan, abuseipdb, otx, rdap, abusech = await asyncio.gather(
         _call_provider("virustotal", vt_ip_summary(client=client, api_key=keys.vt_api_key, ip=ip)),
         _call_provider("ipinfo", ipinfo_ip(client=client, token=keys.ipinfo_token, ip=ip)),
-        _call_provider("shodan", shodan_host(client=client, api_key=keys.shodan_api_key, ip=ip)),
+        _exposure_call(client=client, keys=keys, ip=ip),
         _call_provider("abuseipdb", abuseipdb_check(client=client, api_key=keys.abuseipdb_api_key, ip=ip)),
         _call_provider("otx", otx_ip_pulses(client=client, api_key=keys.otx_api_key, ip=ip)),
+        _call_if_permitted("rdap", lambda: rdap_ip(client=client, ip=ip)),
+        _call_if_permitted("abusech", lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=ip)),
     )
     return {
         "virustotal": virustotal,
         "ipinfo": ipinfo,
+        # Keyed ``shodan`` whichever implementation ran; the payload's ``source`` says which.
         "shodan": shodan,
         "abuseipdb": abuseipdb,
         "otx": otx,
+        "rdap": rdap,
+        "abusech": abusech,
     }
 
 
@@ -895,6 +1081,8 @@ def _ip_entry(ip: str, calls: Mapping[str, ProviderCall], asn_meta: Dict[str, An
         "ipinfo": calls["ipinfo"].data,
         "abuseipdb": calls["abuseipdb"].data,
         "otx": calls["otx"].data,
+        "rdap": calls["rdap"].data,
+        "abusech": calls["abusech"].data,
         "asn_meta": asn_meta,
         "provider_status": status,
         # Per address, not only per run: on the domain path each address gets its own panel,
@@ -943,6 +1131,8 @@ async def _investigate_ip(ip: str) -> InvestigationResult:
             "shodan": calls["shodan"].data,
             "abuseipdb": calls["abuseipdb"].data,
             "otx": calls["otx"].data,
+            "rdap": calls["rdap"].data,
+            "abusech": calls["abusech"].data,
             "asn_meta": asn_meta,
             "provider_status": _status_map(calls),
         }
@@ -1092,9 +1282,12 @@ async def _collect_domain(
     OTX are asked about the name either way, and VirusTotal's passive A/AAAA records still
     arrive in ``intel``.
     """
-    vt_domain, otx_domain = await asyncio.gather(
+    vt_domain, otx_domain, rdap_call, tranco_call, abusech_call = await asyncio.gather(
         _call_provider("virustotal_domain", vt_domain_summary(client=client, api_key=keys.vt_api_key, domain=domain)),
         _call_provider("otx_domain", otx_domain_pulses(client=client, api_key=keys.otx_api_key, domain=domain)),
+        _call_if_permitted("rdap", lambda: rdap_domain(client=client, domain=domain)),
+        _call_if_permitted("tranco", lambda: tranco_rank(client=client, domain=domain)),
+        _call_if_permitted("abusech", lambda: abusech_host_summary(client=client, api_key=_abusech_key(), host=domain)),
     )
 
     intel: Dict[str, Any] = {}
@@ -1104,8 +1297,20 @@ async def _collect_domain(
         passive_ips = _passive_ips_from_vt(vt_domain.data)
     if otx_domain.ok:
         intel["otx"] = otx_domain.data
+    if rdap_call.ok:
+        intel["rdap"] = rdap_call.data
+    if tranco_call.ok:
+        intel["tranco"] = tranco_call.data
+    if abusech_call.ok:
+        intel["abusech"] = abusech_call.data
 
-    calls = {"virustotal": vt_domain, "otx": otx_domain}
+    calls = {
+        "virustotal": vt_domain,
+        "otx": otx_domain,
+        "rdap": rdap_call,
+        "tranco": tranco_call,
+        "abusech": abusech_call,
+    }
     provider_errors, messages = _collect_errors(calls)
 
     if not resolve_addresses:
@@ -1406,13 +1611,20 @@ async def _investigate_url(parsed: ParsedURL, *, depth: str) -> InvestigationRes
     resolved_actively = False
 
     async with create_client() as client:
-        url_calls = {
-            "virustotal_url": await _call_provider(
-                "virustotal_url", vt_url_summary(client=client, api_key=keys.vt_api_key, url=target)
-            )
-        }
-        if url_calls["virustotal_url"].ok:
-            url_intel["virustotal"] = url_calls["virustotal_url"].data
+        vt_url_call, abusech_url_call = await asyncio.gather(
+            _call_provider("virustotal_url", vt_url_summary(client=client, api_key=keys.vt_api_key, url=target)),
+            # The exact-URL abuse.ch lookup: URLhaus's own URL endpoint plus an EXACT ThreatFox
+            # search. This is the strongest form of the abuse.ch observation -- a record for this
+            # link rather than for something that once happened on its host.
+            _call_if_permitted(
+                "abusech", lambda: abusech_url_summary(client=client, api_key=_abusech_key(), url=target)
+            ),
+        )
+        url_calls = {"virustotal_url": vt_url_call, "abusech": abusech_url_call}
+        if vt_url_call.ok:
+            url_intel["virustotal"] = vt_url_call.data
+        if abusech_url_call.ok:
+            url_intel["abusech"] = abusech_url_call.data
 
         url_errors, url_messages = _collect_errors(url_calls)
         result_errors.extend(url_messages)
@@ -1517,11 +1729,17 @@ def _adjudicate_url(result: InvestigationResult, *, parsed: ParsedURL, host_is_a
     the screen. The URL verdict lands on ``data['verdict']``, the host's on
     ``data['host_verdict']``, and each address's on its own entry in ``data['ips']``.
 
-    **The URL verdict is honest about being unscored.** ``verdict/scoring.yaml`` declares no
-    signal whose ``applies_to`` includes ``url``, so the engine is handed an empty signal list
-    and returns ``INSUFFICIENT_DATA`` -- which is the true answer, not a degradation. It becomes
-    a real score the day ``url.*`` signal ids and their weights land in the ruleset; wiring the
-    scope now means that day needs no change here.
+    **The URL scope now scores, but only from abuse.ch.** ``urlhaus.listing`` and
+    ``threatfox.ioc`` are the only signals in the ruleset whose ``applies_to`` includes ``url``,
+    which is the right first pair: URLhaus is a database *of malware distribution URLs*, so an
+    exact-URL record carries a retrieved file and its hash with none of the shared-hosting
+    ambiguity a host-level hit inherits.
+
+    VirusTotal's URL report is collected and rendered and is deliberately **not** scored: the
+    ruleset declares no ``vt.*`` signal for this scope, and inventing one in code would put a
+    scoring constant in a ``.py`` file. Until those weights land, a URL with no abuse.ch record
+    scores nothing and the verdict says ``INSUFFICIENT_DATA`` -- which is the true answer here,
+    not a degradation.
     """
     tools, reason = _adjudicator()
     if tools is None:
@@ -1533,7 +1751,9 @@ def _adjudicate_url(result: InvestigationResult, *, parsed: ParsedURL, host_is_a
         verdict = verdict_engine.evaluate(
             indicator=parsed.masked_url,
             scope=IndicatorScope.URL,
-            signals=(),
+            signals=verdict_signals.extract_url_signals(
+                result.data.get("url_intel"), tools.cfg, tools.now, url=parsed.masked_url
+            ),
             coverage=result.coverage_or_unknown,
             cfg=tools.cfg,
             now=tools.now,
@@ -1635,6 +1855,7 @@ async def _investigate_asn(
             ap,
             cf_bgp,
             cf,
+            rdap_call,
         ) = await asyncio.gather(
             _call_provider("ipinfo_asn", ipinfo_asn(client=client, token=keys.ipinfo_token, asn=asn_int)),
             _call_provider("ripe_overview", as_overview(client=client, asn=asn_int)),
@@ -1652,6 +1873,7 @@ async def _investigate_asn(
                 "cloudflare_asn",
                 fetch_asn_metadata(client=client, api_token=keys.cloudflare_api_token, asn=asn_int),
             ),
+            _call_if_permitted("rdap", lambda: rdap_asn(client=client, asn=asn_int)),
         )
 
         calls: Dict[str, ProviderCall] = {
@@ -1665,6 +1887,7 @@ async def _investigate_asn(
             "ripe_prefixes": ap,
             "cloudflare_bgp": cf_bgp,
             "cloudflare_asn": cf,
+            "rdap": rdap_call,
         }
         provider_errors, result_errors = _collect_errors(calls)
 
@@ -1805,6 +2028,11 @@ async def _investigate_asn(
             "asn": asn_int,
             "meta": meta,
             "bgp": meta_bgp,
+            # Published under its own key rather than merged into ``meta``. The RIR's allocation
+            # record and the aggregate the other nine providers build are different claims with
+            # different provenance, and ``meta`` already resolves conflicts by precedence -- an
+            # RDAP field folded in there would become indistinguishable from an IPinfo one.
+            "rdap": rdap_call.data,
             "provider_status": _status_map(calls),
         }
         if provider_errors:

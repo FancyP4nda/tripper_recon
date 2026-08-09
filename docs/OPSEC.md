@@ -30,14 +30,16 @@ that class and there must never be one.
 
 ## 2. Every outbound destination
 
-Twelve outbound paths appear below. Eleven go to a third party that is not the target. Every one
-of them is enforced at runtime by the egress allowlist (`utils/http.py:63`), which raises
-`PassiveBoundaryViolation` before a socket opens for any host not on this table.
+Sixteen outbound destinations appear below, plus the system resolver. Every one of the sixteen is
+a third party that is not the target, and every one is enforced at runtime by the egress allowlist
+(`utils/http.py:63`), which raises `PassiveBoundaryViolation` before a socket opens for any host
+not on this table.
 
 | Provider | Host contacted | Reaches target infrastructure? |
 |---|---|---|
 | VirusTotal | `www.virustotal.com` | No |
 | Shodan | `api.shodan.io` | No |
+| Shodan InternetDB | `internetdb.shodan.io` | No |
 | AbuseIPDB | `api.abuseipdb.com` | No |
 | IPInfo | `ipinfo.io` | No |
 | AlienVault OTX | `otx.alienvault.com` | No |
@@ -46,8 +48,54 @@ of them is enforced at runtime by the egress allowlist (`utils/http.py:63`), whi
 | RIPEstat | `stat.ripe.net` | No |
 | CAIDA AS-Rank | `api.asrank.caida.org` | No |
 | PeeringDB | `www.peeringdb.com` | No |
+| Tranco | `tranco-list.eu` | No |
+| **abuse.ch URLhaus** | `urlhaus-api.abuse.ch` | No — `POST`, and a query. See section 7 |
+| **abuse.ch ThreatFox** | `threatfox-api.abuse.ch` | No — `POST`, and a query. See section 7 |
+| **RDAP bootstrap** | `data.iana.org` | No — a static file. The indicator is never sent |
+| **RDAP registry** | chosen at runtime from the bootstrap file. **None is allowlisted today** | No — see below |
 | **urlscan.io** | `urlscan.io` | No — see below |
 | **System resolver** | your configured DNS resolver | **Yes, indirectly** — see section 3 |
+
+**RDAP has a dynamic destination, and that is handled by refusing rather than by widening.** RDAP
+deliberately has no single endpoint: each TLD and each RIR runs its own server, and a client finds
+the right one through a bootstrap step (STD 95, RFC 9224). `providers/rdap.py` does that step
+client-side — it fetches IANA's static JSON files (`IANA_BOOTSTRAP_BASE`, `rdap.py:137`), caches
+them for the process, and resolves the authoritative base URL locally. The alternative, the
+`rdap.org` aggregator, answers `302` and would mean following a redirect to a host chosen at
+runtime; that is the exact hole this allowlist exists to close, and it is forbidden outright by
+section 7.
+
+Three properties follow, and each is checkable:
+
+- **The indicator never goes to an intermediary.** IANA serves a file and learns nothing about
+  what is being investigated. Only the registry that holds the record sees the query.
+- **No redirect is ever followed.** Both requests in the module set `follow_redirects=False`
+  explicitly (`rdap.py:480`, `:723`), and a `3xx` from a registry is reported as
+  `unexpected_redirect` with the host it named (`rdap.py:199`) so that host can be reviewed
+  deliberately instead of a client silently visiting it.
+- **The resolved host is checked before a request is built.** `providers/rdap.py` reads the same
+  `ALLOWED_EGRESS_HOSTS` the runtime hook reads and returns `registry_not_allowlisted`
+  (`rdap.py:196`) — naming the host, with no request made — when it is not on the list. That check
+  is a courtesy, not the enforcement: the hook in `utils/http.py` raises regardless, which was
+  verified by disabling the provider-side check and watching `PassiveBoundaryViolation` fire.
+
+**Which registries are approved, and which are deliberately not.** The high-volume registries were
+read from the IANA bootstrap files on 2026-08-09 (`dns.json` carries 292 service entries;
+`ipv4.json` and `asn.json` carry the five RIRs) and allowlisted host by host: the five RIRs for
+`ip` and `asn` lookups, and the gTLD/ccTLD registries behind the highest query volume and the
+heaviest phishing use. The long tail is **not** allowlisted and fails closed with
+`registry_not_allowlisted`, which names the exact host to add — an unlisted TLD therefore degrades
+to a stated UNKNOWN rather than to a silent miss.
+
+Two registries are **deliberately absent**: `rdap.nic.ru` (`.ru`) and `rdap.cnnic.cn` (`.cn`). Both
+are the genuine authoritative registries and both would work. But an RDAP query tells the registry
+which domain is being investigated, and when. Handing that to a Russian or Chinese registry is a
+disclosure decision that belongs to the operator, not to a default shipped in a tool. Both fail
+closed with the host named, so enabling either is one reviewed line in `utils/http.py`.
+
+The safety property that makes any of this acceptable: **the resolved host is a function of the
+TLD, never of the indicator.** A target that registers `evil.com` cannot influence which server
+answers `.com` RDAP, so this lookup cannot be steered at infrastructure the target controls.
 
 VirusTotal is used correctly for a passive tool: the provider module issues `GET` requests against
 reports that already exist, for IPs, domains and URLs alike
@@ -117,9 +165,13 @@ Passive does not mean invisible. It means the *target* does not see you. The pro
 - **Every query is attributable to your API key.** A VirusTotal lookup is logged against your
   account. Assume your employer, the provider, and anyone with access to provider logs can see
   which indicators you investigated and when.
-- **Your egress IP is visible** to every provider the tool actually queries — the ten wired
-  provider modules. `providers/urlscan.py` is the eleventh module and no orchestrator calls it, so
-  urlscan.io sees nothing today (section 6, gap 3).
+- **Your egress IP is visible** to every provider the tool actually queries — the wired provider
+  modules in the section 2 table. `providers/urlscan.py` is written but no orchestrator calls it,
+  so urlscan.io sees nothing today (section 6, gap 3).
+- **A keyless provider identifies you by egress IP and nothing else, which cuts both ways.** Shodan
+  InternetDB, Tranco and RDAP take no credential, so the lookup is not attributable to an account
+  — but the address is still the identifier the provider rate-limits and logs on, and it is the
+  address your whole organisation shares. Keyless is cheaper, not quieter.
 - **The indicator list itself is sensitive.** The set of things you are looking at can reveal an
   ongoing incident before you are ready to disclose it.
 - **Look-ups are not submissions.** Nothing in this tool contributes your indicators to a public
@@ -127,6 +179,45 @@ Passive does not mean invisible. It means the *target* does not see you. The pro
 
 If an investigation is sensitive enough that provider visibility is itself a risk, this tool is
 the wrong instrument. Use an offline data set.
+
+## 4a. Accepted risk: the abuse.ch terms of use
+
+**Decision date: 2026-08-09. This is an accepted risk, recorded rather than mitigated.** It is not
+a warning to be actioned and it is not an open item; `docs/ROADMAP.md` §4b decision Q5 settles it
+and it is not to be re-litigated.
+
+**What was accepted.** abuse.ch's Terms and Conditions prohibit automated access in broad terms.
+Clause 6.2: "You shall not conduct, facilitate, authorize or permit any text or data mining or web
+scraping in relation to our site or any services provided via, or in relation to, our site."
+Clause 6.2.1 names the mechanism: "Any 'robot', 'bot', 'spider', 'scraper' or other automated
+device, program, tool, algorithm, code, process or methodology to access, obtain, copy, monitor or
+republish any portion of the site or any data, content, information or services accessed via the
+same." (abuse.ch Terms and Conditions, retrieved 2026-08-09.)
+
+Tripper Recon is a script that queries the URLhaus and ThreatFox APIs. `bulk --investigate` issues
+one lookup per indicator in a file with no ceiling other than the global concurrency limiter, which
+is the shape clause 6.2.1 describes. **The operator has decided to build it in full, including
+bulk mode, with no gate**, and to carry the exposure rather than engineer around it.
+
+**The counter-reading, stated so the decision is legible rather than flattering.** abuse.ch's own
+API documentation supplies `curl` and `wget` invocations, requires an `Auth-Key` obtained from
+their authentication portal, and states that the API "is available free of charge under the fair
+use principles" (URLhaus API and ThreatFox API documentation, retrieved 2026-08-09). A published
+API with issued credentials and worked command-line examples is an invitation to automate; the
+site-wide terms read as though it is not. The two documents are in tension, and per-indicator
+interactive lookups plausibly sit inside "fair use". Bulk mode is the part that does not.
+
+**What this means operationally, in one sentence each:**
+
+- The exposure is contractual, not technical. Nothing here touches the passive boundary — abuse.ch
+  never contacts the target, and neither endpoint submits anything (section 7).
+- The remedy if abuse.ch objects is to stop, not to obfuscate. Do not rotate keys, spread requests
+  across addresses, or change the User-Agent to look like a browser; the honest User-Agent is a
+  control (section 5), and evading a terms enforcement would convert an accepted contractual risk
+  into a deliberate one.
+- Commercial use has a different answer. abuse.ch directs commercial users to the Spamhaus
+  offering. If this tool ever becomes part of paid work, that is the route, and it is a decision
+  for the operator before the fact rather than after.
 
 ## 5. Controls already in the code
 
@@ -140,6 +231,9 @@ the wrong instrument. Use an offline data set.
 | TLS verification on, never disabled | `utils/http.py:174` |
 | Honest User-Agent — the tool names itself rather than impersonating a browser | `utils/http.py:128` |
 | API keys redacted from every error payload, including the failing request URL | `utils/redact.py`, `orchestrators.py:251` |
+| The abuse.ch Auth-Key travels in a request **header**, which query-parameter redaction cannot see, so it is redacted by literal value from the environment | `ABUSECH_AUTH_KEY` in `utils/redact._SECRET_ENV_VARS` |
+| **No RDAP redirect is followed**, and the registry host resolved from IANA's bootstrap file is checked against the egress allowlist before a request is built | `providers/rdap.py:480`, `:723` (`follow_redirects=False`), `:196` (`registry_not_allowlisted`) |
+| **The test suite cannot reach a live provider.** An unmocked request raises instead of going out, so a forgotten mock fails the build rather than spending quota under the operator's egress IP | `tests/conftest.py::no_real_network` |
 | Redirect chains reported as NOT RESOLVED unless a third party's scan supplied one | `utils/urls.py:236-322` |
 | Every hop of a passively-sourced redirect chain is **defanged** in human-facing output, so a report pasted into a ticket or a chat client carries no clickable target URL | `reporting/console.py:1857` |
 | A URL whose **host** is a non-public address is withheld at triage as well as refused at the orchestrator | `cli.py:1116-1117` (triage), `orchestrators.py:1334` (orchestrator) |
@@ -183,12 +277,30 @@ These are real and open. They are tracked in `docs/ROADMAP.md`.
    computes the A-label and records `HOST_MIXED_SCRIPT`, but `types/indicators.detect` does not
    carry either into the triage row. The row is marked `probable` rather than `certain`, which is
    a hint and not a warning.
-8. **A future provider will ask for `follow_redirects=True`.** `docs/ROADMAP.md` item 8.2 proposes
-   RDAP via `rdap.org`, which answers with a 30x to the authoritative registry server. That is a
-   redirect **within provider infrastructure**, not a fetch of the target, so it is not the thing
-   section 7 forbids — but the distinction is one sentence wide and the flag is set per-request on
-   a shared client. If that provider lands, the redirect must be bounded to allowlisted hosts and
-   the exception written into section 7 explicitly, not inherited by every other call.
+8. **~~A future provider will ask for `follow_redirects=True`.~~ CLOSED, and closed the other
+   way.** This gap anticipated RDAP arriving via the `rdap.org` aggregator, which answers `302`,
+   and warned that the flag would have to be bounded to allowlisted hosts. RDAP landed
+   (`providers/rdap.py`) and **does not use the aggregator and does not follow redirects at all**:
+   it bootstraps from IANA's static files client-side and calls the registry directly, with
+   `follow_redirects=False` set explicitly on both requests and a `3xx` reported as
+   `unexpected_redirect` rather than followed. No exception was written into section 7, because
+   none was needed. A grep of the package for `follow_redirects` returns exactly those two `False`
+   settings and nothing else. The gap is retained rather than deleted so the next provider that
+   wants the flag finds the reasoning that refused it.
+9. **RESOLVED 2026-08-09: the registry allowlist was reviewed and populated.** This gap read "no
+   registry RDAP host is allowlisted, so RDAP answers UNKNOWN for everything", which was true as
+   shipped and made the highest-value source in W8 inert. The five RIRs plus the high-volume
+   gTLD/ccTLD registries were read from the IANA bootstrap files and added host by host; `.ru` and
+   `.cn` were reviewed and deliberately excluded. See section 2. What remains is the long tail of
+   ~270 further service entries, which stay unlisted on purpose: each is a party that would learn
+   the operator's indicator list, and an unlisted TLD fails closed with the host named rather than
+   failing silently.
+
+   Note the structural constraint before attempting it: `tests/test_passivity.py`'s
+   `test_allowlist_has_no_dead_entries` requires every allowlisted host to appear as a URL literal
+   somewhere in the package, and `providers/rdap.py` is pinned by its own test to exactly one
+   literal (`data.iana.org`). A reviewed registry table therefore needs somewhere to live that is
+   neither of those two places.
 
 ## 7. Endpoints that must never be added
 
@@ -221,7 +333,42 @@ to trust:
 2. **Resolved-path checks** (section 5 of `tests/test_passivity.py`) rebuild the destination of
    every `client.<verb>(...)` call through the module constants that assemble it, then assert
    that no resolved path ends at a submission collection, that `analyses` appears nowhere, and
-   that **every non-GET request goes to the one pinned read-only query endpoint** (Cloudflare's
-   Radar GraphQL API, which is POST but reads). This is what distinguishes
-   `GET .../api/v3/urls/{url_id}` from `POST .../api/v3/urls`, which no substring can do, and it
-   is what closes the "hide the path in a constant" walkaround.
+   that **every non-GET request goes to one of the pinned read-only query endpoints**
+   (`NON_GET_DESTINATIONS`). This is what distinguishes `GET .../api/v3/urls/{url_id}` from
+   `POST .../api/v3/urls`, which no substring can do, and it is what closes the "hide the path in
+   a constant" walkaround.
+
+### POST-as-QUERY: why four POSTs are not four submissions
+
+**Do not "fix" these into `GET`s. They cannot be, and the verb is not what makes a request
+active.** A submission is a request that makes the provider go and *look at the target*. A query
+is a request that makes the provider *read its own database*. HTTP verbs do not distinguish the
+two, and three of the APIs this tool uses take their queries in a request body:
+
+| Call | Body | Why it is a query |
+|---|---|---|
+| Cloudflare Radar GraphQL (`providers/cloudflare_radar.py`, ×2) | GraphQL document | GraphQL is POST-only by design. It reads Radar's aggregates; there is no write route on it |
+| abuse.ch URLhaus `POST /v1/url/` (`abusech.py:108`) | form field `url=` | Looks up whether URLhaus already holds a record for that URL. abuse.ch does not fetch it |
+| abuse.ch URLhaus `POST /v1/host/` (`abusech.py:113`) | form field `host=` | Same, keyed by host. Accepts an IPv4 address, a hostname or a domain |
+| abuse.ch ThreatFox `POST /api/v1/` (`abusech.py:116`) | JSON `{"query": "search_ioc", ...}` | One endpoint dispatching on a selector. This tool sends exactly one selector, `search_ioc` (`THREATFOX_SEARCH_QUERY`, `abusech.py:121`), named as a constant so a reviewer can see no write selector is reachable |
+
+**The ThreatFox endpoint is the one to watch**, because its URL is shared between read and write
+operations — the selector, not the path, is what makes the call passive. That is why
+`THREATFOX_SEARCH_QUERY` is a module constant rather than an inline string.
+
+**What stops any of these drifting into a submission**, since the allowlist is host-level and
+would not:
+
+- `PINNED_POST_SITES` in `tests/test_passivity.py` pins each call site by *module and constant
+  name* and by *how many times it appears*, so a fourth abuse.ch POST fails the build.
+- `test_abusech_query_endpoint_constants_are_unchanged` and
+  `test_radar_graphql_endpoint_constant_is_unchanged` pin each constant's resolved *value*,
+  because pinning by name is worthless if the name can be repointed. The abuse.ch check resolves
+  through `URLHAUS_BASE`, so moving the base is caught too.
+- `test_every_non_get_request_goes_to_the_one_pinned_query_endpoint` asks the same question of the
+  statically resolved destination rather than of the constant's name.
+
+Neither abuse.ch endpoint submits anything. Both platforms have separate, credentialled submission
+routes; this package does not name them anywhere, and adding one would be the change this section
+exists to prevent. The terms-of-service exposure that *does* attach to abuse.ch is contractual and
+is recorded in section 4a, not here.

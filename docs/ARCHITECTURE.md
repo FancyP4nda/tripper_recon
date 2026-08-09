@@ -21,8 +21,10 @@ never contacts the indicator itself, with one disclosed exception covered in sec
 There is no server and no REST API. An earlier FastAPI entry point was deleted, and
 `tests/test_server_removed.py` fails the build if one comes back.
 
-The tool ships ten providers plus urlscan.io. Three of them need no credential at all
-(RIPEstat, CAIDA AS-Rank, PeeringDB), so `tripper-recon asn 15169` works with an empty `.env`.
+The tool ships fourteen provider modules plus urlscan.io, which is written but not wired. Six need
+no credential at all (RIPEstat, CAIDA AS-Rank, PeeringDB, Shodan InternetDB, RDAP, Tranco), so
+`tripper-recon asn 15169` works with an empty `.env` -- and, since 2026-08-09, an empty `.env` no
+longer means a run makes no requests at all.
 
 ---
 
@@ -360,13 +362,22 @@ than "reports the gap," the path is wrong.
 The target is never contacted. `ALLOWED_EGRESS_HOSTS` (`utils/http.py:63`) is the complete list of
 hosts this tool may reach, and the target can never be on it.
 
+One provider has a destination that is genuinely dynamic. RDAP's authoritative server is chosen at
+runtime from IANA's bootstrap files (RFC 9224), which a static allowlist cannot enumerate in
+advance. That is resolved by refusing rather than by widening: `providers/rdap.py` bootstraps
+client-side, follows no redirects, and checks the resolved host against this same set before it
+builds a request -- returning `registry_not_allowlisted`, an explicit UNKNOWN, otherwise. No
+registry host is allowlisted today (`docs/OPSEC.md` section 6, gap 9).
+
 Two halves enforce this, and they are complementary rather than redundant:
 
 * **The static gate fails the build.** `tests/test_passivity.py` parses the package source. It
   checks that every URL literal targets an allowlisted host, that no forbidden endpoint appears
   (`FORBIDDEN_MARKERS`, `test_passivity.py:148`, covering VirusTotal URL submission, urlscan scan
-  submission, DNSBL lookups, redirect following and more), that the only POST goes to the pinned
-  Cloudflare Radar GraphQL endpoint, and that name resolution appears in exactly one module.
+  submission, DNSBL lookups, redirect following and more), that every non-GET request goes to one
+  of the pinned read-only query endpoints (`NON_GET_DESTINATIONS`: Cloudflare's Radar GraphQL and
+  the two abuse.ch platforms, each pinned by constant NAME and by resolved VALUE), and that name
+  resolution appears in exactly one module.
 * **The runtime hook fails the run.** A static scan sees literals. It cannot see a host assembled
   at run time, and `client.get("https://" + target_host + "/")` passes every static check while
   being a direct fetch of the target. The event hook in `create_client` catches that one.

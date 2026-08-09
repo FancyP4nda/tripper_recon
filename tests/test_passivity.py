@@ -89,6 +89,56 @@ ALLOWED_HOSTS: set[str] = {
     # (FORBIDDEN_MARKERS below, docs/OPSEC.md section 7), and the screenshot base
     # (URLSCAN_SCREENSHOT_BASE, same host) is emitted as a link and never retrieved.
     "urlscan.io",
+    # Shodan InternetDB — INTERNETDB_BASE, providers/internetdb.py. The keyless sibling of
+    # api.shodan.io: same dataset, no credential, GET only.
+    "internetdb.shodan.io",
+    # Tranco rank API — TRANCO_BASE, providers/tranco.py. A popularity list, consulted to
+    # SUPPRESS false positives. It can never make a verdict worse.
+    "tranco-list.eu",
+    # abuse.ch URLhaus — URLHAUS_BASE, providers/abusech.py. POST, form-encoded, and a QUERY:
+    # the indicator is the form field because that is how the API accepts a lookup. Nothing is
+    # submitted for analysis and abuse.ch does not fetch the target on our behalf. Pinned in
+    # PINNED_POST_SITES and NON_GET_DESTINATIONS below, by constant name and by value.
+    "urlhaus-api.abuse.ch",
+    # abuse.ch ThreatFox — THREATFOX_ENDPOINT, providers/abusech.py. Same shape, JSON body.
+    "threatfox-api.abuse.ch",
+    # IANA RDAP bootstrap registries (RFC 9224) — IANA_BOOTSTRAP_BASE, providers/rdap.py.
+    # Static JSON files naming which registry serves which TLD, address range and AS block.
+    # The indicator never travels here: IANA sees a request for a file, cached per process.
+    #
+    # The registry that file names is contacted directly, so ITS host is chosen at RUNTIME and
+    # is invisible to this scanner by construction. That is handled by refusal rather than by
+    # widening: providers/rdap.py checks the resolved base URL against ALLOWED_EGRESS_HOSTS
+    # before it builds a request, reports `registry_not_allowlisted` (an UNKNOWN, never clean)
+    # otherwise, and follows no redirects at all.
+    "data.iana.org",
+    # The reviewed registry set, read from the IANA bootstrap files on 2026-08-09 and approved
+    # host by host. These appear in no URL literal -- the base URL is read from the bootstrap
+    # response at runtime -- so they are listed here as approved DESTINATIONS rather than as
+    # scanned literals. `.ru` and `.cn` are deliberately excluded; see docs/OPSEC.md section 2.
+    "rdap.arin.net",
+    "rdap.db.ripe.net",
+    "rdap.apnic.net",
+    "rdap.lacnic.net",
+    "rdap.afrinic.net",
+    "rdap.verisign.com",
+    "tld-rdap.verisign.com",
+    "rdap.publicinterestregistry.org",
+    "rdap.nic.info",
+    "rdap.nic.biz",
+    "rdap.nic.io",
+    "rdap.centralnic.com",
+    "rdap.zdnsgtld.com",
+    "rdap.radix.host",
+    "rdap.nic.shop",
+    "rdap.nic.live",
+    "rdap.registry.click",
+    "rdap.uniregistry.net",
+    "rdap.nic.tv",
+    "rdap.nic.me",
+    "rdap.nic.co",
+    "rdap.nominet.uk",
+    "rdap.nic.de",
     # ---- Rendered as a clickable pivot only; never fetched by this tool -----------------
     # Cloudflare Radar UI deep link — reporting/console.py, cli.py
     "radar.cloudflare.com",
@@ -112,6 +162,11 @@ EXPECTED_PROVIDER_HOSTS: set[str] = {
     "api.asrank.caida.org",
     "www.peeringdb.com",
     "urlscan.io",
+    "internetdb.shodan.io",
+    "tranco-list.eu",
+    "urlhaus-api.abuse.ch",
+    "threatfox-api.abuse.ch",
+    "data.iana.org",
 }
 
 # Matches an absolute URL literal in source text. Stops at whitespace, quote, bracket or
@@ -242,11 +297,32 @@ PINNED_POST_SITES: dict[tuple[str, str], int] = {
     # providers/cloudflare_radar.py issues the same read-only Radar GraphQL query twice:
     # once with an Int-typed $asn variable and once with a String-typed fallback.
     ("cloudflare_radar.py", "RADAR_GRAPHQL_ENDPOINT"): 2,
+    # abuse.ch is POST-as-QUERY. Both platforms take a lookup as a request BODY — URLhaus
+    # form-encoded, ThreatFox JSON — and answer out of a database they already hold. Neither
+    # route makes abuse.ch retrieve the target, and neither publishes the indicator: URLhaus
+    # submission is a different, credentialled route this package does not name anywhere, and
+    # ThreatFox's is likewise separate. The verb is the API's shape, not a change in what the
+    # request does. Written up in docs/OPSEC.md section 7.
+    #
+    # URLhaus: one lookup by exact URL, one by host. Distinct endpoints, one call site each.
+    ("abusech.py", "URLHAUS_URL_ENDPOINT"): 1,
+    ("abusech.py", "URLHAUS_HOST_ENDPOINT"): 1,
+    # ThreatFox: one search endpoint serving every indicator kind.
+    ("abusech.py", "THREATFOX_ENDPOINT"): 1,
 }
 
 # The value RADAR_GRAPHQL_ENDPOINT is pinned to. Repointing the constant would otherwise
 # let a POST through the check above while sending it somewhere else entirely.
 EXPECTED_RADAR_GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/radar/graphql"
+
+# Same guard for the abuse.ch endpoints, for the same reason: pinning a POST by the NAME of
+# the constant naming its destination is worth nothing if the constant can be repointed. Each
+# is asserted against its module source in test_abusech_query_endpoint_constants_are_unchanged.
+EXPECTED_ABUSECH_ENDPOINTS: dict[str, str] = {
+    "URLHAUS_URL_ENDPOINT": "https://urlhaus-api.abuse.ch/v1/url/",
+    "URLHAUS_HOST_ENDPOINT": "https://urlhaus-api.abuse.ch/v1/host/",
+    "THREATFOX_ENDPOINT": "https://threatfox-api.abuse.ch/api/v1/",
+}
 
 # Verbs that mutate remote state. None of them belong in a read-only OSINT client.
 MUTATING_METHODS = ("put", "patch", "delete")
@@ -421,10 +497,21 @@ def test_every_url_literal_targets_an_allowlisted_host() -> None:
         )
 
 
+#: Approved destinations that are resolved at RUNTIME and so appear in no URL literal.
+#:
+#: Every RDAP registry below is read out of IANA's bootstrap response, not written into the
+#: source, so the literal scanner cannot see it by construction. They are exempt from the
+#: dead-entry sweep and from nothing else: the runtime hook still checks them, the
+#: subset-of-static test still requires them here, and removing a provider still means removing
+#: its entry. Keep this set small and justified -- an exemption is the one place drift could
+#: hide from the sweep that exists to catch it.
+RUNTIME_RESOLVED_HOSTS: set[str] = {h for h in ALLOWED_HOSTS if h.startswith("rdap.") or h == "tld-rdap.verisign.com"}
+
+
 def test_allowlist_has_no_dead_entries() -> None:
     """An allowlist that outlives its provider is a standing permission nobody re-approved."""
     found = {_host_of(m) for _p, _n, line in _iter_source_lines(PACKAGE_ROOT) for m in _URL_LITERAL_RE.findall(line)}
-    stale = ALLOWED_HOSTS - found
+    stale = ALLOWED_HOSTS - found - RUNTIME_RESOLVED_HOSTS
 
     assert not stale, (
         f"ALLOWED_HOSTS permits hosts that no longer appear anywhere in the source: "
@@ -602,6 +689,36 @@ def test_radar_graphql_endpoint_constant_is_unchanged() -> None:
     )
 
 
+def test_abusech_query_endpoint_constants_are_unchanged() -> None:
+    """Same guard as the Radar one, for the three abuse.ch POST destinations.
+
+    Resolved through ``_module_string_constants`` rather than matched with a regex, because two
+    of the three are f-strings over ``URLHAUS_BASE`` — which is itself the shape a repoint would
+    hide behind. Resolving means a change to the BASE is caught here too, not only a change to
+    the endpoint constant that names it.
+    """
+    constants = _module_string_constants(_parse(PROVIDERS_ROOT / "abusech.py"))
+
+    for name, expected in sorted(EXPECTED_ABUSECH_ENDPOINTS.items()):
+        resolved = constants.get(name)
+        assert resolved is not None, (
+            f"{name} is no longer a resolvable module-level string in providers/abusech.py. "
+            "test_every_post_in_providers_is_a_pinned_query_endpoint pins that POST call site "
+            "by CONSTANT NAME; with the value computed at runtime the pin no longer constrains "
+            "where the POST goes, and the allowance must be removed rather than trusted."
+        )
+        assert resolved == expected, (
+            f"{name} was repointed to {resolved!r}, but the passivity gate sanctions POST to "
+            f"{expected!r} only.\n\n"
+            "The abuse.ch POSTs are allowed because those exact endpoints are read-only query "
+            "routes: the indicator is the request body because that is how URLhaus and "
+            "ThreatFox accept a lookup, and neither makes abuse.ch retrieve the target or "
+            "publish the indicator (docs/OPSEC.md section 7). Point a constant elsewhere — at "
+            "a submission route on the same host, for instance — and the allowance silently "
+            "carries over to a destination nobody reviewed."
+        )
+
+
 @pytest.mark.parametrize("method", MUTATING_METHODS)
 def test_no_state_mutating_http_verb_anywhere(method: str) -> None:
     """PUT, PATCH and DELETE have no read-only reading."""
@@ -684,9 +801,14 @@ FORBIDDEN_ANY_SEGMENT: dict[str, str] = {
     ),
 }
 
-#: The one destination a verb other than GET may go to. Same endpoint the POST pin above names,
-#: reached here by resolving the constant rather than by trusting its name.
-NON_GET_DESTINATIONS: frozenset[str] = frozenset({EXPECTED_RADAR_GRAPHQL_ENDPOINT})
+#: The destinations a verb other than GET may go to, reached here by resolving the constant
+#: rather than by trusting its name. Every one is a read-only QUERY endpoint whose API happens
+#: to take its query in a request body: Cloudflare's Radar GraphQL, and the two abuse.ch
+#: platforms. None of them retrieves the target, and none of them publishes the indicator.
+#: Adding an entry here is the same weight of decision as adding an egress host.
+NON_GET_DESTINATIONS: frozenset[str] = frozenset(
+    {EXPECTED_RADAR_GRAPHQL_ENDPOINT, *EXPECTED_ABUSECH_ENDPOINTS.values()}
+)
 
 #: Resolved destinations expected to be found, so a resolver that quietly stops resolving cannot
 #: turn every assertion below into a claim about the empty set. Keyed by module filename.
@@ -711,6 +833,25 @@ EXPECTED_RESOLVED_ENDPOINTS: dict[str, set[str]] = {
         "GET https://api.cloudflare.com/client/v4/radar/bgp/hijacks/events",
         "GET https://api.cloudflare.com/client/v4/radar/bgp/leaks/events",
     },
+    "internetdb.py": {
+        # The indicator is the last path segment, so the resolver reports it as a placeholder.
+        "GET https://internetdb.shodan.io/{ip}",
+    },
+    "abusech.py": {
+        # Three POSTs, three query endpoints. Resolving them here is what lets the non-GET
+        # check below assert on the destination rather than on the constant's name.
+        "POST https://urlhaus-api.abuse.ch/v1/url/",
+        "POST https://urlhaus-api.abuse.ch/v1/host/",
+        "POST https://threatfox-api.abuse.ch/api/v1/",
+    },
+    # providers/tranco.py and providers/rdap.py are deliberately ABSENT. Both build their
+    # destination into a local variable before the call, so the resolver yields "{url}" rather
+    # than a path and there is nothing stable to pin. That is not a dodge and it is not
+    # unchecked: rdap.py's own host is dynamic by design (RFC 9224 bootstrap) and is gated on
+    # ALLOWED_EGRESS_HOSTS inside the provider before a request is built, while tranco.py's
+    # host is a fixed literal covered by the URL-literal scan above. Both are GET-only, which
+    # test_every_non_get_request_goes_to_the_one_pinned_query_endpoint enforces regardless of
+    # whether the path resolves.
 }
 
 

@@ -99,6 +99,20 @@ async def test_allowlisted_host_is_permitted(host: str) -> None:
         # so they are deliberately absent from the runtime allowlist.
         "https://radar.cloudflare.com/ip/8.8.8.8",
         "https://www.shodan.io/host/8.8.8.8",
+        # Non-public destinations. The orchestrator refuses non-public ADDRESSES as indicators
+        # before it gets here, but that is a different control on a different value: this one is
+        # about the URL a provider module builds. A provider that interpolated a target-supplied
+        # host, or a redirect that was followed, could name any of these -- and on an analyst
+        # workstation an RFC 1918 or link-local destination is the internal network, not the
+        # internet. 169.254.169.254 in particular is the cloud instance-metadata service, which is
+        # the classic SSRF payoff and returns credentials.
+        "https://192.168.1.1/admin",
+        "https://10.0.0.5:8443/",
+        "https://172.16.4.9/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[fd00::1]/",
+        "https://localhost:9200/_search",
+        "http://127.0.0.1:8080/",
     ],
 )
 async def test_unlisted_host_raises_before_the_request_leaves(url: str) -> None:

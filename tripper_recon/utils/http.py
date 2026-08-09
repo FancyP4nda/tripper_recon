@@ -80,6 +80,69 @@ ALLOWED_EGRESS_HOSTS: FrozenSet[str] = frozenset(
         # screenshot base on this host is emitted as a link and never retrieved, so
         # allowlisting the host does not authorise fetching it.
         "urlscan.io",
+        "internetdb.shodan.io",  # Shodan InternetDB, keyless - providers/internetdb.py
+        "tranco-list.eu",  # Tranco rank API - providers/tranco.py
+        # abuse.ch URLhaus and ThreatFox - providers/abusech.py. Both are POST QUERY APIs: the
+        # indicator travels in a form field or a JSON body because that is how the API accepts
+        # a query, and neither route submits anything for analysis. That distinction is written
+        # up in docs/OPSEC.md section 7, and tests/test_passivity.py pins both endpoints by
+        # constant name AND by constant value so the POST allowance cannot be walked onto a
+        # different route.
+        "urlhaus-api.abuse.ch",
+        "threatfox-api.abuse.ch",
+        # IANA's RDAP bootstrap registries (RFC 9224) - providers/rdap.py. Static JSON files,
+        # fetched once per process and cached. The indicator is never sent here; IANA sees a
+        # request for a file, not a query. This entry permits the BOOTSTRAP and nothing else.
+        #
+        # The authoritative registry server is read out of that file at runtime, so its host is
+        # dynamic and no static list can enumerate it in advance. The tension with a static
+        # allowlist is resolved by refusing rather than by widening: providers/rdap.py checks
+        # the resolved base URL against THIS set before it builds a request, returns
+        # ``registry_not_allowlisted`` -- an explicit UNKNOWN, never a clean result -- for a
+        # host nobody has reviewed, and follows no redirects at all. Adding a registry below is
+        # therefore a deliberate review of a party that will learn the operator's indicator list.
+        "data.iana.org",
+        #
+        # --- RDAP authoritative registries -------------------------------------------------
+        # Read from the IANA bootstrap files on 2026-08-09 (dns.json carries 292 service
+        # entries; ipv4.json and asn.json carry the five RIRs). Only the high-volume registries
+        # are listed: the long tail fails closed with ``registry_not_allowlisted``, which names
+        # the exact host to add, so an unlisted TLD degrades to a stated UNKNOWN rather than to
+        # a silent miss. The resolved host is a function of the TLD, never of the indicator, so
+        # a target cannot steer this lookup at its own infrastructure.
+        #
+        # Regional Internet Registries - IP and ASN RDAP.
+        "rdap.arin.net",
+        "rdap.db.ripe.net",
+        "rdap.apnic.net",
+        "rdap.lacnic.net",
+        "rdap.afrinic.net",
+        # gTLD and ccTLD registries, chosen by query volume and by phishing prevalence.
+        "rdap.verisign.com",  # com, net
+        "tld-rdap.verisign.com",  # cc
+        "rdap.publicinterestregistry.org",  # org
+        "rdap.nic.info",
+        "rdap.nic.biz",
+        "rdap.nic.io",
+        "rdap.centralnic.com",  # xyz
+        "rdap.zdnsgtld.com",  # top
+        "rdap.radix.host",  # online, site
+        "rdap.nic.shop",
+        "rdap.nic.live",
+        "rdap.registry.click",
+        "rdap.uniregistry.net",  # link
+        "rdap.nic.tv",
+        "rdap.nic.me",
+        "rdap.nic.co",
+        "rdap.nominet.uk",
+        "rdap.nic.de",
+        #
+        # DELIBERATELY ABSENT: rdap.nic.ru (.ru) and rdap.cnnic.cn (.cn). Both are the real
+        # authoritative registries and both would work. But an RDAP query tells the registry
+        # which domain the operator is investigating, and when. Handing that to a Russian or
+        # Chinese registry is a disclosure decision that belongs to the operator rather than to
+        # a default. They fail closed with the host named, so enabling either is one reviewed
+        # line here. See docs/OPSEC.md section 2.
     }
 )
 

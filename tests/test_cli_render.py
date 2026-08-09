@@ -692,9 +692,9 @@ def test_provider_supplied_dates_are_escaped() -> None:
 # --------------------------------------------------------------------------------------------
 # End to end: the exact scenario this workstream was written to fix.
 #
-# Two of six credentials configured, VirusTotal clean, Shodan down, output redirected. Driven
-# through the real orchestrator over respx so the coverage figure is computed rather than
-# asserted into existence.
+# Two credentials configured out of an eight-provider IP panel, VirusTotal clean, Shodan down,
+# RDAP's bootstrap unreachable, output redirected. Driven through the real orchestrator over
+# respx so the coverage figure is computed rather than asserted into existence.
 # --------------------------------------------------------------------------------------------
 
 
@@ -709,7 +709,16 @@ def no_backoff_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(backoff.asyncio, "sleep", _instant)
 
 
-def test_two_of_six_credentials_says_so_on_the_screen(monkeypatch: pytest.MonkeyPatch, no_backoff_sleep: None) -> None:
+def test_two_configured_credentials_of_eight_providers_says_so_on_the_screen(
+    monkeypatch: pytest.MonkeyPatch, no_backoff_sleep: None
+) -> None:
+    """The IP panel is eight providers wide; two credentials buy one answer, and it says so.
+
+    Was "two of six" until roadmap 8.1/8.2/8.7 widened the panel with InternetDB, RDAP and
+    abuse.ch. The number moved; the property under test did not. What matters is that the
+    denominator counts every provider that COULD have answered -- including the keyless ones,
+    which is where an unconfigured tool would otherwise flatter itself.
+    """
     respx = pytest.importorskip("respx")
     import httpx
 
@@ -733,13 +742,18 @@ def test_two_of_six_credentials_says_so_on_the_screen(monkeypatch: pytest.Monkey
         mock.get(url__regex=r"https://api\.shodan\.io/shodan/host/.*").mock(
             return_value=httpx.Response(500, json={"error": "down"})
         )
+        # RDAP needs no credential, so it is asked whatever the operator configured. Routed
+        # explicitly to a 503 rather than left unrouted: an unrouted request is a real request
+        # in production, and a test that relies on the conftest network guard to stop it is
+        # asserting on the guard rather than on the tool.
+        mock.get(url__regex=r"https://data\.iana\.org/rdap/.*").mock(return_value=httpx.Response(503))
         out, code = _capture(lambda: cli._cmd_ip("93.184.216.34"))
 
-    # The headline gap: four providers were never asked and the tool used to say nothing.
-    assert "provider_coverage: 1 of 6 providers answered" in out
-    assert "never asked - no API key configured: ipinfo, abuseipdb, otx" in out
+    # The headline gap: seven providers did not answer and the tool used to say nothing.
+    assert "provider_coverage: 1 of 8 providers answered" in out
+    assert "never asked - no API key configured: ipinfo, abuseipdb, otx, abusech" in out
     assert "never asked - skipped: cloudflare_asn" in out
-    assert "query failed: shodan" in out
+    assert "query failed: shodan, rdap" in out
     # Provenance, so a pasted report says what produced it.
     assert "tripper-recon" in out and "run " in out
     # A partial answer is still exit 0; the coverage line is what qualifies it.

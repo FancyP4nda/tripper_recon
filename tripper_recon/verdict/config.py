@@ -65,6 +65,7 @@ except ImportError:  # pragma: no cover - see the module docstring warning
 __all__ = [
     "CONFIG_ENV_VAR",
     "PACKAGED_CONFIG_NAME",
+    "AbusechConfig",
     "AllowlistRule",
     "AsnConfig",
     "AbuseIpdbConfig",
@@ -85,6 +86,7 @@ __all__ = [
     "OverrideTier",
     "OverridesConfig",
     "ProvidersConfig",
+    "RdapConfig",
     "ScoreConfig",
     "ScoringConfig",
     "ScoringConfigError",
@@ -95,6 +97,7 @@ __all__ = [
     "TierAConfig",
     "TierBConfig",
     "TierCConfig",
+    "TrancoConfig",
     "UndatedEvidenceConfig",
     "VendorSuppressionRule",
     "VerdictLabelName",
@@ -115,6 +118,12 @@ PACKAGED_CONFIG_NAME = "scoring.yaml"
 
 #: Directory under ``$XDG_CONFIG_HOME`` / ``~/.config`` searched for an override.
 USER_CONFIG_SUBDIR = "tripper_recon"
+
+#: How many daily rank entries the Tranco rank endpoint returns. **A fact about the upstream
+#: API, not a tunable** -- Tranco averages its sources over a rolling 30-day window and the
+#: per-domain endpoint returns that window (``providers/tranco.py`` module docstring). It lives
+#: here only so :class:`TrancoConfig` can reject a ``steady_days`` the data can never satisfy.
+TRANCO_HISTORY_WINDOW_DAYS = 30
 
 
 class ScoringConfigError(Exception):
@@ -156,6 +165,11 @@ class SignalId(str, Enum):
     ASN_BGP_INCIDENTS = "asn.bgp_incidents"
     DOMAIN_AGE = "domain.age"
     CERT_ANOMALY = "cert.anomaly"
+    RDAP_DOMAIN_AGE = "rdap.domain_age"
+    RDAP_ADVERSE_STATUS = "rdap.adverse_status"
+    RDAP_ABUSE_CONTACT_MISSING = "rdap.abuse_contact_missing"
+    URLHAUS_LISTING = "urlhaus.listing"
+    THREATFOX_IOC = "threatfox.ioc"
 
 
 class IndicatorScope(str, Enum):
@@ -609,6 +623,146 @@ class CertificateConfig(_Base):
         )
 
 
+class RdapConfig(_Base):
+    """Registration-data parameters. Registry facts, not reputation.
+
+    Age is deliberately absent here: an RDAP registration date and a whois-derived one answer
+    the same question, so both feed ``domain_age.bands`` rather than each carrying a private
+    copy of the curve. Which source established the age changes the *provider* on the signal and
+    therefore its family; it does not change what a fourteen-day-old domain is worth.
+    """
+
+    #: Points per adverse EPP status (``client hold``, ``pending delete``, ...). A registrar
+    #: hold is the registrar acting on an abuse report, which is a fact about the registration
+    #: rather than an opinion about the site.
+    points_per_adverse_status: float = Field(ge=0.0)
+    #: Ceiling for the composite, validated against ``signals['rdap.adverse_status'].max_points``.
+    max_adverse_status_points: float = Field(ge=0.0)
+    #: No abuse address published at all. Mildly notable, never damning: privacy proxying is
+    #: routine and legitimate, and the great majority of proxied domains are ordinary.
+    missing_abuse_contact_points: float = Field(ge=0.0)
+    #: An abuse address reached only by falling back to the registrar's general contact. Half a
+    #: finding: somebody can be told, but not through the queue that has the obligation.
+    fallback_abuse_contact_points: float = Field(ge=0.0)
+
+    @model_validator(mode="after")
+    def _absence_outranks_a_weak_contact(self) -> RdapConfig:
+        if self.fallback_abuse_contact_points > self.missing_abuse_contact_points:
+            raise ValueError(
+                f"rdap.fallback_abuse_contact_points ({self.fallback_abuse_contact_points}) "
+                f"exceeds missing_abuse_contact_points ({self.missing_abuse_contact_points}). A "
+                "registrar fallback address is weaker evidence than no address at all, so it "
+                "must never score higher."
+            )
+        return self
+
+
+class TrancoConfig(_Base):
+    """Popularity thresholds. **This block contains no points, and that is the design.**
+
+    Tranco is a false-positive *suppressor*: a domain in the global top tier for a month is
+    unlikely to be what an analyst is hunting. The inverse -- unranked therefore suspicious --
+    is invalid, because the list holds about a million domains and the honest web holds
+    hundreds of millions, so every small legitimate site is unranked.
+
+    The engine has no negative-points mechanism and no suppression tier keyed on a provider
+    payload, so the honest thing this ruleset can express today is an *observation*: the
+    ``tranco.rank`` signal carries zero points, states the rank and the steadiness in words, and
+    is not counted as an affirmative negative -- a popularity rank is not a provider saying
+    "asked, nothing here". The thresholds below decide which sentence is emitted, which is a
+    classification constant and belongs in the ruleset like every other one.
+
+    Wiring a real cap needs an engine-side suppressor tier; that is not in this change and the
+    gap is stated rather than papered over with a weight that would look like it does something.
+    """
+
+    #: A rank at or below this is "well established" in the sentence the analyst reads.
+    strong_rank: int = Field(gt=0)
+    #: Days ranked within the provider's 30-day window that count as sustained presence.
+    steady_days: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _steady_fits_the_window(self) -> TrancoConfig:
+        if self.steady_days > TRANCO_HISTORY_WINDOW_DAYS:
+            raise ValueError(
+                f"tranco.steady_days ({self.steady_days}) exceeds the {TRANCO_HISTORY_WINDOW_DAYS}-day "
+                "history the rank endpoint returns, so the condition can never be met."
+            )
+        return self
+
+
+class AbusechConfig(_Base):
+    """URLhaus and ThreatFox magnitudes.
+
+    abuse.ch is the only source in the panel that is an *observation* rather than an aggregate
+    of opinions: a URLhaus record means a file was retrieved from that URL and hashed, and a
+    ThreatFox record means somebody attributed the indicator to a named family. The factors
+    below express how much of that survives contact with the two ways it goes wrong -- a
+    host-level hit that really describes a shared hoster, and an attribution nobody is confident
+    in.
+
+    Every factor is a multiplier in ``[0, 1]``: they can only ever reduce the signal from its
+    ceiling, so no combination can push either signal past the weight the ``signals:`` table
+    granted it.
+    """
+
+    #: A URLhaus record for the exact URL queried. Full strength -- there is no ambiguity about
+    #: what was seen.
+    urlhaus_exact_match_factor: float = Field(ge=0.0, le=1.0)
+    #: A URLhaus record for the HOST. Discounted, because on shared hosting a host-level hit
+    #: measures the hoster and not the tenant.
+    urlhaus_host_match_factor: float = Field(ge=0.0, le=1.0)
+    #: The record says the URL is serving right now.
+    urlhaus_online_factor: float = Field(ge=0.0, le=1.0)
+    #: The record says it is dead. Still evidence -- a since-cleaned compromised site is the
+    #: common case, and the ``abused_legit_malware`` blacklist hint says so out loud.
+    urlhaus_offline_factor: float = Field(ge=0.0, le=1.0)
+    #: Neither platform spoke to liveness. Between the two, never above ``online``.
+    urlhaus_unknown_liveness_factor: float = Field(ge=0.0, le=1.0)
+    #: A payload hash or signature is attached: a file was actually retrieved.
+    urlhaus_payload_factor: float = Field(ge=0.0, le=1.0)
+    #: A listing with no payload behind it.
+    urlhaus_no_payload_factor: float = Field(ge=0.0, le=1.0)
+    urlhaus_recency_profile: str = Field(min_length=1)
+
+    #: ThreatFox's own confidence in the ATTRIBUTION, at which the signal reaches full strength.
+    threatfox_confidence_saturation: float = Field(gt=0.0, le=100.0)
+    #: A named malware family attached to the IOC.
+    threatfox_attributed_factor: float = Field(ge=0.0, le=1.0)
+    #: An IOC with no family named. Weaker: "somebody flagged this" without saying as what.
+    threatfox_unattributed_factor: float = Field(ge=0.0, le=1.0)
+    threatfox_recency_profile: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _factors_are_ordered(self) -> AbusechConfig:
+        if self.urlhaus_offline_factor > self.urlhaus_online_factor:
+            raise ValueError(
+                "abusech.urlhaus_offline_factor may not exceed urlhaus_online_factor: a dead URL "
+                "is not stronger evidence than one that is serving."
+            )
+        if not (self.urlhaus_offline_factor <= self.urlhaus_unknown_liveness_factor <= self.urlhaus_online_factor):
+            raise ValueError(
+                "abusech.urlhaus_unknown_liveness_factor must sit between the offline and online "
+                "factors; unknown liveness is neither the best nor the worst reading."
+            )
+        if self.urlhaus_no_payload_factor > self.urlhaus_payload_factor:
+            raise ValueError(
+                "abusech.urlhaus_no_payload_factor may not exceed urlhaus_payload_factor: a "
+                "listing with no retrieved file behind it is the weaker observation."
+            )
+        if self.urlhaus_host_match_factor > self.urlhaus_exact_match_factor:
+            raise ValueError(
+                "abusech.urlhaus_host_match_factor may not exceed urlhaus_exact_match_factor: a "
+                "hit on the host is about the hoster, a hit on the URL is about the URL."
+            )
+        if self.threatfox_unattributed_factor > self.threatfox_attributed_factor:
+            raise ValueError(
+                "abusech.threatfox_unattributed_factor may not exceed "
+                "threatfox_attributed_factor: an IOC with no family named says less."
+            )
+        return self
+
+
 class AllowlistRule(_Base):
     """One CIDR-based allowlist or cap rule, with its provenance."""
 
@@ -861,6 +1015,9 @@ class ScoringConfig(_Base):
     domain_age: DomainAgeConfig
     vt_categories: VtCategoriesConfig
     certificate: CertificateConfig
+    rdap: RdapConfig
+    tranco: TrancoConfig
+    abusech: AbusechConfig
     overrides: OverridesConfig
     contradictions: ContradictionsConfig
 
@@ -1057,6 +1214,23 @@ class ScoringConfig(_Base):
             ),
             (SignalId.SHODAN_EXPOSURE, self.shodan.max_points_from_cves, "shodan.max_points_from_cves"),
             (SignalId.ASN_REPUTATION, self.asn.points_if_bulletproof, "asn.points_if_bulletproof"),
+            # The RDAP age signal reads the SAME band table as the whois-derived one: one age
+            # concept, one curve, whichever registry surface established it.
+            (
+                SignalId.RDAP_DOMAIN_AGE,
+                max([band.points for band in self.domain_age.bands] + [self.domain_age.unknown_points]),
+                "domain_age bands (via rdap.domain_age)",
+            ),
+            (
+                SignalId.RDAP_ADVERSE_STATUS,
+                self.rdap.max_adverse_status_points,
+                "rdap.max_adverse_status_points",
+            ),
+            (
+                SignalId.RDAP_ABUSE_CONTACT_MISSING,
+                self.rdap.missing_abuse_contact_points,
+                "rdap.missing_abuse_contact_points",
+            ),
         )
         for signal_id, sub_total, label in checks:
             signal = self.signals.get(signal_id)
@@ -1093,6 +1267,8 @@ class ScoringConfig(_Base):
             ("abuseipdb.recency_profile", self.abuseipdb.recency_profile),
             ("otx.recency_profile", self.otx.recency_profile),
             ("shodan.recency_profile", self.shodan.recency_profile),
+            ("abusech.urlhaus_recency_profile", self.abusech.urlhaus_recency_profile),
+            ("abusech.threatfox_recency_profile", self.abusech.threatfox_recency_profile),
         )
         for key, profile in references:
             if profile not in self.decay_profiles:

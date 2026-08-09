@@ -95,6 +95,7 @@ from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tupl
 from pydantic import BaseModel, Field
 
 from tripper_recon.verdict.config import (
+    TRANCO_HISTORY_WINDOW_DAYS,
     AuthorDiversityMode,
     IndicatorScope,
     ScoringConfig,
@@ -107,14 +108,19 @@ __all__ = [
     "OBSERVATIONAL_SIGNAL_IDS",
     "Signal",
     "SignalDirection",
+    "extract_abusech_signals",
     "extract_abuseipdb_signals",
     "extract_asn_metadata_signals",
     "extract_domain_intel_signals",
     "extract_domain_signals",
+    "extract_internetdb_signals",
     "extract_ip_signals",
     "extract_ipinfo_signals",
     "extract_otx_signals",
+    "extract_rdap_signals",
     "extract_shodan_signals",
+    "extract_tranco_signals",
+    "extract_url_signals",
     "extract_virustotal_signals",
 ]
 
@@ -143,6 +149,20 @@ SHODAN_NO_EXPOSURE = "shodan.no_exposure"
 ASN_IDENTITY = "asn.identity"
 #: Registry-level ASN description from Cloudflare Radar.
 ASN_METADATA = "asn.metadata"
+#: Who registered the object and when, as the registry itself reports it. The incident-report
+#: facts: registrar, registration and expiry dates, delegation, network or AS handle.
+RDAP_REGISTRATION = "rdap.registration"
+#: A published abuse address. The single field this provider exists to put in a ticket.
+RDAP_ABUSE_CONTACT = "rdap.abuse_contact"
+#: Tranco lists the domain. Suppression-only: it lowers how much suspicion a *reputation*
+#: argument deserves and never clears an indicator, so it carries no points and is deliberately
+#: NOT an affirmative negative -- a popularity rank is not a provider saying "asked, nothing
+#: here".
+TRANCO_RANK = "tranco.rank"
+#: Tranco does not list the domain. **Not adverse**, and emitted precisely so nobody reads the
+#: silence as one: the list holds about a million domains and the honest web holds hundreds of
+#: millions, so almost every legitimate small site is unranked.
+TRANCO_UNRANKED = "tranco.unranked"
 
 #: Every id emitted by this module that is not in the ruleset's weight table. All carry zero
 #: points. An engine may render them and must not score them.
@@ -158,12 +178,27 @@ OBSERVATIONAL_SIGNAL_IDS: FrozenSet[str] = frozenset(
         SHODAN_NO_EXPOSURE,
         ASN_IDENTITY,
         ASN_METADATA,
+        RDAP_REGISTRATION,
+        RDAP_ABUSE_CONTACT,
+        TRANCO_RANK,
+        TRANCO_UNRANKED,
     }
 )
 
 #: The subset that constitutes an *affirmative negative*: a provider that was asked and reported
 #: nothing adverse. ``verdict_rules.require_affirmative_negative`` is satisfied by these and by
 #: nothing else -- not by an empty signal list, and not by a provider that failed to answer.
+#:
+#: Four sources added in the 0.2.0 ruleset are deliberately absent from this set, and each
+#: omission is load-bearing:
+#:
+#: * :data:`TRANCO_RANK` -- "this domain is popular" is not "no provider reported anything
+#:   adverse". Admitting it would let a Tranco rank alone unlock the clean verdict.
+#: * :data:`RDAP_REGISTRATION` / :data:`RDAP_ABUSE_CONTACT` -- registration data says who owns a
+#:   name, not whether anybody has complained about it.
+#: * abuse.ch -- a miss returns a *failure* envelope from the provider module, so the extractor
+#:   never sees a payload to build a signal from. "abuse.ch holds no record" is the state of the
+#:   overwhelming majority of the internet and carries no exculpatory weight at all.
 AFFIRMATIVE_NEGATIVE_SIGNAL_IDS: FrozenSet[str] = frozenset(
     {
         VT_NO_DETECTIONS,
@@ -199,6 +234,23 @@ _SHODAN = "shodan"
 _IPINFO = "ipinfo"
 _CLOUDFLARE_ASN = "cloudflare_asn"
 _CLOUDFLARE_BGP = "cloudflare_bgp"
+#: The keyless Shodan InternetDB extract. A DIFFERENT provider name for the same signal slot, so
+#: a report says which dataset answered -- InternetDB drops the per-service banners, the network
+#: owner and, decisively, the observation date.
+_INTERNETDB = "internetdb"
+_RDAP = "rdap"
+_TRANCO = "tranco"
+#: abuse.ch. ONE provider key, because it is one composed call filling one coverage slot --
+#: ``providers.abusech.abusech_host_summary`` asks URLhaus and ThreatFox and merges the two.
+#: Which platform saw the thing is carried by the signal id (``urlhaus.listing`` /
+#: ``threatfox.ioc``) and by its observation sentence, not by a second provider name that would
+#: imply a second thing to have coverage of.
+_ABUSECH = "abusech"
+
+#: The provider ``data`` key that says an exposure payload came from InternetDB rather than the
+#: paid Shodan record (``providers/internetdb.INTERNETDB_SOURCE``). Compared rather than
+#: imported to keep this module free of provider imports; the value is pinned by a test.
+INTERNETDB_SOURCE_VALUE = "shodan_internetdb"
 
 
 # --------------------------------------------------------------------------------------
@@ -1304,6 +1356,58 @@ def extract_shodan_signals(
     ``shodan.max_points_from_cves``. They are a patching finding about the host, not an
     attribution claim about its operator, and the observation says so.
     """
+    return _exposure_signals(payload, cfg, now, scope=scope, indicator=indicator, provider=_SHODAN, label="Shodan")
+
+
+def extract_internetdb_signals(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope = IndicatorScope.IP,
+    indicator: Optional[str] = None,
+) -> List[Signal]:
+    """The same exposure signal, from the keyless Shodan InternetDB extract (roadmap 8.1).
+
+    InternetDB carries the five fields this extractor reads under the paid provider's own key
+    names, so the arithmetic is identical and shares one ceiling: the two are alternative
+    implementations of one slot and exactly one of them can ever answer for an address.
+
+    **One difference matters and is not smoothed over.** InternetDB returns no observation date,
+    so the age is genuinely unknown and ``undated_evidence`` prices it at 1.0 -- the finding is
+    not discounted for a metadata field the dataset does not carry, and the observation string
+    says the date was not reported instead of implying freshness. That is the same rule
+    :class:`~tripper_recon.verdict.config.UndatedEvidenceConfig` states at length, applied to a
+    provider that will hit it on every single call rather than occasionally.
+    """
+    return _exposure_signals(
+        payload,
+        cfg,
+        now,
+        scope=scope,
+        indicator=indicator,
+        provider=_INTERNETDB,
+        label="Shodan InternetDB",
+    )
+
+
+def _exposure_signals(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope,
+    indicator: Optional[str],
+    provider: str,
+    label: str,
+) -> List[Signal]:
+    """Shared body for the paid and keyless exposure providers.
+
+    ``provider`` decides which name the signal is attributed to -- and therefore what a report
+    says answered -- while ``label`` is the display name in the observation sentence. Nothing
+    else differs, deliberately: two copies of this arithmetic would drift, and the thing they
+    would drift on is which ports count.
+    """
     now = _require_aware(now)
     data = _as_dict(payload)
     if not data:
@@ -1328,11 +1432,11 @@ def extract_shodan_signals(
         return [
             _observational(
                 signal_id=SHODAN_NO_EXPOSURE,
-                provider=_SHODAN,
+                provider=provider,
                 cfg=cfg,
                 direction=SignalDirection.CONTEXT,
                 observation=(
-                    f"Shodan holds a record for this host: {len(ports)} open ports, none on the risky-port "
+                    f"{label} holds a record for this host: {len(ports)} open ports, none on the risky-port "
                     f"list, and {len(vulns)} associated CVEs; {_age_phrase(age, recency)}. "
                     "Says nothing about intent either way"
                 ),
@@ -1367,12 +1471,12 @@ def extract_shodan_signals(
         _scored(
             signal_id=SignalId.SHODAN_EXPOSURE,
             wiring=wiring,
-            provider=_SHODAN,
+            provider=provider,
             cfg=cfg,
             direction=SignalDirection.CONTEXT,
             magnitude=magnitude,
             observation=(
-                f"Shodan: {port_clause}; {cve_clause}; {_age_phrase(age, recency)}. "
+                f"{label}: {port_clause}; {cve_clause}; {_age_phrase(age, recency)}. "
                 "Exposure describes what the host is, not whether it is hostile"
             ),
             evidence={
@@ -1633,8 +1737,15 @@ def extract_domain_signals(
     *,
     scope: IndicatorScope = IndicatorScope.DOMAIN,
     indicator: Optional[str] = None,
+    age_reported: bool = False,
 ) -> List[Signal]:
     """Domain-level signals from the VirusTotal domain payload: age and certificate anomalies.
+
+    ``age_reported`` suppresses the whois-derived age when a better source already answered the
+    same question. See :func:`extract_domain_intel_signals`: RDAP is the registry's own
+    structured record and this path parses free-text whois from hundreds of registrars, so when
+    RDAP reported an age -- including reporting that it does not know one -- letting both fire
+    would score one registration date twice.
 
     Domain age is the highest-value single signal in phishing triage and the one an analyst is
     most likely to skip. It is never negative: an old domain is not clean, it is
@@ -1656,9 +1767,26 @@ def extract_domain_signals(
 
     link = _as_str(data.get("vt_link"))
     signals: List[Signal] = []
-    signals.extend(_domain_age_signals(data, cfg, now, scope=scope, link=link))
+    if not age_reported:
+        signals.extend(_domain_age_signals(data, cfg, now, scope=scope, link=link))
     signals.extend(_certificate_signals(data, cfg, now, scope=scope, indicator=indicator, link=link))
     return signals
+
+
+def _domain_age_band_points(cfg: ScoringConfig, age_days: Optional[float]) -> float:
+    """Points for a domain of this age, from ``domain_age.bands``.
+
+    One curve, shared by the whois-derived and the RDAP-derived age signals. "How suspicious is
+    a fourteen-day-old domain" has one answer, and which registry surface reported the fourteen
+    days does not change it -- what it changes is the provider on the signal, and therefore the
+    family, which is why the two are separate signal ids reading one band table.
+    """
+    band_points = cfg.domain_age.bands[-1].points
+    for band in cfg.domain_age.bands:
+        if band.max_age_days is None or (age_days is not None and age_days <= band.max_age_days):
+            band_points = band.points
+            break
+    return band_points
 
 
 def _domain_age_signals(
@@ -1689,12 +1817,7 @@ def _domain_age_signals(
         raw_value: Any = None
     else:
         age = _age_days(created, now)
-        band_points = cfg.domain_age.bands[-1].points
-        for band in cfg.domain_age.bands:
-            if band.max_age_days is None or (age is not None and age <= band.max_age_days):
-                band_points = band.points
-                break
-        points = min(band_points, wiring.max_points)
+        points = min(_domain_age_band_points(cfg, age), wiring.max_points)
         observation = (
             f"Domain registered {age:.0f} days ago ({created.date().isoformat()}); age band worth {points:.0f} points"
         )
@@ -1853,6 +1976,695 @@ def _certificate_signals(
 
 
 # --------------------------------------------------------------------------------------
+# RDAP -- registration data from the registry that holds it (roadmap 8.2)
+# --------------------------------------------------------------------------------------
+
+
+def _newest(*values: Any) -> Tuple[Optional[dt.datetime], Optional[str]]:
+    """The most recent parseable timestamp among ``values``, with the string it came from.
+
+    Newest rather than oldest because these are *observation* dates, and decay asks how long
+    ago the evidence was last true. Taking the oldest would age a currently-live finding by the
+    date it was first reported, which discounts adverse evidence for having a long history.
+    """
+    best: Optional[dt.datetime] = None
+    best_raw: Optional[str] = None
+    for value in values:
+        parsed = _parse_timestamp(value)
+        if parsed is None:
+            continue
+        if best is None or parsed > best:
+            best = parsed
+            best_raw = _as_str(value)
+    return best, best_raw
+
+
+def extract_rdap_signals(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope = IndicatorScope.DOMAIN,
+    indicator: Optional[str] = None,
+) -> List[Signal]:
+    """Registration data: age, registry status, and who to send the abuse report to.
+
+    **Age is the reason this provider exists.** A domain registered days ago is the strongest
+    cheap phishing signal available, and RDAP is the registry's own structured answer rather
+    than free-text whois parsed by pattern. It reads ``domain_age.bands`` -- the same curve as
+    the whois-derived ``domain.age`` -- so the two cannot disagree about what fourteen days is
+    worth, and :func:`extract_domain_intel_signals` suppresses the whois one when this path
+    reported anything, so a new domain is never counted twice.
+
+    **An unknown age is not a safe age.** A registry that answered and published no registration
+    event scores ``domain_age.unknown_points``, which the ruleset forbids being zero. Scoring it
+    zero would make "we could not establish when this was registered" identical to "comfortably
+    old", which is the clean end of the signal.
+
+    **The registry acting is a fact, not an opinion.** ``client hold`` is what a registrar sets
+    when it has accepted an abuse report and pulled the name out of DNS; ``pending delete`` and
+    ``redemption period`` say the name is on its way out of the zone. Those score. They sit in
+    the non-corroborating ``registry_meta`` family, so they can raise a score and can never
+    stand in for an independent second source confirming a detection.
+
+    **A missing abuse contact is mildly notable, never damning.** Privacy proxying is legal,
+    routine, and used by an enormous number of entirely ordinary domains, so the weight is
+    near-zero by design; scoring it hard would be a false-positive engine aimed at the honest
+    long tail. Its *presence* is the more valuable half and is emitted as a zero-weight
+    observation, because "abuse@registrar.example, +1-555-0100" is the line that makes a report
+    actionable.
+
+    Scope decides what scores: the ruleset declares all three weighted RDAP signals
+    ``applies_to: [domain]``, so an IP or ASN payload produces observations only -- the
+    allocation record and the netblock's abuse contact -- and no points. Nothing here needs a
+    scope test of its own; :func:`_wiring` returns ``None`` and the scored branches do not run.
+    """
+    now = _require_aware(now)
+    data = _as_dict(payload)
+    # A payload must carry at least one ``rdap_`` field before anything here fires. Every other
+    # extractor is guarded by looking for a specific field it needs; this one is not, because the
+    # unknown-age branch deliberately fires on a record with no registration date -- so without
+    # this check a FAILURE envelope (``{"ok": false, "error": "missing_api_key"}``) would be a
+    # non-empty dict with no date and would score the unknown-age weight. That is the absent-data
+    # rule running backwards: a provider that was never asked would score points.
+    if not any(isinstance(key, str) and key.startswith("rdap_") for key in data):
+        return []
+
+    signals: List[Signal] = []
+    signals.extend(_rdap_age_signals(data, cfg, now, scope=scope))
+    signals.extend(_rdap_status_signals(data, cfg, scope=scope))
+    signals.extend(_rdap_contact_signals(data, cfg, scope=scope))
+    signals.extend(_rdap_registration_note(data, cfg, indicator=indicator))
+    return signals
+
+
+def _rdap_registration_date(data: Mapping[str, Any]) -> Optional[dt.datetime]:
+    return _parse_timestamp(data.get("rdap_registration_date"))
+
+
+def _rdap_age_signals(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope,
+) -> List[Signal]:
+    wiring = _wiring(cfg, SignalId.RDAP_DOMAIN_AGE, scope)
+    if wiring is None or wiring.max_points <= 0:
+        return []
+
+    created = _rdap_registration_date(data)
+    # The age is recomputed here from the registration date against the INJECTED clock rather
+    # than trusting the provider's own `rdap_age_days`, which was computed against whatever the
+    # provider thought the time was. Purity is the point: the same payload and the same `now`
+    # must always produce the same signal, including when a saved case is re-scored later.
+    age = _age_days(created, now)
+
+    if created is None:
+        points = min(cfg.domain_age.unknown_points, wiring.max_points)
+        observation = (
+            "RDAP answered and the registry published no registration date for this domain. Age "
+            f"unknown is not age fine -- scored at the ruleset's unknown-age weight ({points:.0f} "
+            "points). Establish the registration date before clearing this domain"
+        )
+        evidence: Dict[str, Any] = {"rdap_available": True, "registration_date": None, "age_days": None}
+        raw_value: Any = None
+    else:
+        points = min(_domain_age_band_points(cfg, age), wiring.max_points)
+        observation = (
+            f"RDAP: domain registered {age:.0f} days ago ({created.date().isoformat()}) with "
+            f"{_as_str(data.get('rdap_registrar_name')) or 'an unnamed registrar'}; age band worth "
+            f"{points:.0f} points"
+        )
+        evidence = {
+            "rdap_available": True,
+            "registration_date": created.isoformat(),
+            "age_days": age,
+            "registrar": _as_str(data.get("rdap_registrar_name")),
+        }
+        raw_value = created.isoformat()
+
+    return [
+        _scored(
+            signal_id=SignalId.RDAP_DOMAIN_AGE,
+            wiring=wiring,
+            provider=_RDAP,
+            cfg=cfg,
+            # Never EXCULPATORY, whatever the age. An old domain is not clean, it is
+            # compromise-eligible: the oldest band is worth zero, which is not the same as
+            # earning a discount.
+            direction=SignalDirection.ADVERSE if points > 0 else SignalDirection.CONTEXT,
+            magnitude=points / wiring.max_points,
+            observation=observation,
+            evidence=evidence,
+            raw_value=raw_value,
+            observed_at=_as_str(data.get("rdap_registration_date")),
+            source_url=None,
+        )
+    ]
+
+
+def _rdap_status_signals(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    *,
+    scope: IndicatorScope,
+) -> List[Signal]:
+    wiring = _wiring(cfg, SignalId.RDAP_ADVERSE_STATUS, scope)
+    if wiring is None or wiring.max_points <= 0:
+        return []
+    adverse = [text for text in (_as_str(item) for item in _as_list(data.get("rdap_adverse_status"))) if text]
+    if not adverse:
+        return []
+
+    conf = cfg.rdap
+    points = min(len(adverse) * conf.points_per_adverse_status, conf.max_adverse_status_points, wiring.max_points)
+    return [
+        _scored(
+            signal_id=SignalId.RDAP_ADVERSE_STATUS,
+            wiring=wiring,
+            provider=_RDAP,
+            cfg=cfg,
+            direction=SignalDirection.ADVERSE,
+            magnitude=points / wiring.max_points,
+            observation=(
+                f"RDAP: the registry reports status {', '.join(adverse)}. A hold is a registrar or "
+                "registry acting against the registration -- typically after accepting an abuse "
+                "report -- and the name is out of, or leaving, the zone"
+            ),
+            evidence={
+                "adverse_status": adverse,
+                "all_status": [text for text in (_as_str(item) for item in _as_list(data.get("rdap_status"))) if text],
+            },
+            raw_value=adverse,
+            observed_at=_as_str(data.get("rdap_last_changed_date")),
+            source_url=None,
+        )
+    ]
+
+
+def _rdap_contact_signals(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    *,
+    scope: IndicatorScope,
+) -> List[Signal]:
+    """The abuse contact: its content when there is one, its absence when there is not."""
+    source = _as_str(data.get("rdap_abuse_contact_source"))
+    email = _as_str(data.get("rdap_abuse_email"))
+    phone = _as_str(data.get("rdap_abuse_phone"))
+    reachable = ", ".join(part for part in (email, phone) if part)
+
+    if source == "abuse_role" and reachable:
+        return [
+            _observational(
+                signal_id=RDAP_ABUSE_CONTACT,
+                provider=_RDAP,
+                cfg=cfg,
+                direction=SignalDirection.CONTEXT,
+                observation=(
+                    f"RDAP abuse contact: {reachable}. Published by an entity holding the abuse "
+                    "role, which is the queue with the reporting obligation"
+                ),
+                block="rdap",
+                evidence={"abuse_email": email, "abuse_phone": phone, "source": source},
+                raw_value=email or phone,
+            )
+        ]
+
+    wiring = _wiring(cfg, SignalId.RDAP_ABUSE_CONTACT_MISSING, scope)
+    if wiring is None or wiring.max_points <= 0:
+        # Out of scope for scoring (IP and ASN payloads). Report a fallback contact anyway --
+        # a netblock's registrar address is still the line that makes a report actionable.
+        if reachable:
+            return [
+                _observational(
+                    signal_id=RDAP_ABUSE_CONTACT,
+                    provider=_RDAP,
+                    cfg=cfg,
+                    direction=SignalDirection.CONTEXT,
+                    observation=(
+                        f"RDAP abuse contact: {reachable}. Taken from the registrar entity; no "
+                        "entity holds the abuse role for this object"
+                    ),
+                    block="rdap",
+                    evidence={"abuse_email": email, "abuse_phone": phone, "source": source},
+                    raw_value=email or phone,
+                )
+            ]
+        return []
+
+    conf = cfg.rdap
+    if reachable:
+        points = min(conf.fallback_abuse_contact_points, wiring.max_points)
+        observation = (
+            f"RDAP: no entity holds the abuse role; the only published address is the registrar's "
+            f"general contact ({reachable}). Somebody can be told, but not through the queue that "
+            "carries the obligation"
+        )
+    else:
+        points = min(conf.missing_abuse_contact_points, wiring.max_points)
+        observation = (
+            "RDAP: no abuse contact published at all -- privacy-proxied or omitted. Mildly "
+            "notable and not damning: proxying is routine and the great majority of proxied "
+            "domains are ordinary. It does mean there is nobody to send a report to"
+        )
+    return [
+        _scored(
+            signal_id=SignalId.RDAP_ABUSE_CONTACT_MISSING,
+            wiring=wiring,
+            provider=_RDAP,
+            cfg=cfg,
+            direction=SignalDirection.ADVERSE if points > 0 else SignalDirection.CONTEXT,
+            magnitude=points / wiring.max_points,
+            observation=observation,
+            evidence={"abuse_email": email, "abuse_phone": phone, "source": source},
+            raw_value=source,
+            source_url=None,
+        )
+    ]
+
+
+def _rdap_registration_note(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    *,
+    indicator: Optional[str],
+) -> List[Signal]:
+    """The registration facts, as one zero-weight line an analyst can paste into a ticket.
+
+    Emitted for every scope, because the ASN and netblock forms of this record are exactly as
+    useful in an incident report as the domain form and carry no weight in any of them.
+    """
+    parts: List[str] = []
+    evidence: Dict[str, Any] = {}
+
+    registrar = _as_str(data.get("rdap_registrar_name"))
+    if registrar:
+        parts.append(f"registrar {registrar}")
+        evidence["registrar"] = registrar
+    network_name = _as_str(data.get("rdap_network_name")) or _as_str(data.get("rdap_autnum_name"))
+    if network_name:
+        parts.append(f"allocated as {network_name}")
+        evidence["network_name"] = network_name
+    handle = (
+        _as_str(data.get("rdap_handle"))
+        or _as_str(data.get("rdap_network_handle"))
+        or _as_str(data.get("rdap_autnum_handle"))
+    )
+    if handle:
+        evidence["handle"] = handle
+    registered = _as_str(data.get("rdap_registration_date"))
+    if registered:
+        parts.append(f"registered {registered}")
+        evidence["registration_date"] = registered
+    expires = _as_str(data.get("rdap_expiration_date"))
+    if expires:
+        parts.append(f"expires {expires}")
+        evidence["expiration_date"] = expires
+    nameserver_count = _as_int(data.get("rdap_nameserver_count"))
+    if nameserver_count is not None:
+        parts.append(f"{nameserver_count} nameserver(s)")
+        evidence["nameserver_count"] = nameserver_count
+        evidence["nameservers"] = [
+            text for text in (_as_str(item) for item in _as_list(data.get("rdap_nameserver_names"))) if text
+        ]
+    signed = _as_bool(data.get("rdap_dnssec_delegation_signed"))
+    if signed is not None:
+        parts.append("DNSSEC signed" if signed else "DNSSEC unsigned")
+        evidence["dnssec_delegation_signed"] = signed
+    server = _as_str(data.get("rdap_server_host"))
+    if server:
+        evidence["rdap_server_host"] = server
+
+    if not parts:
+        return []
+    subject = indicator or "this object"
+    return [
+        _observational(
+            signal_id=RDAP_REGISTRATION,
+            provider=_RDAP,
+            cfg=cfg,
+            direction=SignalDirection.CONTEXT,
+            observation=f"RDAP record for {subject}: {'; '.join(parts)}. Registry facts, not a judgement",
+            block="rdap",
+            evidence=evidence,
+            raw_value=handle,
+            observed_at=registered,
+        )
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# Tranco -- popularity, and the one direction it may be read in (roadmap 8.3)
+# --------------------------------------------------------------------------------------
+
+
+def extract_tranco_signals(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope = IndicatorScope.DOMAIN,
+    indicator: Optional[str] = None,
+) -> List[Signal]:
+    """Tranco rank. **Suppression only: this function can never emit an adverse signal.**
+
+    Getting this backwards would flag every small legitimate site on the internet. The list
+    holds roughly a million domains and the honest web holds hundreds of millions, so "not
+    ranked" is the ordinary state of essentially every regional supplier, internal service and
+    small business, and treating it as suspicious would be a tautology rather than a detection.
+    Both branches below emit zero points and neither carries
+    :attr:`SignalDirection.ADVERSE`; there is no code path that could.
+
+    **What a rank is worth, honestly.** A domain in the global top tier for a month is unlikely
+    to be what an analyst is hunting, which caps how much suspicion a *reputation* argument
+    deserves. It never clears the indicator -- popular sites are compromised, and popular
+    file-sharing services carry payloads daily -- and it must never override a provider that
+    actually observed something. That is why the ranked branch is not in
+    :data:`AFFIRMATIVE_NEGATIVE_SIGNAL_IDS`: it may not unlock the clean verdict on its own.
+
+    **What this does NOT do, stated rather than papered over.** The engine has no
+    negative-points mechanism and no suppression tier keyed on a provider payload, so a high
+    rank does not currently reduce any other signal's contribution. It is an observation the
+    analyst reads and weighs. Wiring a real cap needs an engine-side suppressor tier; inventing
+    a weight here to look like it does something would be worse than saying so.
+    """
+    now = _require_aware(now)
+    data = _as_dict(payload)
+    if not data:
+        return []
+    in_list = _as_bool(data.get("tranco_in_list"))
+    if in_list is None:
+        return []
+
+    conf = cfg.tranco
+    days_ranked = _as_int(data.get("tranco_days_ranked")) or 0
+    if not in_list:
+        note = _as_str(data.get("tranco_absence_note")) or (
+            "Not in the Tranco list. This is NOT adverse: the list holds about a million domains "
+            "while the public web holds hundreds of millions, so the overwhelming majority of "
+            "legitimate domains are unranked"
+        )
+        return [
+            _observational(
+                signal_id=TRANCO_UNRANKED,
+                provider=_TRANCO,
+                cfg=cfg,
+                direction=SignalDirection.CONTEXT,
+                observation=f"Tranco: {note} No popularity-based suppression is available for this domain",
+                block="tranco",
+                evidence={"tranco_in_list": False, "days_ranked": days_ranked},
+                raw_value=None,
+            )
+        ]
+
+    rank = _as_int(data.get("tranco_rank"))
+    best = _as_int(data.get("tranco_best_rank"))
+    strong = rank is not None and rank <= conf.strong_rank
+    steady = days_ranked >= conf.steady_days
+    strength = (
+        "well-established popular infrastructure"
+        if strong and steady
+        else "ranked, but not steadily enough or highly enough to carry much weight"
+    )
+    return [
+        _observational(
+            signal_id=TRANCO_RANK,
+            provider=_TRANCO,
+            cfg=cfg,
+            # EXCULPATORY, and worth zero. Direction and points are independent axes: this says
+            # which way the evidence points without claiming it settles anything.
+            direction=SignalDirection.EXCULPATORY,
+            observation=(
+                f"Tranco: ranked {rank if rank is not None else 'unknown'} "
+                f"(best {best if best is not None else 'unknown'}) on {days_ranked} of the last "
+                f"{TRANCO_HISTORY_WINDOW_DAYS} daily lists -- {strength}. Popularity caps how much "
+                "suspicion a reputation argument deserves; it never clears an indicator and never "
+                "outweighs a provider that observed something"
+            ),
+            block="tranco",
+            evidence={
+                "tranco_in_list": True,
+                "rank": rank,
+                "best_rank": best,
+                "days_ranked": days_ranked,
+                "strong_rank_threshold": conf.strong_rank,
+                "steady_days_threshold": conf.steady_days,
+                "is_strong": strong,
+                "is_steady": steady,
+            },
+            raw_value=rank,
+            observed_at=_as_str(data.get("tranco_rank_date")),
+        )
+    ]
+
+
+# --------------------------------------------------------------------------------------
+# abuse.ch -- URLhaus and ThreatFox (roadmap 8.7)
+# --------------------------------------------------------------------------------------
+
+
+def extract_abusech_signals(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope = IndicatorScope.IP,
+    indicator: Optional[str] = None,
+) -> List[Signal]:
+    """URLhaus and ThreatFox: the only observations in this panel, as opposed to opinions.
+
+    Every other reputation input here aggregates somebody's judgement. A URLhaus record means a
+    file was retrieved from that URL and its SHA-256 published; a ThreatFox record means somebody
+    attributed the indicator to a named malware family and said how confident they were. That
+    difference in kind is why the ruleset weights these above VirusTotal and why the escalation
+    rules name them.
+
+    **A miss is never a clean signal.** The provider module returns a *failure* envelope on a
+    miss (``no_results`` / ``not_found`` / ``lookup_failed``), so this extractor is handed
+    nothing and emits nothing. There is no abuse.ch affirmative negative and there must not be:
+    "abuse.ch holds no record" is the state of the overwhelming majority of the internet.
+
+    **Two ways the evidence is less than it looks, both priced in the ruleset.** A host-level
+    URLhaus record says something happened *somewhere* on that host, which on shared hosting is
+    a fact about the hoster and not the tenant, so it is discounted and -- with no payload detail
+    in a host response -- cannot reach the decisiveness threshold on its own. And a ThreatFox row
+    carries abuse.ch's own confidence in the attribution, which drives the magnitude directly, so
+    a low-confidence row lands short of decisive and cannot escalate.
+
+    **Volume is deliberately not counted.** ``urlhaus_url_count`` on a shared hoster measures the
+    hoster; presence and liveness are read instead, exactly as the provider module's own notes
+    ask. ``urlhaus_online_urls_in_response`` is used only as the liveness floor it is named for.
+    """
+    now = _require_aware(now)
+    data = _as_dict(payload)
+    if not data:
+        return []
+    signals: List[Signal] = []
+    signals.extend(_urlhaus_signals(data, cfg, now, scope=scope))
+    signals.extend(_threatfox_signals(data, cfg, now, scope=scope))
+    return signals
+
+
+def _urlhaus_shape(data: Mapping[str, Any]) -> Optional[str]:
+    """``"url"``, ``"host"`` or ``None`` -- which URLhaus lookup produced this payload.
+
+    Keyed on fields only one of the two shapes carries. ``None`` means URLhaus contributed
+    nothing to the merged payload, which is what a miss or a platform failure looks like; the
+    reason is in ``abusech_urlhaus_error``.
+    """
+    if _as_str(data.get("urlhaus_url")) or _as_str(data.get("urlhaus_url_status")):
+        return "url"
+    if data.get("urlhaus_url_count") is not None or data.get("urlhaus_urls_returned") is not None:
+        return "host"
+    return None
+
+
+def _urlhaus_signals(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope,
+) -> List[Signal]:
+    wiring = _wiring(cfg, SignalId.URLHAUS_LISTING, scope)
+    if wiring is None or wiring.max_points <= 0:
+        return []
+    shape = _urlhaus_shape(data)
+    if shape is None:
+        return []
+
+    conf = cfg.abusech
+    online = _as_bool(data.get("urlhaus_online"))
+    signatures = [text for text in (_as_str(item) for item in _as_list(data.get("urlhaus_signatures"))) if text]
+    payload_count = _as_int(data.get("urlhaus_payload_count")) or 0
+    url_count = _as_int(data.get("urlhaus_url_count"))
+    online_urls = _as_int(data.get("urlhaus_online_urls_in_response")) or 0
+
+    if shape == "url":
+        match_factor = conf.urlhaus_exact_match_factor
+        match_clause = "an exact record for this URL"
+        has_payload = payload_count > 0 or bool(signatures)
+    else:
+        match_factor = conf.urlhaus_host_match_factor
+        counted = url_count if url_count is not None else _as_int(data.get("urlhaus_urls_returned")) or 0
+        match_clause = f"a host record covering {counted} known malware URL(s) on this host"
+        # A host response carries no payload detail at all, so there is no retrieved file behind
+        # this reading. Discounted rather than assumed either way -- which is also what keeps a
+        # host-level hit below the decisiveness threshold and therefore out of the escalation.
+        has_payload = False
+
+    if online is True:
+        liveness_factor = conf.urlhaus_online_factor
+        liveness_clause = "serving now" if shape == "url" else f"{online_urls} of them serving now"
+    elif online is False:
+        liveness_factor = conf.urlhaus_offline_factor
+        liveness_clause = "not currently serving"
+    else:
+        liveness_factor = conf.urlhaus_unknown_liveness_factor
+        liveness_clause = "liveness not reported"
+
+    payload_factor = conf.urlhaus_payload_factor if has_payload else conf.urlhaus_no_payload_factor
+    payload_clause = (
+        f"{payload_count} payload record(s) retrieved" + (f" ({', '.join(signatures[:3])})" if signatures else "")
+        if has_payload
+        else "no retrieved payload in this response"
+    )
+
+    observed, observed_raw = _newest(
+        data.get("urlhaus_payload_last_seen"),
+        data.get("urlhaus_last_online"),
+        data.get("urlhaus_date_added"),
+        data.get("urlhaus_firstseen"),
+    )
+    age = _age_days(observed, now)
+    recency = cfg.decay_factor(conf.urlhaus_recency_profile, age)
+
+    blacklists = _as_dict(data.get("urlhaus_blacklists"))
+    dbl = _as_str(blacklists.get("spamhaus_dbl"))
+    compromised_hint = (
+        ". Spamhaus DBL classifies this as abused legitimate infrastructure, which usually means a "
+        "compromised site rather than an attacker-owned one"
+        if dbl and "legit" in dbl.lower()
+        else ""
+    )
+
+    magnitude = match_factor * liveness_factor * payload_factor * recency
+    return [
+        _scored(
+            signal_id=SignalId.URLHAUS_LISTING,
+            wiring=wiring,
+            provider=_ABUSECH,
+            cfg=cfg,
+            direction=SignalDirection.ADVERSE,
+            magnitude=magnitude,
+            observation=(
+                f"URLhaus holds {match_clause}, {liveness_clause}; {payload_clause}; "
+                f"{_age_phrase(age, recency)}{compromised_hint}"
+            ),
+            evidence={
+                "shape": shape,
+                "online": online,
+                "url_count": url_count,
+                "online_urls_in_response": online_urls,
+                "payload_count": payload_count,
+                "signatures": signatures,
+                "blacklists": {key: value for key, value in blacklists.items() if value is not None},
+                "reference": _as_str(data.get("urlhaus_reference")),
+                "match_factor": match_factor,
+                "liveness_factor": liveness_factor,
+                "payload_factor": payload_factor,
+                "recency_factor": recency,
+                "observation_age_days": age,
+            },
+            raw_value=signatures or _as_str(data.get("urlhaus_reference")),
+            observed_at=observed_raw,
+            source_url=_as_str(data.get("urlhaus_reference")),
+        )
+    ]
+
+
+def _threatfox_signals(
+    data: Mapping[str, Any],
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope,
+) -> List[Signal]:
+    wiring = _wiring(cfg, SignalId.THREATFOX_IOC, scope)
+    if wiring is None or wiring.max_points <= 0:
+        return []
+    count = _as_int(data.get("threatfox_ioc_count")) or 0
+    if count <= 0:
+        return []
+
+    conf = cfg.abusech
+    families = [text for text in (_as_str(item) for item in _as_list(data.get("threatfox_malware_families"))) if text]
+    threat_types = [text for text in (_as_str(item) for item in _as_list(data.get("threatfox_threat_types"))) if text]
+    confidence = _as_float(data.get("threatfox_confidence_max"))
+    discarded = _as_int(data.get("threatfox_discarded_partial_matches")) or 0
+
+    if confidence is None:
+        # No confidence level reported. Treated as full strength rather than discounted, for the
+        # reason UndatedEvidenceConfig sets out for missing timestamps: a multiplier below 1.0
+        # would let a provider that omitted a metadata field argue the indicator cleaner than the
+        # evidence it actually supplied. The gap is stated in the observation instead.
+        confidence_factor = 1.0
+        confidence_clause = "abuse.ch reported no confidence level, which is not the same as low confidence"
+    else:
+        confidence_factor = _clamp01(confidence / conf.threatfox_confidence_saturation)
+        confidence_clause = f"abuse.ch confidence {confidence:.0f} of {conf.threatfox_confidence_saturation:.0f}"
+
+    attribution_factor = conf.threatfox_attributed_factor if families else conf.threatfox_unattributed_factor
+    attribution_clause = f"attributed to {', '.join(families[:3])}" if families else "with no malware family named"
+
+    observed, observed_raw = _newest(data.get("threatfox_last_seen"), data.get("threatfox_first_seen"))
+    age = _age_days(observed, now)
+    recency = cfg.decay_factor(conf.threatfox_recency_profile, age)
+
+    collision_clause = (
+        f". {discarded} wildcard result(s) were discarded as substring collisions; a large share "
+        "there means the search term was too short to search broadly"
+        if discarded > 0
+        else ""
+    )
+
+    magnitude = confidence_factor * attribution_factor * recency
+    return [
+        _scored(
+            signal_id=SignalId.THREATFOX_IOC,
+            wiring=wiring,
+            provider=_ABUSECH,
+            cfg=cfg,
+            direction=SignalDirection.ADVERSE,
+            magnitude=magnitude,
+            observation=(
+                f"ThreatFox holds {count} IOC record(s) for this indicator, {attribution_clause}"
+                + (f" as {', '.join(threat_types[:2])}" if threat_types else "")
+                + f"; {confidence_clause}; {_age_phrase(age, recency)}{collision_clause}"
+            ),
+            evidence={
+                "ioc_count": count,
+                "malware_families": families,
+                "threat_types": threat_types,
+                "confidence_max": confidence,
+                "confidence_min": _as_float(data.get("threatfox_confidence_min")),
+                "discarded_partial_matches": discarded,
+                "first_seen": _as_str(data.get("threatfox_first_seen")),
+                "confidence_factor": confidence_factor,
+                "attribution_factor": attribution_factor,
+                "recency_factor": recency,
+                "observation_age_days": age,
+            },
+            raw_value=families or count,
+            observed_at=observed_raw,
+            source_url=None,
+        )
+    ]
+
+
+# --------------------------------------------------------------------------------------
 # Dispatchers over a whole analysis dict
 # --------------------------------------------------------------------------------------
 
@@ -1873,7 +2685,9 @@ def extract_ip_signals(analysis: Any, cfg: ScoringConfig, now: dt.datetime) -> L
     signals.extend(extract_virustotal_signals(data.get("virustotal"), cfg, now, scope=scope, indicator=indicator))
     signals.extend(extract_abuseipdb_signals(data.get("abuseipdb"), cfg, now, scope=scope, indicator=indicator))
     signals.extend(extract_otx_signals(data.get("otx"), cfg, now, scope=scope, indicator=indicator))
-    signals.extend(extract_shodan_signals(data.get("shodan"), cfg, now, scope=scope, indicator=indicator))
+    signals.extend(_extract_exposure_for_entry(data.get("shodan"), cfg, now, scope=scope, indicator=indicator))
+    signals.extend(extract_abusech_signals(data.get("abusech"), cfg, now, scope=scope, indicator=indicator))
+    signals.extend(extract_rdap_signals(data.get("rdap"), cfg, now, scope=scope, indicator=indicator))
     signals.extend(extract_ipinfo_signals(data.get("ipinfo"), cfg, now, scope=scope, indicator=indicator))
     signals.extend(
         extract_asn_metadata_signals(
@@ -1881,6 +2695,29 @@ def extract_ip_signals(analysis: Any, cfg: ScoringConfig, now: dt.datetime) -> L
         )
     )
     return signals
+
+
+def _extract_exposure_for_entry(
+    payload: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    scope: IndicatorScope,
+    indicator: Optional[str],
+) -> List[Signal]:
+    """Attribute the exposure payload to whichever Shodan surface actually produced it.
+
+    The orchestrator publishes both the paid host record and the keyless InternetDB extract
+    under one ``shodan`` key, because they are alternative implementations of one provider slot
+    and counting them as two would permanently understate coverage by one for every operator.
+    The payload itself says which one answered -- ``source`` is present only on the InternetDB
+    shape -- so the signal can name the dataset without the orchestrator having to pass a flag
+    down. A report with no CVE ages should say which dataset it came from.
+    """
+    data = _as_dict(payload)
+    if _as_str(data.get("source")) == INTERNETDB_SOURCE_VALUE:
+        return extract_internetdb_signals(data, cfg, now, scope=scope, indicator=indicator)
+    return extract_shodan_signals(data, cfg, now, scope=scope, indicator=indicator)
 
 
 def extract_domain_intel_signals(
@@ -1903,6 +2740,40 @@ def extract_domain_intel_signals(
     vt = data.get("virustotal")
     signals: List[Signal] = []
     signals.extend(extract_virustotal_signals(vt, cfg, now, scope=scope, indicator=domain))
-    signals.extend(extract_domain_signals(vt, cfg, now, scope=scope, indicator=domain))
+
+    # RDAP first, because it decides whether the whois-derived age still has a job. Both answer
+    # "how old is this domain" and RDAP answers it from the registry's structured record rather
+    # than by pattern-matching free text, so when RDAP reported anything -- a date, or the fact
+    # that it has none -- the whois age is suppressed and the registration is scored once.
+    rdap_signals = extract_rdap_signals(data.get("rdap"), cfg, now, scope=scope, indicator=domain)
+    age_reported = any(signal.id == SignalId.RDAP_DOMAIN_AGE.value for signal in rdap_signals)
+    signals.extend(rdap_signals)
+    signals.extend(extract_domain_signals(vt, cfg, now, scope=scope, indicator=domain, age_reported=age_reported))
+
     signals.extend(extract_otx_signals(data.get("otx"), cfg, now, scope=scope, indicator=domain))
+    signals.extend(extract_abusech_signals(data.get("abusech"), cfg, now, scope=scope, indicator=domain))
+    signals.extend(extract_tranco_signals(data.get("tranco"), cfg, now, scope=scope, indicator=domain))
     return signals
+
+
+def extract_url_signals(
+    url_intel: Any,
+    cfg: ScoringConfig,
+    now: dt.datetime,
+    *,
+    url: Optional[str] = None,
+) -> List[Signal]:
+    """Every signal available from ``data['url_intel']`` for a URL investigation.
+
+    One source today. URLhaus is a database *of malware distribution URLs*, so the URL scope is
+    where it is at its strongest: an exact-URL record carries a retrieved file and its hash, with
+    none of the shared-hosting ambiguity a host-level hit inherits.
+
+    VirusTotal's URL report is collected and rendered but is **not** scored here: the ruleset
+    declares no ``vt.*`` signal whose ``applies_to`` includes ``url``, and inventing weights for
+    one in this function would put scoring constants in a ``.py`` file. Until they land in the
+    ruleset, a URL verdict rests on abuse.ch or on nothing, and the coverage line says which.
+    """
+    now = _require_aware(now)
+    data = _as_dict(url_intel)
+    return extract_abusech_signals(data.get("abusech"), cfg, now, scope=IndicatorScope.URL, indicator=url)

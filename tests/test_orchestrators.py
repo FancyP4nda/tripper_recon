@@ -35,6 +35,9 @@ import respx
 
 from tripper_recon import __version__, orchestrators
 from tripper_recon.orchestrators import (
+    ASN_PROVIDERS,
+    DOMAIN_PROVIDERS,
+    IP_PROVIDERS,
     MAX_CONCURRENT_IPS,
     MAX_CONCURRENT_NEIGHBOUR_LOOKUPS,
     _error_details,
@@ -53,6 +56,16 @@ from tripper_recon.utils.http import PassiveBoundaryViolation
 from tripper_recon.utils.redact import _SECRET_ENV_VARS, REDACTED
 
 SECRET = "sk-tripperTESTSECRET-0123456789"
+
+#: Coverage denominators, read from the declared provider sets rather than written out.
+#:
+#: These counts move whenever a provider is wired in, and a literal here turns every such change
+#: into a scavenger hunt through unrelated assertions. What each test is actually pinning is the
+#: RELATIONSHIP -- "every declared provider is in the denominator", "the never-attempted one
+#: stays in it" -- and that relationship is what survives the next addition.
+IP_PROVIDER_COUNT = len(IP_PROVIDERS)
+DOMAIN_PROVIDER_COUNT = len(DOMAIN_PROVIDERS)
+ASN_PROVIDER_COUNT = len(ASN_PROVIDERS)
 
 
 @pytest.fixture(autouse=True)
@@ -372,7 +385,7 @@ async def test_investigate_ip_accepts_a_public_address_as_far_as_the_guard() -> 
 
     # ...and failed for the W4.2 reason instead, said plainly and said first.
     assert result.ok is False
-    assert result.data["coverage"]["headline"] == "0 of 6 providers answered"
+    assert result.data["coverage"]["headline"] == f"0 of {IP_PROVIDER_COUNT} providers answered"
     assert result.errors[0].startswith("no provider answered for 8.8.8.8")
 
 
@@ -427,7 +440,7 @@ async def test_investigate_asn_accepts_a_valid_asn_as_far_as_the_guard() -> None
     assert result.errors
 
     assert result.ok is False
-    assert result.data["coverage"]["headline"] == "0 of 10 providers answered"
+    assert result.data["coverage"]["headline"] == f"0 of {ASN_PROVIDER_COUNT} providers answered"
 
 
 # =======================================================================================
@@ -655,18 +668,10 @@ async def test_asn_path_reports_every_provider_it_considered() -> None:
     async with respx.mock(assert_all_called=False):
         result = await investigate_asn(15169)
 
-    assert set(result.data["provider_status"]) == {
-        "ipinfo_asn",
-        "ripe_overview",
-        "ripe_abuse",
-        "caida",
-        "peeringdb",
-        "ripe_routing_status",
-        "ripe_neighbors",
-        "ripe_prefixes",
-        "cloudflare_bgp",
-        "cloudflare_asn",
-    }
+    # Every declared ASN provider, and nothing that was not declared. Compared against
+    # ASN_PROVIDERS rather than a copied list so the two cannot drift: a provider added to the
+    # set but never called would leave the status map short, and that is what this pins.
+    assert set(result.data["provider_status"]) == set(ASN_PROVIDERS)
     # No Cloudflare token in the environment, so both Cloudflare calls are configuration
     # rather than incidents -- recorded, and deliberately absent from the error list.
     assert result.data["provider_status"]["cloudflare_bgp"]["outcome"] == "not_configured"
@@ -776,15 +781,35 @@ async def test_a_non_positive_deadline_disables_the_ceiling(monkeypatch: pytest.
 # ---------------------------------------------------------------------------
 
 
-async def test_the_five_per_ip_providers_run_in_one_wave(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+async def test_the_per_ip_providers_run_in_one_wave(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
+    """Every per-IP provider is in flight at once, including the two wired in W8.
+
+    A Shodan key is set so the PAID exposure provider is the one under the probe: without a key
+    the slot falls back to InternetDB and ``shodan_host`` is never called, which would silently
+    turn this into a four-provider assertion.
+    """
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
     probe = _Probe()
-    for attribute in ("vt_ip_summary", "ipinfo_ip", "shodan_host", "abuseipdb_check", "otx_ip_pulses"):
+    patched = (
+        "vt_ip_summary",
+        "ipinfo_ip",
+        "shodan_host",
+        "abuseipdb_check",
+        "otx_ip_pulses",
+        "rdap_ip",
+        "abusech_host_summary",
+    )
+    for attribute in patched:
         monkeypatch.setattr(orchestrators, attribute, _slow_provider(probe))
+    # The two W8 providers are gated on the egress allowlist, which is wired in a file this
+    # change does not own. Permit their hosts for this test so the concurrency of the whole wave
+    # is what is measured, rather than the wiring state of the allowlist.
+    monkeypatch.setattr(orchestrators, "NEW_PROVIDER_EGRESS_HOSTS", {})
 
     result = await investigate_ip("8.8.8.8")
 
     assert result.ok is True
-    assert probe.peak == 5, f"providers ran {probe.peak}-at-a-time; the wave is still partly serial"
+    assert probe.peak == len(patched), f"providers ran {probe.peak}-at-a-time; the wave is still partly serial"
 
 
 async def test_domain_ips_are_enriched_concurrently(monkeypatch: pytest.MonkeyPatch, unlimited_rate: None) -> None:
@@ -890,7 +915,7 @@ def _fake_resolver(addresses: list[str]) -> Callable[..., Any]:
 
 
 def _fake_wave(probe: _Probe | None = None) -> Callable[..., Any]:
-    """Stand in for ``_ip_provider_wave`` with five providers that answered emptily."""
+    """Stand in for ``_ip_provider_wave`` with every per-IP provider answering emptily."""
 
     async def _wave(*, client: Any, keys: Any, ip: str) -> dict[str, Any]:
         if probe is None:
@@ -902,11 +927,17 @@ def _fake_wave(probe: _Probe | None = None) -> Callable[..., Any]:
     return _wave
 
 
+#: The keys ``_ip_provider_wave`` returns, and therefore the ones ``_ip_entry`` indexes.
+#:
+#: Derived from ``IP_PROVIDERS`` minus ``cloudflare_asn``, which is the second wave and is added
+#: by ``_asn_meta_for_ip`` rather than by the wave. Derived rather than written out so that a
+#: provider added to the set without being added to the wave fails here instead of at the first
+#: ``KeyError`` inside an orchestrator.
+_WAVE_PROVIDERS: tuple[str, ...] = tuple(name for name in orchestrators.IP_PROVIDERS if name != "cloudflare_asn")
+
+
 def _empty_calls() -> dict[str, Any]:
-    return {
-        name: orchestrators._envelope(name, _ok(), 0.0)
-        for name in ("virustotal", "ipinfo", "shodan", "abuseipdb", "otx")
-    }
+    return {name: orchestrators._envelope(name, _ok(), 0.0) for name in _WAVE_PROVIDERS}
 
 
 def _vt_domain_with_a_records(addresses: list[str]) -> Callable[..., Any]:
@@ -959,11 +990,11 @@ async def test_a_total_blackout_is_not_ok() -> None:
     assert result.ok is False
     assert result.coverage is not None
     assert result.coverage.answered_count == 0
-    assert result.coverage.applicable_count == 6
+    assert result.coverage.applicable_count == IP_PROVIDER_COUNT
     # The reason is stated first, because cli.py's failure branch prints '; '.join(errors) and
     # nothing else -- and a blackout caused by unset keys produces no provider errors to print.
     assert result.errors[0] == (
-        "no provider answered for 8.8.8.8 (0 of 6 providers answered): "
+        f"no provider answered for 8.8.8.8 (0 of {IP_PROVIDER_COUNT} providers answered): "
         "this is an intelligence blackout, not a clean result"
     )
 
@@ -980,24 +1011,27 @@ async def test_a_partial_answer_is_ok_and_says_how_partial(monkeypatch: pytest.M
     assert result.coverage is not None
     assert result.coverage.answered == ["shodan"]
     assert result.coverage.is_complete is False
-    assert result.data["coverage"]["headline"] == "1 of 6 providers answered"
+    assert result.data["coverage"]["headline"] == f"1 of {IP_PROVIDER_COUNT} providers answered"
 
 
 async def test_the_denominator_is_declared_not_counted_from_attempts() -> None:
     """``cloudflare_asn`` runs only when IPinfo returns an ASN, so a failed IPinfo means it is
     never attempted at all.
 
-    A denominator derived from the calls that happened would shrink from six to five exactly
-    when IPinfo failed, and report BETTER coverage for the worse run. ``IP_PROVIDERS`` is
-    declared so the never-attempted provider stays in the denominator as ``skipped``.
+    A denominator derived from the calls that happened would shrink by one exactly when IPinfo
+    failed, and report BETTER coverage for the worse run. ``IP_PROVIDERS`` is declared so the
+    never-attempted provider stays in the denominator as ``skipped``.
     """
     async with respx.mock(assert_all_called=False):
         result = await investigate_ip("8.8.8.8")
 
     assert "cloudflare_asn" not in result.data["provider_status"]
     assert result.coverage is not None
-    assert result.coverage.skipped == ["cloudflare_asn"]
-    assert result.coverage.applicable_count == 6
+    # ``in``, not equality: the W8 providers also land in ``skipped`` until their hosts reach
+    # the egress allowlist. What this test pins is that a provider nobody attempted stays in
+    # the denominator, which the total below asserts directly.
+    assert "cloudflare_asn" in result.coverage.skipped
+    assert result.coverage.applicable_count == IP_PROVIDER_COUNT
 
 
 async def test_ok_is_true_as_soon_as_one_provider_answers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1130,7 +1164,7 @@ async def test_a_suppressed_failure_is_still_reported_as_missing_coverage(
 
 
 async def test_every_resolved_address_carries_its_own_coverage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One address answered by five providers beside one answered by none is a distinction a
+    """One address answered by every provider beside one answered by none is a distinction a
     single run-level number would flatten, and each address gets its own console panel."""
     monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
     monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["1.1.1.1", "2.2.2.2"]))
@@ -1138,23 +1172,27 @@ async def test_every_resolved_address_carries_its_own_coverage(monkeypatch: pyte
     result = await investigate_domain("example.test")
 
     for entry in result.data["ips"]:
-        # Five per-IP providers answered; cloudflare_asn was never reached, and stays in the
-        # denominator rather than quietly leaving it.
-        assert entry["coverage"]["headline"] == "5 of 6 providers answered"
+        # Every provider in the wave answered; cloudflare_asn is the second wave and was never
+        # reached, and it stays in the denominator rather than quietly leaving it.
+        assert entry["coverage"]["headline"] == (f"{len(_WAVE_PROVIDERS)} of {IP_PROVIDER_COUNT} providers answered")
+        assert entry["coverage"]["skipped"] == ["cloudflare_asn"]
 
 
 async def test_domain_coverage_spans_both_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two domain-level providers plus six per-address calls for each of two addresses."""
+    """Every domain-level provider plus every per-address call for each of two addresses."""
     monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
     monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver(["1.1.1.1", "2.2.2.2"]))
 
     result = await investigate_domain("example.test")
 
     assert result.coverage is not None
-    # 2 domain-level + (6 x 2) per-address. Names are namespaced, so the same provider asked
-    # about two addresses counts twice instead of collapsing to one.
-    assert result.coverage.applicable_count == 14
-    assert result.coverage.answered_count == 10
+    # Every domain-level provider plus every per-IP provider for each of two addresses. Names
+    # are namespaced, so the same provider asked about two addresses counts twice instead of
+    # collapsing to one.
+    assert result.coverage.applicable_count == DOMAIN_PROVIDER_COUNT + 2 * IP_PROVIDER_COUNT
+    # The wave answered for both addresses; every domain-level provider is unconfigured or
+    # not yet allowlisted, and cloudflare_asn was never reached for either address.
+    assert result.coverage.answered_count == 2 * len(_WAVE_PROVIDERS)
     assert "domain:virustotal" in result.coverage.unconfigured
     assert "1.1.1.1:cloudflare_asn" in result.coverage.skipped
 
@@ -1308,3 +1346,304 @@ async def test_a_domain_resolving_only_to_internal_space_is_not_ok(monkeypatch: 
     assert result.data["addresses"] == {"resolved": 2, "investigated": 0, "skipped": 2}
     assert len(result.skipped_addresses) == 2
     assert result.errors[0].startswith("no provider answered for internal.example.test")
+
+
+# =======================================================================================
+# W8 — the four new passive sources, wired into the investigation
+#
+# The recurring device in this section is ``monkeypatch.setattr(orchestrators,
+# "NEW_PROVIDER_EGRESS_HOSTS", {})``. Those providers' hosts reach ``ALLOWED_EGRESS_HOSTS`` in
+# ``utils/http.py``, a file this change does not own, in the integration commit; until then the
+# orchestrator records them as ``skipped`` rather than letting an unlisted host raise
+# ``PassiveBoundaryViolation`` and abort the whole run. Clearing the map is how a test measures
+# the wiring rather than the current state of the allowlist. The runtime hook is untouched by
+# it, which the last test in this section pins.
+# =======================================================================================
+
+
+@pytest.fixture
+def egress_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat every newly-wired provider's host as allowlisted for the duration of one test."""
+    monkeypatch.setattr(orchestrators, "NEW_PROVIDER_EGRESS_HOSTS", {})
+
+
+def _recording_provider(calls: list[dict[str, Any]], payload: dict[str, Any]) -> Callable[..., Any]:
+    """A stand-in provider that records the keyword arguments it was called with."""
+
+    async def _call(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return payload
+
+    return _call
+
+
+# ---------------------------------------------------------------------------
+# 8.1 — one exposure slot, two implementations
+# ---------------------------------------------------------------------------
+
+
+async def test_the_paid_shodan_record_is_preferred_whenever_a_key_exists(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """InternetDB is a strict subset -- no banners, no org, and no ``last_update``. Choosing it
+    for an operator who is paying for the full record is a silent downgrade."""
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    paid: list[dict[str, Any]] = []
+    keyless: list[dict[str, Any]] = []
+    monkeypatch.setattr(orchestrators, "shodan_host", _recording_provider(paid, _ok(ports=[443], org="Example")))
+    monkeypatch.setattr(orchestrators, "internetdb_host", _recording_provider(keyless, _ok(ports=[443])))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert len(paid) == 1
+    assert keyless == []
+    assert result.data["shodan"]["org"] == "Example"
+
+
+async def test_the_keyless_extract_answers_when_no_shodan_key_is_set(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """Roadmap 8.1: with no key this path used to return ``missing_api_key`` and be suppressed,
+    so exposed services and their CVEs were absent from every report an unkeyed operator ran."""
+    paid: list[dict[str, Any]] = []
+    keyless: list[dict[str, Any]] = []
+    monkeypatch.setattr(orchestrators, "shodan_host", _recording_provider(paid, _ok(ports=[443])))
+    monkeypatch.setattr(
+        orchestrators,
+        "internetdb_host",
+        _recording_provider(keyless, _ok(ports=[3389], vulns=["CVE-2021-44228"], source="shodan_internetdb")),
+    )
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert paid == []
+    assert len(keyless) == 1
+    assert result.data["shodan"]["vulns"] == ["CVE-2021-44228"]
+    # The discriminator survives into the payload, so a report with no CVE ages can say which
+    # dataset answered.
+    assert result.data["shodan"]["source"] == "shodan_internetdb"
+
+
+async def test_the_two_exposure_implementations_share_one_coverage_slot(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """Listing both would make the ratio permanently understate coverage by one for every
+    operator, since exactly one of the pair can ever answer."""
+    monkeypatch.setattr(orchestrators, "internetdb_host", _fake_provider(_ok(ports=[3389])))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert "internetdb" not in result.data["provider_status"]
+    assert result.data["provider_status"]["shodan"]["outcome"] == "ok"
+    assert IP_PROVIDERS.count("shodan") == 1
+    assert "internetdb" not in IP_PROVIDERS
+
+
+async def test_a_paid_shodan_404_does_not_fall_back_to_the_keyless_surface(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """The choice is made on key presence, never on the paid call's outcome. Re-asking a second
+    Shodan surface about the same address doubles the egress to learn nothing -- a paid 404 is
+    already a terminal "no record"."""
+    monkeypatch.setenv("SHODAN_API_KEY", "shodan-key-0123456789")
+    keyless: list[dict[str, Any]] = []
+    monkeypatch.setattr(orchestrators, "shodan_host", _fake_provider({"ok": False, "error": "not_found"}))
+    monkeypatch.setattr(orchestrators, "internetdb_host", _recording_provider(keyless, _ok(ports=[3389])))
+
+    async with respx.mock(assert_all_called=False):
+        await investigate_ip("8.8.8.8")
+
+    assert keyless == []
+
+
+# ---------------------------------------------------------------------------
+# 8.2 / 8.3 / 8.7 — the new providers reach the right paths
+# ---------------------------------------------------------------------------
+
+
+async def test_every_new_provider_is_declared_in_the_set_that_calls_it() -> None:
+    """The set is the coverage DENOMINATOR. A provider called but not declared would report
+    better coverage than the run actually achieved."""
+    assert {"rdap", "abusech"} <= set(IP_PROVIDERS)
+    assert {"rdap", "tranco", "abusech"} <= set(DOMAIN_PROVIDERS)
+    assert "abusech" in orchestrators.URL_PROVIDERS
+    assert "rdap" in ASN_PROVIDERS
+
+
+async def test_the_domain_path_carries_rdap_tranco_and_abusech_intel(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    monkeypatch.setenv("ABUSECH_AUTH_KEY", "abusech-key-0123456789")
+    monkeypatch.setattr(orchestrators, "_ip_provider_wave", _fake_wave())
+    monkeypatch.setattr("tripper_recon.utils.dns.resolve_domain", _fake_resolver([]))
+    monkeypatch.setattr(orchestrators, "rdap_domain", _fake_provider(_ok(rdap_age_days=3.0)))
+    monkeypatch.setattr(orchestrators, "tranco_rank", _fake_provider(_ok(tranco_in_list=True, tranco_rank=17)))
+    monkeypatch.setattr(orchestrators, "abusech_host_summary", _fake_provider(_ok(urlhaus_url_count=2)))
+
+    result = await investigate_domain("example.test")
+
+    intel = result.data["domain_intel"]
+    assert intel["rdap"]["rdap_age_days"] == 3.0
+    assert intel["tranco"]["tranco_rank"] == 17
+    assert intel["abusech"]["urlhaus_url_count"] == 2
+    for name in ("rdap", "tranco", "abusech"):
+        assert result.data["domain_provider_status"][name]["outcome"] == "ok"
+
+
+async def test_abusech_is_one_call_per_indicator_using_the_composed_summary(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """One provider slot, two requests underneath. Calling the platform endpoints separately
+    from here would put the partial-failure merge rule in the orchestrator, where it is not
+    unit-testable."""
+    monkeypatch.setenv("ABUSECH_AUTH_KEY", "abusech-key-0123456789")
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(orchestrators, "abusech_host_summary", _recording_provider(seen, _ok(urlhaus_url_count=1)))
+    monkeypatch.setattr(orchestrators, "internetdb_host", _fake_provider(_ok(ports=[])))
+
+    async with respx.mock(assert_all_called=False):
+        await investigate_ip("8.8.8.8")
+
+    assert len(seen) == 1
+    assert seen[0]["host"] == "8.8.8.8"
+    assert seen[0]["api_key"] == "abusech-key-0123456789"
+
+
+async def test_the_url_path_asks_abusech_about_the_exact_url(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """URLhaus is a database OF URLs, so the URL scope is where it is strongest: an exact-URL
+    record has none of the shared-hosting ambiguity a host-level hit inherits."""
+    monkeypatch.setenv("ABUSECH_AUTH_KEY", "abusech-key-0123456789")
+    seen: list[dict[str, Any]] = []
+    monkeypatch.setattr(orchestrators, "abusech_url_summary", _recording_provider(seen, _ok(urlhaus_id="1")))
+    monkeypatch.setattr(orchestrators, "vt_url_summary", _fake_provider({"ok": False, "error": "http_error"}))
+
+    async with respx.mock(assert_all_called=False):
+        result = await orchestrators.investigate_url("http://evil.example/a.bin", depth="url")
+
+    assert len(seen) == 1
+    assert seen[0]["url"] == "http://evil.example/a.bin"
+    assert result.data["url_intel"]["abusech"]["urlhaus_id"] == "1"
+    assert result.data["url_provider_status"]["abusech"]["outcome"] == "ok"
+
+
+async def test_the_asn_path_publishes_the_rdap_record_beside_the_aggregate(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """Its own key, not merged into ``meta``: the RIR's allocation record and the aggregate the
+    other providers build are different claims with different provenance."""
+    monkeypatch.setattr(orchestrators, "rdap_asn", _fake_provider(_ok(rdap_autnum_handle="AS15169")))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_asn(15169)
+
+    assert result.data["rdap"]["rdap_autnum_handle"] == "AS15169"
+    assert "rdap_autnum_handle" not in result.data["meta"]
+
+
+async def test_an_unset_abusech_key_is_not_configured_and_makes_no_request(
+    monkeypatch: pytest.MonkeyPatch, egress_permitted: None
+) -> None:
+    """A missing credential must never look like a provider that answered.
+
+    ``missing_api_key`` is in ``NOT_CONFIGURED_ERRORS``, so it files as ``not_configured`` --
+    still in the denominator, never in the numerator. The provider module returns that envelope
+    before building a request, so the absence of a key costs nothing and discloses nothing.
+    """
+    monkeypatch.delenv("ABUSECH_AUTH_KEY", raising=False)
+    monkeypatch.setattr(orchestrators, "internetdb_host", _fake_provider(_ok(ports=[])))
+
+    async with respx.mock(assert_all_called=False):
+        result = await investigate_ip("8.8.8.8")
+
+    assert orchestrators._abusech_key() is None
+    assert result.data["provider_status"]["abusech"]["outcome"] == "not_configured"
+    assert result.coverage is not None
+    assert "abusech" in result.coverage.unconfigured
+    assert "abusech" not in result.coverage.answered
+
+
+# ---------------------------------------------------------------------------
+# The egress gate for newly-wired providers
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unlisted_host_is_skipped_without_a_request_and_stays_in_the_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The alternative is worse than a gap. ``_call_provider`` re-raises
+    ``PassiveBoundaryViolation`` deliberately, so one un-allowlisted host would abort every
+    investigation the tool performs -- an outage, not missing coverage."""
+    monkeypatch.setattr(
+        orchestrators,
+        "NEW_PROVIDER_EGRESS_HOSTS",
+        {
+            "rdap": ("not-allowlisted.example",),
+            "abusech": ("also-not.example",),
+            "internetdb": ("nor-this.example",),
+        },
+    )
+    # Would answer happily if it were reached. It must not be reached.
+    monkeypatch.setattr(orchestrators, "rdap_ip", _fake_provider(_ok(rdap_age_days=1.0)))
+
+    async with no_network():
+        result = await investigate_ip("8.8.8.8")
+
+    status = result.data["provider_status"]["rdap"]
+    assert status["outcome"] == "skipped"
+    assert status["error"]["error"] == "host_not_allowlisted"
+    assert "not-allowlisted.example" in status["error"]["hosts"]
+    assert result.coverage is not None
+    assert "rdap" in result.coverage.skipped
+    assert result.coverage.applicable_count == IP_PROVIDER_COUNT
+    # A wiring gap is not an incident: it stays out of the error list, and out of the
+    # "failed, and kept out of the error list" warning, which is for calls that were made.
+    assert not any("rdap" in message for message in result.errors)
+    assert not any("kept out of the error list" in w and "rdap" in w for w in result.warnings)
+    # It IS named, under the bucket that describes it.
+    assert any("never attempted" in w and "rdap" in w for w in result.warnings)
+
+
+def test_the_declared_hosts_come_from_the_provider_modules_themselves() -> None:
+    """Derived, not copied. A literal here would drift from the module it describes, and
+    ``tests/test_passivity.py`` scans this package for URL literals."""
+    from tripper_recon.providers import abusech, internetdb, rdap, tranco
+
+    hosts = orchestrators.NEW_PROVIDER_EGRESS_HOSTS
+    assert hosts["internetdb"] == (orchestrators._host_of(internetdb.INTERNETDB_BASE),)
+    assert hosts["rdap"] == (orchestrators._host_of(rdap.IANA_BOOTSTRAP_BASE),)
+    assert hosts["tranco"] == (orchestrators._host_of(tranco.TRANCO_BASE),)
+    assert set(hosts["abusech"]) == {
+        orchestrators._host_of(abusech.URLHAUS_URL_ENDPOINT),
+        orchestrators._host_of(abusech.THREATFOX_ENDPOINT),
+    }
+    assert all(host for group in hosts.values() for host in group)
+
+
+def test_the_gate_reads_the_live_allowlist_rather_than_a_copy() -> None:
+    """So it starts passing the moment the integrator adds the entries, with no second edit --
+    and so this check and the runtime hook can never disagree about what is permitted."""
+    assert orchestrators.ALLOWED_EGRESS_HOSTS is http.ALLOWED_EGRESS_HOSTS
+    permitted = next(iter(http.ALLOWED_EGRESS_HOSTS))
+    assert orchestrators._unpermitted_hosts("nonexistent-provider") == ()
+    assert permitted not in orchestrators._unpermitted_hosts("rdap")
+
+
+async def test_the_runtime_hook_is_still_the_enforcement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clearing the gate does not weaken the boundary: a request to an unlisted host still
+    raises, and ``_call_provider`` still refuses to downgrade it to a provider error."""
+    monkeypatch.setattr(orchestrators, "NEW_PROVIDER_EGRESS_HOSTS", {})
+
+    async def _reach_out(**_kwargs: Any) -> dict[str, Any]:
+        async with orchestrators.create_client() as client:
+            await client.get("https://not-on-the-allowlist.example/x")
+        return _ok()
+
+    monkeypatch.setattr(orchestrators, "rdap_ip", _reach_out)
+
+    with pytest.raises(PassiveBoundaryViolation):
+        await investigate_ip("8.8.8.8")
