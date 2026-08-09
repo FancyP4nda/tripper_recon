@@ -230,7 +230,7 @@ Ordered by value per line. Every one is keyless or cheap. Skippable in whole or 
 | 8.5 | Tor bulk exit list (never the per-IP DNSEL) | new | Answers "is this a Tor exit" without paying for IPinfo Plus. IPv4-only, so the honest answer for IPv6 is **unknown**, not no — the output must say which |
 | 8.6 | Spamhaus DROP / ASN-DROP JSON, with attribution text carried into output | new | The ASN path carries no reputation signal at all today. Attribution and the date/copyright line are a licence requirement and must surface in console **and** JSON |
 | 8.7 | URLhaus + ThreatFox behind one abuse.ch Auth-Key | new provider, POST form-encoded | Highest accuracy gain per line available: actor-attributed, payload-backed observations. A live hit forces MALICIOUS at HIGH confidence. **Gate off in bulk mode** pending open question Q5 |
-| 8.8 | GreyNoise Community, quota-gated with a visible exhaustion warning | new provider | `noise` and `riot` answer the two questions that most often decide escalation. 10 lookups/day unauthenticated; consumer-email accounts get no key at all. Cannot be default-on in bulk mode |
+| ~~8.8~~ | ~~GreyNoise Community~~ **STRUCK (Q10)** -- no eligible non-consumer email address, so this can never be started. Removed rather than left filed | ~~new provider~~ | `noise` and `riot` answer the two questions that most often decide escalation. 10 lookups/day unauthenticated; consumer-email accounts get no key at all. Cannot be default-on in bulk mode |
 | 8.9 | Cert Spotter primary, crt.sh fallback | new provider | Not the reverse: crt.sh returned 502 and 404 during the audit session. A SOC tool whose answer intermittently 502s is worse than one that omits the field |
 | 8.10 | TTL disk cache for the bulk-file sources (KEV, Tor list, DROP) | new | Prerequisite for 8.4/8.5/8.6 not becoming a download per invocation |
 
@@ -279,6 +279,25 @@ Each of these was proposed or implied by an input document and is being declined
 | **A generic table/plugin framework for `console.py`** | Every new source costs a second edit in the renderer today, which is annoying but not a defect. Refactoring the renderer into a framework before the verdict engine defines what it renders is exactly backwards |
 | **Publishing any accuracy figure before the held-out corpus exists** | The corpus is circular by construction — precision measured on a URLhaus-labelled set against a scorer that reads URLhaus is the engine grading its own answer key. Until hold-one-feed-out and temporal-split validation run, the tool ships with **no accuracy claim at all**. "Tuned against N labelled indicators, held-out precision X" is defensible; "accurate" is not |
 | **A denylist of named low-quality VirusTotal engines** | No measured basis exists. Shipping an unsourced list of named vendors is both wrong and a liability. Weights come from the corpus or they do not exist |
+
+---
+
+## 4b. Operator decisions (settled 2026-08-09)
+
+These were open questions. They are now answered and are **not to be re-litigated** by a future
+session. Where a decision went against the recommendation in this document, the recommendation is
+left in place above so the reasoning stays legible -- the decision below wins.
+
+| # | Decision | Consequence |
+|---|---|---|
+| Q1 | User-Agent was inherited, not deliberate | Done in W2.6: `tripper-recon/<version>` |
+| Q2 | **System-resolver egress is an ACCEPTED RISK** | 2.2 is documentation, not code. No `--active-dns` flag. Live resolution stays the default and is disclosed in `docs/OPSEC.md` section 3 |
+| Q3 | Retrieve published limits with a retrieval date; never from memory | Blocks `docs/RATE-LIMITS.md` (9.4) and the per-provider budget (3.4) until retrieved |
+| Q5 | **abuse.ch: build 8.7 in full, including bulk mode, no gate** | Operator accepts the terms-of-service exposure. Their Terms prohibit high-volume automated harvesting by "robots, spiders or scripts"; bulk mode is arguably that. Recorded in `docs/OPSEC.md` rather than mitigated |
+| Q8 | **Nothing consumes the FastAPI server; delete it** | Done in W0.8. Removed a class of exposure and the schema-stability requirement in 7.1 |
+| Q10 | **GreyNoise: STRUCK, no eligible address** | 8.8 removed from the plan rather than left filed as a task that can never start |
+| Scope | **Value-ranked subset, not full W7+W8** | Order: W9 docs -> W8.2 RDAP + 8.1 InternetDB + 8.3 Tranco + 8.7 abuse.ch -> W7.7 caching + 7.2 markdown. Reassess after real use. The remaining W7/W8 items are deferred, not cancelled |
+| W5.9 | **Build the recording harness; the operator runs it** | The quota spend and the provider-side log entries are his deliberate act. Until then the ruleset stays `calibration.status: unvalidated` with no accuracy claim |
 
 ---
 

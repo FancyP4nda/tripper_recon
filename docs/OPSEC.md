@@ -104,8 +104,11 @@ read the passive DNS records VirusTotal already returns. The tool parses those p
 records at `orchestrators.py:992` and merges them with the active results at `:1130` — so the
 passive substitute is already present, just not selectable.
 
-**Planned.** Passive DNS becomes the default and live resolution moves behind an explicit
-`--active-dns` flag, with the collection mode recorded in the output. `docs/ROADMAP.md` item 2.2.
+**Settled: this is an accepted risk, not a pending fix.** Live resolution stays the default and is
+disclosed here rather than removed. **There is no `--active-dns` flag and none is planned**
+(`docs/ROADMAP.md` §4b, decision Q2, which resolves item 2.2 to documentation rather than code).
+The controls that do exist are the ones above: `--depth url`, `--depth host`, or investigating the
+addresses directly with `tripper-recon ip`.
 
 ## 4. What the third-party providers learn
 
@@ -114,7 +117,9 @@ Passive does not mean invisible. It means the *target* does not see you. The pro
 - **Every query is attributable to your API key.** A VirusTotal lookup is logged against your
   account. Assume your employer, the provider, and anyone with access to provider logs can see
   which indicators you investigated and when.
-- **Your egress IP is visible** to all eleven providers.
+- **Your egress IP is visible** to every provider the tool actually queries — the ten wired
+  provider modules. `providers/urlscan.py` is the eleventh module and no orchestrator calls it, so
+  urlscan.io sees nothing today (section 6, gap 3).
 - **The indicator list itself is sensitive.** The set of things you are looking at can reveal an
   ongoing incident before you are ready to disclose it.
 - **Look-ups are not submissions.** Nothing in this tool contributes your indicators to a public
@@ -137,8 +142,8 @@ the wrong instrument. Use an offline data set.
 | API keys redacted from every error payload, including the failing request URL | `utils/redact.py`, `orchestrators.py:251` |
 | Redirect chains reported as NOT RESOLVED unless a third party's scan supplied one | `utils/urls.py:236-322` |
 | Every hop of a passively-sourced redirect chain is **defanged** in human-facing output, so a report pasted into a ticket or a chat client carries no clickable target URL | `reporting/console.py:1857` |
-| A URL whose **host** is a non-public address is withheld at triage as well as refused at the orchestrator | `cli.py:904` (triage), `orchestrators.py:1334` (orchestrator) |
-| A pasted email body cannot crash the `bulk` path through its filesystem probe | `cli.py:996` |
+| A URL whose **host** is a non-public address is withheld at triage as well as refused at the orchestrator | `cli.py:1116-1117` (triage), `orchestrators.py:1334` (orchestrator) |
+| A pasted email body cannot crash the `bulk` path through its filesystem probe | `cli.py:1214-1217` (`_read_bulk_text`, the `except (OSError, ValueError, RuntimeError)` guard) |
 | Investigation output is gitignored in bulk | `.gitignore:80-92` |
 | No `POST` to any submission endpoint anywhere in the package | `tests/test_passivity.py` sections 3 and 5 |
 

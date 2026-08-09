@@ -2,7 +2,7 @@
 
 # Tripper Recon
 
-**A passive, asynchronous OSINT toolkit for IP, Domain, and ASN investigations.**
+**A passive OSINT CLI for IP, domain, URL and ASN investigations — that says what it does not know.**
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -11,137 +11,590 @@
 
 ---
 
-## Overview
+## What this is
 
-Tripper Recon is an async Open Source Intelligence (OSINT) tool for infrastructure investigations. Whether you are hunting for threat actors, reviewing SIEM logs, or profiling external IP addresses, Tripper gives you one interface over ten third-party intelligence providers.
+An async command-line tool that asks third-party intelligence providers what they already know
+about an indicator, adjudicates their answers into one verdict, and shows you how much of the
+panel actually answered.
 
-It offers a CLI for analysts, with JSON output for scripted use.
+**It never touches the target.** Every request goes to a provider that already holds the data.
+There is no port scan, no banner grab, no HTTP request to the target, no redirect following, no
+shortener expansion, and no submission of a URL to a scanner that would load it. That constraint
+is enforced at runtime, not just intended — see [OPSEC and passivity](#opsec-and-passivity).
 
-## Key Features
+Two design rules run through the whole tool:
 
-- **Ten providers, one command**: VirusTotal, Shodan, AbuseIPDB, IPInfo, AlienVault OTX, Cloudflare Radar, Cloudflare BGP, RIPEstat, CAIDA AS-Rank, and PeeringDB.
-- **Works without keys**: the `asn` command runs fully on RIPEstat, CAIDA, and PeeringDB, which need no API key at all.
-- **Passive collection**: every query goes to a third-party API. The tool does not scan, connect to, or fetch the target. See [OPSEC & Passivity](#opsec--passivity).
-- **Concurrent IP lookups**: the `ip` command queries its five providers in one wave and processes bulk target files concurrently.
-- **Retry with backoff**: jittered exponential backoff on provider requests.
-- **Scriptable**: `-o json` emits the full result set; structured logs go to stderr so stdout stays parseable.
+- **Absent data never scores as clean.** A provider with no API key is missing coverage, not an
+  excuse. It is counted in the denominator and never in the numerator, and it renders as
+  `no data - not configured, no API key`, never as a green zero.
+- **The verdict and the confidence are separate axes.** "Score 71, confidence LOW, 2 of 6
+  providers answered" is a real state, and the tool prints all three parts of it.
 
-> **Status.** This is an active project under review. A sequenced hardening plan, with a
-> known-defect list and file-line evidence, is in [`docs/ROADMAP.md`](docs/ROADMAP.md); the
-> supporting audit reports are in [`docs/review/`](docs/review/). Read it before relying on
-> the output for a decision.
-
----
-
-## OPSEC & Passivity
-
-The tool is built to investigate infrastructure without touching it. Full detail, per provider, is in [`docs/OPSEC.md`](docs/OPSEC.md). The short version:
-
-- **All intelligence comes from third-party APIs.** No port scan, no banner grab, no HTTP request to the target, no submission of a URL for live scanning.
-- **One documented exception:** the `domain` command resolves the target with your system resolver. That recursive lookup can reach the target's own authoritative nameserver. Treat it as a disclosure risk on a live investigation — see `docs/OPSEC.md`.
-- **Every query is visible to the provider.** A VirusTotal lookup under your API key is attributable to you.
+> **Status: alpha, and under active hardening.** The verdict engine's weights are **unvalidated
+> priors** — no labelled corpus exists and the tool makes **no accuracy claim of any kind**. The
+> sequenced hardening plan, with a defect list and `file:line` evidence, is in
+> [`docs/ROADMAP.md`](docs/ROADMAP.md); the audits behind it are in [`docs/review/`](docs/review/).
+> Read [Known limitations](#known-limitations) before you rely on output for a decision.
 
 ---
 
-## Installation
+## Install
 
-Tripper Recon requires **Python 3.10+**.
+Requires **Python 3.10+**.
 
 ```bash
-# Clone the repository
 git clone https://github.com/FancyP4nda/tripper_recon.git
 cd tripper_recon
 
-# Install using pip (recommended to use a virtual environment)
-pip install .
+# conda (the environment this is developed against)
+conda create -n tripper python=3.12 && conda activate tripper
+
+pip install .            # or: pip install -e ".[dev]" for the test/lint toolchain
+```
+
+Runtime dependencies: `httpx[http2]`, `pydantic`, `python-dotenv`, `pyyaml`, `rich`
+([`pyproject.toml`](pyproject.toml)).
+
+**No configuration is required to try it.** Three providers need no key at all, so
+`tripper-recon asn 15169` works against a completely empty `.env`.
+
+---
+
+## The six subcommands
+
+| Command | What it does | Provider quota |
+|---|---|---|
+| `ip <addr\|file>` | One address, or a file of addresses processed concurrently | 6 providers per address |
+| `domain <name>` | The name itself, then each public address it resolves to | 2 at the domain level, then 6 per address |
+| `url <link>` | The link, then optionally its host and that host's addresses | 1 at the URL level, plus the depths you ask for |
+| `asn <number>` | Routing, peering, prefixes, registry and rank | 10 declared providers, 7 of which need no key |
+| `check <anything>` | Classify a pasted string and route it to the right lookup | routes; `--detect-only` costs **zero** |
+| `bulk [file\|-\|text]` | Extract and triage every indicator in a wall of pasted text | **zero** unless you pass `--investigate` |
+
+### Worked examples
+
+```bash
+# An address. Six providers in one wave.
+tripper-recon ip 8.8.8.8
+
+# A file of addresses: one per line, '#' comments skipped, duplicates collapsed.
+tripper-recon ip ./suspicious_ips.txt
+
+# A domain. Resolves it, then enriches each PUBLIC address it got back.
+tripper-recon domain example.com
+
+# An ASN. No API key needed for this one.
+tripper-recon asn 15169
+tripper-recon asn AS15169 --neighbors 4
+tripper-recon asn 15169 --prefixes-out as15169.txt --prefixes v4
+
+# A URL. --depth controls how far it pivots, and it is a passivity control:
+#   url  = the link's own report        (resolves nothing)
+#   host = plus the host's reputation   (resolves nothing)
+#   full = plus the host's addresses    (this is the depth that resolves) - the default
+tripper-recon url 'https://example.com/login' --depth host
+
+# One verb for a string of unknown shape, pasted under pressure. Defanged input is fine.
+tripper-recon check 'hxxps://secure-login-update[.]example/verify?id=8842'
+
+# Classify and stop. Zero quota: detection is a pure function over the string.
+tripper-recon check 45.33.32.156 --detect-only
+
+# Triage a whole phishing email. Zero quota by default; nothing is deleted, only withheld.
+tripper-recon bulk ./message.eml
+cat message.eml | tripper-recon bulk -
+tripper-recon bulk ./message.eml --investigate --max-targets 5
+
+# Show every weight, its ruleset key and its evidence behind the verdict.
+tripper-recon ip 8.8.8.8 --explain
+
+# Machine output. Never defanged, and structured logs go to stderr so this pipes cleanly.
+tripper-recon ip targets.txt -o json | jq '.results[].data.verdict.verdict'
+```
+
+`-o` / `--format` works in either position — `tripper-recon -o json ip 8.8.8.8` and
+`tripper-recon ip 8.8.8.8 -o json` are equivalent. `--rate-limit`, `--user-agent`, `--fanged` and
+`-V` are top-level only and must come **before** the subcommand.
+
+### Defanging
+
+Human-facing output brackets indicators by default (`8[.]8[.]8[.]8`, `hxxps[://]…`) because a
+recon report gets pasted into tickets and chat, where a live link is one click from a compromise
+and — for a single-use link — one click from burning the investigation. `--fanged` turns it off.
+Third-party pivot links are never defanged: they point at VirusTotal, Shodan, AbuseIPDB and
+Cloudflare Radar, and being clickable is the point of them. **`-o json` is never defanged**, in
+either mode, because a machine consumes it and `evil[.]example` is not a hostname.
+
+---
+
+## What the output looks like
+
+> Every block below is real rendered output from this build, captured with the provider responses
+> mocked (`respx`) rather than by querying anyone. The provider payloads are synthetic; the
+> rendering, the scoring and the coverage arithmetic are the code's own.
+
+### An address the allowlist recognises, with one provider unconfigured
+
+```text
+--- IP lookup for 8[.]8[.]8[.]8 ---
+tripper-recon 0.1.0 • 2026-08-09T11:52:07.529912Z • run 20260809T115207Z-304027f3
+VERDICT: KNOWN_INFRASTRUCTURE   score 0 (raw 0.0)   confidence MEDIUM   5 of 6 providers answered
+  not answered: cloudflare_asn
+  why:
+    - VirusTotal: 0 of 94 engines flagged this indicator; observed 2 days ago (recency x1.00). An
+    answer, not an absence
+    - AbuseIPDB was asked and holds no abuse reports for this address within the provider's 365-day
+    reporting window
+    - OTX was asked and holds no pulses referencing this indicator
+  collection: passive only - no traffic was sent to the target or its infrastructure
+  allowlist 2026-08-08.1 retrieved 2026-08-08 - matched allowlist data retrieved 2026-08-08, 1 days
+  old (refresh age 180)
+  ruleset 0.1.0-draft (package:tripper_recon.verdict/scoring.yaml) • engine 1.0.0 • evaluated
+  2026-08-09T11:52:07.615702Z
+  calibration: Heuristic. The weights, thresholds and decay constants in this ruleset are informed
+  priors, not measurements. No labelled corpus has been built and no held-out evaluation has been
+  run, so this ruleset carries no precision, recall or accuracy claim of any kind. Verdicts are
+  decision support for an analyst, never a decision.
+provider_coverage: 5 of 6 providers answered
+  never asked - no API key configured: cloudflare_asn
+  ip                              8[.]8[.]8[.]8
+  virustotal_detections           0/94
+  virustotal_last_analysis        2026-08-07T06:12:00+00:00
+  virustotal_community_score      512
+  virustotal_analysis_link        https://www.virustotal.com/gui/ip-address/8.8.8.8
+  abuseipdb_reports               0
+  abuseipdb_distinct_reporters    0
+  abuseipdb_confidence_score      0%
+  abuseipdb_last_reported         unknown - provider supplied no date
+  abuseipdb_whitelisted           yes - AbuseIPDB lists this address as whitelisted
+  abuseipdb_analysis_link         https://www.abuseipdb.com/check/8.8.8.8
+  otx_pulse_count                 0
+  otx_pulse_link                  https://otx.alienvault.com/indicator/ip/8.8.8.8
+  open_ports                      53, 443
+  shodan_last_update              2026-07-30T11:04:22.000000
+  shodan_hostnames                dns[.]google
+  shodan_link                     https://www.shodan.io/host/8.8.8.8
+  isp                             AS15169 Google LLC
+  organization                    AS15169 Google LLC
+  cloudflare_radar_link           https://radar.cloudflare.com/ip/8.8.8.8
+  geolocation                     IPinfo registry data - context, not evidence
+  city                            Mountain View
+  country                         US
+  coordinates                     37.4056, -122.0775
+  postal_code                     94043
+```
+
+`KNOWN_INFRASTRUCTURE` is the one label that means "this is fine", and it is only reachable from a
+curated Tier A allowlist entry with a citation and a retrieval date — never from a low score. The
+allowlist line records which list answered and how old it was.
+
+### Adverse evidence on a domain
+
+Name reserved for documentation (RFC 2606 `.example`), provider payloads mocked:
+
+```text
+--- Domain lookup for secure-login-update[.]example ---
+tripper-recon 0.1.0 • 2026-08-09T11:51:53.917222Z • run 20260809T115153Z-34be2bdd
+VERDICT: SUSPICIOUS   score 64 (raw 64.0)   confidence HIGH   2 of 2 providers answered
+  why:
+    - +35.0 of 35.0  vt.weighted_detections: VirusTotal: 14 of 94 engines adverse (11 malicious, 3
+    suspicious); weighted 12.50 of 8.00; observed 2 days ago (recency x1.00); no high-confidence
+    engine set is configured, so no single engine hit is decisive
+    - +15.0 of 15.0  otx.pulse_quality: OTX: 3 pulses reported, 3.00 effective after
+    author-diversity, recency and duplicate-title adjustment
+    - +5.0 of 5.0  vt.community_reputation: VirusTotal community score -34. Crowd-sourced, gameable
+    and unversioned, so this is directional colour and scores as a flag, not a curve
+    and 2 more scoring signal(s); run with --explain for the full breakdown
+  collection: passive only - no traffic was sent to the target or its infrastructure
+  ruleset 0.1.0-draft (package:tripper_recon.verdict/scoring.yaml) • engine 1.0.0 • evaluated
+  2026-08-09T11:51:53.948138Z
+  calibration: Heuristic. The weights, thresholds and decay constants in this ruleset are informed
+  priors, not measurements. No labelled corpus has been built and no held-out evaluation has been
+  run, so this ruleset carries no precision, recall or accuracy claim of any kind. Verdicts are
+  decision support for an analyst, never a decision.
+provider_coverage: 2 of 2 providers answered
+```
+
+The domain and each of its addresses are scored **separately and never merged**: a phishing kit on
+a CDN is a malicious domain on a shared address, and both statements have to survive to the screen.
+
+`--explain` prints the full audit trail — every signal, its points against its own ceiling, the
+ruleset key that set the weight, the provider values behind it, and every confidence criterion the
+engine asked:
+
+```text
+verdict explanation (--explain)
+  indicator: secure-login-update.example (domain)
+  score 64 (raw 64.0), band from score alone: SUSPICIOUS
+  signals (5), highest contribution first:
+    vt.weighted_detections  [adverse]  virustotal / multiscanner
+      points 35.0 of 35.0 (magnitude 1.0000)
+      observation: VirusTotal: 14 of 94 engines adverse (11 malicious, 3 suspicious); weighted 12.50
+of 8.00; observed 2 days ago (recency x1.00); no high-confidence engine set is configured, so no
+single engine hit is decisive
+      weight from: package:tripper_recon.verdict/scoring.yaml#signals.vt.weighted_detections
+      observed at: 2026-08-07T11:54:41+00:00
+        evidence: adverse_engine_count = 14
+        evidence: total_engines = 94
+        evidence: weighted_detections = 12.5
+        evidence: saturation = 8.0
+        evidence: recency_factor = 1.0
+        evidence: consensus_threshold = 3
+```
+
+### No keys configured — the most common first run
+
+This is not mocked. With no credentials set, every IP-scope provider returns its missing-key
+envelope before issuing a request, so the run makes **zero** HTTP requests. (An `httpx` client is
+still constructed — `_investigate_ip` opens one around the wave — it is simply never used.)
+
+```text
+--- IP lookup for 45[.]33[.]32[.]156 ---
+VERDICT: INSUFFICIENT_DATA   score 0 (raw 0.0)   confidence LOW   0 of 6 providers answered
+  ! INSUFFICIENT_DATA rather than NO_ADVERSE_FINDINGS: 0 of 6 providers answered, below the 0.5
+  coverage floor. Absent data is not a clean result
+  not answered: virustotal, ipinfo, shodan, abuseipdb, otx, cloudflare_asn
+  collection: passive only - no traffic was sent to the target or its infrastructure
+provider_coverage: 0 of 6 providers answered
+  never asked - no API key configured: virustotal, ipinfo, shodan, abuseipdb, otx
+  never asked - skipped: cloudflare_asn
+  ip                            45[.]33[.]32[.]156
+  virustotal_detections         no data - not configured, no API key
+  abuseipdb_confidence_score    no data - not configured, no API key
+  abuseipdb_analysis_link       https://www.abuseipdb.com/check/45.33.32.156
+  otx_pulse_count               no data - not configured, no API key
+  otx_pulse_link                https://otx.alienvault.com/indicator/ip/45.33.32.156
+  open_ports                    no data - not configured, no API key
+```
+
+The run exits `1` with `no provider answered … this is an intelligence blackout, not a clean
+result`.
+
+### `asn 15169` on an empty `.env`
+
+```text
+--- ASN lookup for AS15169 (GOOGLE, US) ---
+tripper-recon 0.1.0 • 2026-08-09T11:50:36.321878Z • run 20260809T115036Z-3e2b8955
+provider_coverage: 7 of 10 providers answered
+  never asked - no API key configured: ipinfo_asn, cloudflare_bgp, cloudflare_asn
+  AS Number        ──>    15169
+  AS Name          ──>    GOOGLE, US
+  CAIDA AS Rank    ──>    #5
+  Abuse contact    ──>    network-abuse@google.com
+  RIR (Region)     ──>    ARIN (USA, Canada, many Caribbean and North Atlantic islands)
+  Peering @IXPs    ──>    AMS-IX • DE-CIX Frankfurt • Equinix Ashburn • LINX LON1
+
+--- BGP informations for AS15169 ---
+  BGP Neighbors        1104 (4 Transits • 1070 Peers • 30 Customers)
+  Customer cone        51 (# of ASNs observed in the customer cone)
+  In-depth BGP info    https://radar.cloudflare.com/routing/as15169?dateRange=52w
+
+--- Prefix informations for AS15169 ---
+  IPv4 Prefixes announced    1052
+  IPv6 Prefixes announced    116
+
+--- Peering informations for AS15169 ---
+  Upstream      COGENT-174, US (174)  LEVEL3, US (3356)  NTT-LTD-2914, US (2914)
+  Downstream    HURRICANE, US (6939)
+  Uncertain     NONE
+```
+
+### Zero-quota triage of a pasted email
+
+`bulk` extraction and classification are pure functions over the string — no I/O, no client, no
+request. It is safe to paste an entire hostile email into it:
+
+```text
+indicators (7) - extracted from pasted text and classified locally; no provider was consulted for
+this list
+  #    type      indicator                       seen    confidence    note
+  1    url       hxxps[://]secure-login-updat       1    certain       arrived defanged - somebody
+                 e[.]example/verify?id=8842                            already judged this hostile
+  2    domain    mx[.]corp[.]example                1    certain
+  3    ipv4      45[.]33[.]32[.]156                 1    certain       arrived defanged - somebody
+                                                                       already judged this hostile
+  4    ipv4      67[.]231[.]153[.]30                1    certain
+  5    sha256    9f2b4c1d7e6a3b8c5d0e9f1a2b3c       1    certain
+                 4d5e6f7a8b9c0d1e2f3a4b5c6d7e
+                 8f9a0b1c
+  6    email     it-helpdesk@corp[.]example         1    certain       no provider here
+                                                                       investigates mailboxes;
+                                                                       investigate the domain to
+                                                                       the right of the @
+  7    asn       AS15169                            1    certain
+
+withheld from triage (2), extracted but not investigated:
+  type      indicator                seen    reason
+  domain    mail-out.pphosted.com       1    looks like mail transport infrastructure, not a
+                                             subject of investigation
+  ipv4      10.14.7.22                  1    non-public addressing; this tool never forwards
+                                             internal addresses to a third party
+```
+
+Nothing is deleted. Anything the RFC1918 guard or the mail-infrastructure heuristic holds back is
+printed in its own table with the reason, because a filter that removes evidence silently is
+indistinguishable from evidence that was never there. `--no-filter` disables the mail-infrastructure
+heuristic; the non-public guard is not optional.
+
+### JSON
+
+`-o json` carries the whole verdict record, so a verdict pasted into a ticket six months ago stays
+interpretable:
+
+```json
+{
+  "schema_version": "1.0",
+  "indicator": "8.8.8.8",
+  "indicator_type": "ip",
+  "verdict": "KNOWN_INFRASTRUCTURE",
+  "score": 0,
+  "raw_score": 0.0,
+  "score_band": "NO_ADVERSE_FINDINGS",
+  "confidence": "MEDIUM",
+  "confidence_score": 0.7143,
+  "confidence_criteria": [
+    { "name": "coverage_floor", "met": true,
+      "detail": "5 of 6 providers answered; ratio 0.8333 against floor 0.5" },
+    { "name": "corroboration_high", "met": true,
+      "detail": "3 corroborating famil(ies) against 2 required for HIGH" },
+    { "name": "decisive_signal", "met": false,
+      "detail": "0 signal(s) at or above 0.8 of their own ceiling" }
+  ],
+  "coverage": {
+    "answered": ["virustotal", "ipinfo", "shodan", "abuseipdb", "otx"],
+    "errored": [], "unconfigured": ["cloudflare_asn"], "skipped": [],
+    "answered_count": 5, "applicable_count": 6,
+    "missing": ["cloudflare_asn"], "ratio": 0.8333,
+    "is_complete": false, "headline": "5 of 6 providers answered"
+  },
+  "coverage_floor": 0.5,
+  "corroborating_families": ["multiscanner", "abuse_reports", "community_ti"],
+  "passive_only": true,
+  "active_collection": [],
+  "ruleset_version": "0.1.0-draft",
+  "calibration_statement": "Heuristic. …no precision, recall or accuracy claim of any kind…"
+}
 ```
 
 ---
 
-## Quick Start
+## The verdict engine
 
-### CLI
+Five states, and the clean one is deliberately not called `BENIGN`:
 
-The `tripper-recon` CLI provides immediate, readable intelligence straight to your terminal.
-
-```bash
-# Investigate a single IP address
-tripper-recon ip 8.8.8.8
-
-# Investigate a domain (resolves IPs, then enriches each one)
-tripper-recon domain www.cloudflare.com
-
-# Deep-dive into an Autonomous System Number (ASN) — no API key needed
-tripper-recon asn 15169
-```
-
-**Bulk Processing**: Feed the tool a text file of targets for concurrent processing.
-```bash
-tripper-recon ip ./path/to/suspicious_ips.txt --format json
-```
-
-`--format` works in either position — `tripper-recon -o json ip 8.8.8.8` and
-`tripper-recon ip 8.8.8.8 -o json` are equivalent. Structured logs go to stderr, so
-`tripper-recon ip targets.txt -o json | jq` is safe.
-
-### Known limitations
-
-Read these before you trust an answer. Each is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
-
-| Limitation | Effect |
+| Verdict | Meaning |
 |---|---|
-| **The tool states no verdict.** | It renders provider data. Deciding "malicious or not" is still your job. This is the headline gap — see roadmap W5. |
-| **Exit code is 0 even when every provider failed.** | Do not gate automation on exit status yet. Roadmap item 4.2. |
-| **No coverage line.** | Nothing tells you how many providers actually answered. A sparse result and a clean result look alike. Roadmap item 4.4. |
-| **Colour carries most of the signal.** | `rich` strips colour when you redirect to a file, which is exactly the "paste into a ticket" workflow. Roadmap item 5.8. |
-| **No URL support.** | Pass the hostname to `domain` instead. Roadmap W6. |
-| **`--rate-limit` has no effect.** | The limiter constrains task creation rather than requests. Roadmap item 3.3. |
-| **The `domain` path queries providers serially per IP.** | Slow on a domain with many A records. Roadmap item 3.8. |
+| `MALICIOUS` | Adverse evidence reaching the top band |
+| `SUSPICIOUS` | Adverse evidence below that band, or a top-band call the panel cannot stand behind |
+| `NO_ADVERSE_FINDINGS` | Coverage cleared the floor, a provider was asked and answered, and nothing adverse was reported. **Not** "benign" — six feeds agreeing they have never seen an indicator is exactly what a purpose-built C2 domain looks like on its first day |
+| `INSUFFICIENT_DATA` | Coverage below the floor. Nothing was learned |
+| `KNOWN_INFRASTRUCTURE` | A Tier A allowlist entry matched. The only label that means "this is fine", and it is unreachable without a curated entry behind it |
 
-## Data Providers
+Structural rules enforced on the record itself, not left to the scoring code:
 
-Tripper Recon correlates data from the following sources. Per-provider detail — which fields are extracted, which commands use it, and what you get without a key — is in [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+- `NO_ADVERSE_FINDINGS` is rejected without coverage above the floor **and** an affirmative
+  negative among the signals **and** no adverse points. A failed call, a missing key and a 404 are
+  not evidence of cleanliness.
+- `KNOWN_INFRASTRUCTURE` is rejected without a Tier A override record with a citation.
+- `MALICIOUS` at `LOW` confidence is rejected unless flagged for analyst review.
+- **Contradictions are surfaced, never averaged.** Averaging VirusTotal's five detections with
+  AbuseIPDB's 0% produces a number describing neither provider and destroys the one fact that
+  directs the next step: that the panel is split, and which way each half points.
+- **Corroboration counts provider families, not providers.** Two feeds re-ingesting one upstream
+  is one observation wearing two hats.
+- **No single provider family can reach `MALICIOUS` alone.** The band sits at 70 points and the
+  largest single signal at full saturation is worth 35, so corroboration is structural rather than
+  advisory — and a validator enforces it against a retuned ruleset.
 
-**No API key required:**
+Every tunable — weights, thresholds, bands, decay constants, the allowlist — lives in
+[`tripper_recon/verdict/scoring.yaml`](tripper_recon/verdict/scoring.yaml) and
+[`known_infrastructure.yaml`](tripper_recon/verdict/known_infrastructure.yaml), versioned and
+stamped into every verdict. Point `TRIPPER_RECON_SCORING_CONFIG` at your own file, or drop one at
+`$XDG_CONFIG_HOME/tripper_recon/scoring.yaml`, to retune without touching code.
 
-- **[RIPEstat](https://stat.ripe.net/)**: AS overview, abuse contact, routing status, neighbours, announced prefixes.
-- **[CAIDA AS-Rank](https://asrank.caida.org/)**: AS rank, customer cone, transit relationships.
-- **[PeeringDB](https://www.peeringdb.com/)**: IXP presence.
+**The weights are unvalidated priors.** `calibration.status` is `unvalidated`, no labelled corpus
+exists, no held-out evaluation has been run, and the ruleset therefore carries no precision, recall
+or accuracy figure. That statement travels inside every verdict rather than living only here.
 
-**API key required:**
+---
 
-- **[VirusTotal v3](https://www.virustotal.com/)**: Detections, reputation, passive DNS, Whois, HTTPS certificate.
-- **[Shodan](https://www.shodan.io/)**: Open ports, service banners, SSL certificate fingerprints.
-- **[AbuseIPDB](https://www.abuseipdb.com/)**: Abuse confidence scoring and report counts.
-- **[IPInfo](https://ipinfo.io/)**: Geolocation and network ownership.
-- **[AlienVault OTX](https://otx.alienvault.com/)**: Pulse counts and titles.
-- **[Cloudflare Radar](https://radar.cloudflare.com/)**: ASN metadata and BGP prefixes.
-- **Cloudflare BGP** (same token): BGP hijack incident counts.
+## Providers
 
-> Providers whose key is unset are skipped silently. If your output looks sparse, check your
-> `.env` before concluding the indicator is clean. This is a known defect — see
-> [`docs/ROADMAP.md`](docs/ROADMAP.md) item 4.1.
+Detail per provider — endpoints, fields kept, fields discarded — is in
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+
+### No API key required
+
+| Provider | Used by | What it gives |
+|---|---|---|
+| [RIPEstat](https://stat.ripe.net/) | `asn` | AS overview, abuse contact, routing status, neighbours, announced prefixes |
+| [CAIDA AS-Rank](https://asrank.caida.org/) | `asn` | AS rank, customer cone, transit/peer/customer degree |
+| [PeeringDB](https://www.peeringdb.com/) | `asn` | IXP presence |
+
+**`tripper-recon asn 15169` runs on these three alone, against an empty `.env`.** They cover seven
+of the ten declared ASN providers — RIPEstat contributes five endpoints — so the run reports
+`7 of 10 providers answered` and names the three it could not ask.
+
+### API key required
+
+| Provider | Env var | Used by | What it gives |
+|---|---|---|---|
+| [VirusTotal v3](https://www.virustotal.com/) | `VT_API_KEY` | `ip`, `domain`, `url` | Per-engine detections, reputation, categories, tags, passive DNS records, whois (domain age is parsed out of it), HTTPS certificate and JARM |
+| [Shodan](https://www.shodan.io/) | `SHODAN_API_KEY` | `ip` | Open ports, hostnames, tags, CPEs, CVEs, last-update timestamp |
+| [AbuseIPDB](https://www.abuseipdb.com/) | `ABUSEIPDB_API_KEY` | `ip` | Abuse confidence, report counts, last-reported date, usage type, Tor flag (365-day window) |
+| [IPinfo](https://ipinfo.io/) | `IPINFO_TOKEN` | `ip`, `asn` | Geolocation and network ownership |
+| [AlienVault OTX](https://otx.alienvault.com/) | `OTX_API_KEY` | `ip`, `domain` | Pulse counts, titles, authors, dates |
+| [Cloudflare Radar](https://radar.cloudflare.com/) | `CLOUDFLARE_API_TOKEN` | `ip`, `asn` | ASN metadata, registry, IXPs |
+| Cloudflare BGP | same token | `asn` | BGP hijack and leak incident counts |
+
+Providers used per scope: `ip` intends six, `domain` intends two at the name level and then six per
+resolved address, `url` intends one at the link level plus the depths you request, `asn` intends
+ten. Those declared sets are the denominator of every "N of M answered" line — the tool never
+shrinks the denominator to the providers that happened to be configured.
+
+A [urlscan.io](https://urlscan.io/) provider (search and result reads only — never submission)
+is implemented and tested, but **no orchestrator calls it yet**. It is not a source of output today.
 
 ---
 
 ## Configuration
 
-API access requires configuring your provider keys. Create a `.env` file in the project root:
+Create a `.env` in the project root (it is gitignored; `.env.example` is a starting point):
 
 ```ini
-# Core
+# Provider credentials. Every one is optional; an unset key means that provider is
+# counted as missing coverage, never as a clean answer.
+VT_API_KEY=
+SHODAN_API_KEY=
+ABUSEIPDB_API_KEY=
+IPINFO_TOKEN=
+OTX_API_KEY=
+CLOUDFLARE_API_TOKEN=
+
+# Behaviour
 # Log level: a number (10=DEBUG, 20=INFO, 30=WARN, 40=ERROR) or a name (DEBUG/INFO/WARN/ERROR).
 TRIPPER_RECON_LOG_LEVEL=20
-TRIPPER_RECON_USER_AGENT="Your Custom User Agent"
+# User-Agent sent to providers. Defaults to `tripper-recon/<version>`.
+TRIPPER_RECON_USER_AGENT=
 
-# Provider Keys
-CLOUDFLARE_API_TOKEN=your_token_here
-VT_API_KEY=your_key_here
-SHODAN_API_KEY=your_key_here
-ABUSEIPDB_API_KEY=your_key_here
-IPINFO_TOKEN=your_token_here
-OTX_API_KEY=your_key_here
+# Verdict tuning (optional). Point these at your own YAML to override the packaged defaults.
+TRIPPER_RECON_SCORING_CONFIG=
+TRIPPER_RECON_KNOWN_INFRASTRUCTURE=
 ```
-*(An example template is provided in `.env.example`)*
 
+`.env` is read from the current directory first, then the project root, and never overrides a
+variable already exported in your shell.
 
+Runtime flags: `--rate-limit N` sets the process-wide ceiling on concurrent in-flight provider
+requests (default 10). `--user-agent` overrides the User-Agent for the run. Each target gets a
+180-second wall-clock deadline, and a domain enriches at most 8 addresses concurrently.
+
+### Exit codes
+
+These are a public interface; a playbook may branch on them.
+
+| Code | Meaning |
+|---|---|
+| `0` | The investigation ran and at least one provider answered. **Not** a claim that the indicator is clean, and **not** a claim that the lookup was complete — read the coverage line |
+| `1` | Nothing was learned: an intelligence blackout, a deadline breach, a non-public target the tool refuses to forward, or a target the orchestrator rejected |
+| `2` | The CLI rejected the input before any provider was consulted: unparseable target, non-numeric ASN, an indicator type no subcommand investigates, or no subcommand |
+
+**The exit code is not the verdict.** A `MALICIOUS` indicator with every provider answering exits
+`0`. Branch on `data.verdict.verdict` in `-o json` instead. `check --detect-only` and `bulk`
+without `--investigate` exit `0` on a successful classification and `2` when nothing could be
+classified — and neither constructs an HTTP client at all.
+
+---
+
+## OPSEC and passivity
+
+Full detail, per provider and per subcommand, with `file:line` evidence, is in
+[`docs/OPSEC.md`](docs/OPSEC.md). The short version:
+
+- **All intelligence comes from third parties that already hold it.** No scan, no connect, no fetch
+  of the target, no redirect resolution, no shortener expansion, no scanner submission.
+- **The boundary is enforced twice.** A runtime egress allowlist
+  ([`utils/http.py`](tripper_recon/utils/http.py)) inspects the URL of every request as an httpx
+  event hook and raises `PassiveBoundaryViolation` for any host not on the ten-entry list —
+  **before a socket opens**. A static gate (`tests/test_passivity.py`) scans the package for URL
+  literals and forbidden endpoints and fails the build. The static scan is blind to a host
+  assembled at runtime; the hook catches exactly that. Neither replaces the other.
+- **One documented exception: system DNS.** `domain <name>` and `url … --depth full` call
+  `socket.getaddrinfo()` on the target. Your recursive resolver walks the delegation chain and
+  queries **the nameserver the target operator controls**, which for a live actor watching their
+  own DNS logs is a tell. This is an **accepted, documented risk, not a bug** — there is no
+  opt-out flag. If resolver egress is the risk you are managing, use `--depth url` or
+  `--depth host` (neither resolves anything), or investigate the addresses directly with `ip`.
+- **Passive does not mean invisible.** Every query is attributable to your API key. A VirusTotal
+  lookup under your key is logged against your account, and the provider learns your egress IP and
+  your indicator list.
+- **Internal addressing is never forwarded.** Private, reserved, loopback, link-local, multicast
+  and unspecified addresses are refused on every path that would otherwise send them to a vendor
+  under your keys — including a URL whose host is one, and a domain that resolves to one. Refused
+  addresses are counted and named in the report, not silently dropped.
+- **Every verdict states its collection mode** (`passive_only`, `active_collection[]`), so an
+  analyst can see which kind of artifact they are holding before it goes into a report.
+
+---
+
+## Known limitations
+
+Read these before you trust an answer. Each is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+| Limitation | Effect |
+|---|---|
+| **The verdict weights are unvalidated priors.** | No labelled corpus, no held-out evaluation, no accuracy claim. Treat a verdict as ordered decision support, never as a decision. The recording harness that would produce a corpus is designed but not built (roadmap W5.9) |
+| **`--depth full` and `domain` resolve the target through your system resolver.** | An accepted, documented risk with no opt-out flag. See OPSEC above and `docs/OPSEC.md` §3 |
+| **No verdict on the `asn` path.** | Only `ip`, `domain` and `url` are adjudicated. The ASN report carries no reputation signal at all — Spamhaus DROP/ASN-DROP would be the fix (roadmap 8.6) |
+| **The domain level has only two providers.** | VirusTotal and OTX. There is no RDAP/registrar source, so registrar abuse contact is unavailable and domain age is parsed out of whatever whois text VirusTotal happens to return — when it cannot be read, the signal scores an explicit "age unknown is not age fine" weight rather than nothing (roadmap 8.2) |
+| **No result caching and no `--offline`.** | Every run re-queries every provider. A domain with eight A records costs nine VirusTotal calls per run (roadmap 7.7) |
+| **No per-provider rate budget.** | One process-wide concurrency ceiling. A semaphore cannot express "4 requests per minute", so a bulk run can still breach a published quota (roadmap 3.4) |
+| **Retry policy is uneven across providers.** | VirusTotal, Shodan, AbuseIPDB, IPinfo and OTX raise on a bad status, so a `429` or `5xx` is retried with backoff and a server-supplied `Retry-After` is honoured (clamped to 60s). RIPEstat, CAIDA, PeeringDB and both Cloudflare providers return an error payload on any non-2xx instead, so a transient `502` from them is never retried — it just becomes a missing provider in the coverage line |
+| **No markdown output.** | `-o` accepts `console` and `json` only. The four-line block an analyst pastes into a ticket does not exist yet (roadmap 7.2) |
+| **No `--fail-on`.** | The verdict cannot be folded into the exit code. Automation that wants to branch on maliciousness must parse `-o json` |
+| **`--prefixes-out` with a bare filename writes package-relative.** | It resolves against the installed package directory, so after `pip install .` it lands in `site-packages/outputs/`. Pass a path with a directory component. There is no `--out` for `ip`, `domain` or `url` at all (roadmap 7.3) |
+| **No registrar/whois enrichment on the `asn` path.** | The `--enrich` placeholder flag that advertised it was removed rather than left promising a capability the tool lacks (roadmap 9.11). No whois or pWhois call exists anywhere in the codebase |
+| **No colour flag.** | Colour is controlled by `rich`, which honours `NO_COLOR` and disables styling when output is not a TTY. The dead `--monochrome` flag was removed (roadmap 9.11) |
+| **urlscan.io is implemented but not wired in.** | The provider module and its allowlist entry exist; no orchestrator calls it, so URL-scope coverage is `1 of 1` from VirusTotal alone (`docs/OPSEC.md` §6 gap 3) |
+| **abuse.ch (URLhaus + ThreatFox) is planned, not built.** | It is the largest accuracy gain still on the list, and the terms-of-service exposure in bulk mode is a recorded accepted risk rather than a mitigated one (roadmap 8.7) |
+| **IDN homographs render as written in `bulk` triage.** | `аpple.com` (Cyrillic U+0430) looks identical to `apple.com`. The A-label and mixed-script flag are computed but not carried into the triage row; the row is only marked `probable` (`docs/OPSEC.md` §6 gap 7) |
+| **An over-long hostname is still sent to VirusTotal.** | The URL guard checks scheme, host presence and routability but not the RFC 1035 253-octet limit, so a pasted 4000-character name spends a quota unit. Not a passivity breach — pinned as current behaviour in `tests/test_w6_passivity_audit.py` |
+| **A provider could be wrong about its own API.** | Every passivity claim about a third-party endpoint is read from that provider's documentation. If a `GET` route silently started triggering a fetch, nothing here would detect it (`docs/OPSEC.md` §6 gap 5) |
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+
+python -m pytest -q          # the suite makes zero network calls, by design
+python -m ruff check .       # pyproject sets extend-exclude = ["docs/"] — ruff >=0.16 reformats
+python -m ruff format --check .   # Python inside Markdown, which would rewrite quoted evidence
+python -m mypy tripper_recon/
+```
+
+CI runs all four on Python 3.10, 3.11 and 3.12, plus a `gitleaks` secret scan over the full
+history. Every provider credential is explicitly unset in the job, so a test that forgot its
+`respx` mock fails loudly instead of billing a real key. Lint, format and type checks are
+**blocking on `tests/` and advisory on the package source** — the source predates any linter, and
+the workflow documents the condition for flipping them to blocking
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). `pytest` is blocking everywhere.
+
+Adding a provider means adding its host to `ALLOWED_EGRESS_HOSTS` in
+[`utils/http.py`](tripper_recon/utils/http.py) **and** to `ALLOWED_HOSTS` in
+`tests/test_passivity.py` **and** to [`docs/OPSEC.md`](docs/OPSEC.md) §2, in the same commit.
+Anything else fails one of the two gates.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/OPSEC.md`](docs/OPSEC.md) | The passivity contract with `file:line` evidence, every outbound destination, the DNS exception, what providers learn, and the gaps it does not paper over |
+| [`docs/PROVIDERS.md`](docs/PROVIDERS.md) | Per-provider endpoints, fields kept and discarded, credential handling |
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | The sequenced hardening plan, the deliberately-not-doing list, and the settled operator decisions |
+| [`docs/review/`](docs/review/) | The six audit lenses, four design proposals, and the adversarial verification pass behind the roadmap |
+
+## License
+
+MIT — see [LICENSE](LICENSE).

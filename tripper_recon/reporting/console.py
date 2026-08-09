@@ -1374,9 +1374,14 @@ def render_ip_analysis(
     if isp_line:
         table.add_row("isp", esc(isp_line))
 
+    # Cloudflare Radar's GraphQL asks for `organization { name }`, so this value is a DICT
+    # whenever a Cloudflare token is configured -- rendering it raw put a Python dict repr
+    # (`{'name': 'Google LLC'}`) in front of the analyst. render_asn_header already unwrapped it;
+    # this path did not.
     org = asn_meta.get("organization") or ipinfo.get("org")
-    if org:
-        table.add_row("organization", esc(org))
+    org_name = org.get("name") if isinstance(org, dict) else org
+    if org_name:
+        table.add_row("organization", esc(org_name))
 
     table.add_row("cloudflare_radar_link", f"https://radar.cloudflare.com/ip/{ip}")
 

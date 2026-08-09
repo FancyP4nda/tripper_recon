@@ -102,6 +102,193 @@ console = Console()
 _EXPLAIN_HELP = "Show the full signal breakdown behind the verdict: every weight, its ruleset key, and its evidence"
 
 
+# --------------------------------------------------------------------------------------
+# --help (roadmap 9.11)
+#
+# `--help` is the only documentation an analyst reads at 02:00, so the three things that get
+# a run misread live in it rather than in a file nobody opens: what the exit code does and
+# does not claim, which variable feeds which provider, and why an empty panel is not a clean
+# result. The blocks below are assembled into the top-level `epilog`; each subparser carries
+# its own note naming the providers that path consults.
+#
+# Every provider list here is a transcription of the declared tuples in `orchestrators` --
+# IP_PROVIDERS, DOMAIN_PROVIDERS, URL_PROVIDERS, ASN_PROVIDERS -- and not of the calls a run
+# happens to make. Those tuples are the denominator of the coverage ratio the help text tells
+# the reader to trust, so the two have to be the same list.
+# --------------------------------------------------------------------------------------
+
+#: The exit-code contract, in the wording of this module's docstring. Duplicated into the help
+#: text on purpose: the docstring is for whoever reads the source, and a playbook author
+#: branching on `$?` reads `--help`. The full contract, with the reasoning, stays in the
+#: docstring; this is the operative summary.
+_EXIT_CODES = """\
+exit codes:
+  0   A provider answered. This is NOT a claim that the indicator is clean and NOT a claim
+      that the lookup was complete -- a run with two of six credentials set exits 0. Read the
+      provider_coverage line ("N of M providers answered") before concluding anything.
+  1   Nothing was learned: no provider answered at all, the wall-clock deadline was breached,
+      the target is not public and this tool will not forward it to a third party, or the
+      orchestrator rejected it as malformed.
+  2   The input was rejected before any provider was consulted: an unparseable target, a
+      non-numeric ASN, an indicator type no subcommand investigates, or no subcommand at all.
+      `check --detect-only` and `bulk` also exit 2 when nothing could be classified.
+
+  The exit code is not the verdict. It says whether the lookup worked, not what it found: a
+  MALICIOUS indicator with every provider answering exits 0. The verdict is the first line of
+  every console block and the `verdict` key in `-o json`."""
+
+#: Every variable this package reads. Credentials come from `orchestrators._env_keys`, the two
+#: behaviour knobs from `utils.http` and `utils.logging`, and the two path overrides from
+#: `verdict.config` and `verdict.known_infrastructure`.
+_ENVIRONMENT = """\
+environment:
+  Read from the process environment, and from a .env file in the current directory or the
+  package root -- whichever is found first (utils/env.py).
+
+  Provider credentials. A variable that is unset means that provider is never asked:
+    VT_API_KEY             VirusTotal v3 reports          ip, domain, url
+    SHODAN_API_KEY         Shodan host records            ip, domain, url
+    ABUSEIPDB_API_KEY      AbuseIPDB /check               ip, domain, url
+    OTX_API_KEY            AlienVault OTX pulses          ip, domain, url
+    IPINFO_TOKEN           IPinfo address records         ip, domain, url, asn
+                           (the ASN record needs a paid plan; a 401/403 there is suppressed)
+    CLOUDFLARE_API_TOKEN   Cloudflare Radar and BGP       ip, domain, url, asn
+
+  RIPEstat, CAIDA AS-Rank and PeeringDB need no credential, which is why
+  `tripper-recon asn 15169` works with an empty .env.
+
+  Behaviour:
+    TRIPPER_RECON_LOG_LEVEL   DEBUG, INFO, WARN, ERROR, or a number. Default 20 (INFO).
+                              Logs go to stderr so they never mix with `-o json` on stdout.
+    TRIPPER_RECON_USER_AGENT  User-Agent sent to providers. `--user-agent` overrides it.
+
+  Verdict engine:
+    TRIPPER_RECON_SCORING_CONFIG        A scoring ruleset to load instead of
+                                        $XDG_CONFIG_HOME/tripper_recon/scoring.yaml and the
+                                        packaged default. A path that does not exist is an
+                                        error, never a silent fallback.
+    TRIPPER_RECON_KNOWN_INFRASTRUCTURE  A known-infrastructure catalogue to load instead of
+                                        the packaged one.
+    XDG_CONFIG_HOME                     Where the user ruleset is looked for. Defaults to
+                                        ~/.config."""
+
+#: The "why is my output empty" answer, and the pointer to the file that answers it in full.
+_EMPTY_OUTPUT = """\
+why is my output empty:
+  A provider with no credential is never asked, and a provider that was not asked renders as
+  "no data" -- never as a zero, and never in green. Absence does not score as clean. The
+  provider_coverage line on every console block, and coverage.headline in `-o json`, say how
+  many of the expected providers answered.
+
+  docs/PROVIDERS.md lists every provider, the variable it needs, the commands that use it and
+  the fields it keeps. Start there when a panel is thinner than expected.
+
+  The verdict engine's weights are unvalidated priors -- calibration.status is "unvalidated"
+  and the tool makes no accuracy claim. Treat a verdict as a ranked reading of the evidence
+  shown, not as a measurement."""
+
+#: Worked examples. Each one is a command that runs as written against the parser below.
+_EXAMPLES = """\
+examples:
+  tripper-recon asn 15169
+      ASN identity, routing status, neighbours and IXP presence. Runs against an empty .env:
+      RIPEstat, CAIDA and PeeringDB carry this command on their own.
+
+  tripper-recon ip 8.8.8.8 --explain
+      One address, with the full signal breakdown behind the verdict -- every weight, the
+      ruleset key that set its ceiling, and the provider value behind it.
+
+  tripper-recon domain example.com -o json
+      Domain report as JSON. `-o json` is never defanged, and may be given before or after
+      the subcommand.
+
+  tripper-recon url 'hxxps://evil[.]example/login' --depth host
+      A defanged link is refanged and looked up. `--depth host` adds the host's reputation
+      and still resolves nothing; the default `--depth full` resolves the host through the
+      system resolver.
+
+  tripper-recon check '1[.]2[.]3[.]4' --detect-only
+      Classify a pasted string and stop. Costs no provider quota -- detection is a pure
+      function over the string and no HTTP client is built.
+
+  tripper-recon bulk phishing-email.txt --investigate --max-targets 5
+      Extract and triage every indicator in a wall of pasted text, then look up the first
+      five routable ones. Triage alone costs no provider quota; `--investigate` is the opt-in
+      that spends it."""
+
+_EPILOG = "\n\n".join((_EXAMPLES, _EXIT_CODES, _ENVIRONMENT, _EMPTY_OUTPUT))
+
+_IP_EPILOG = """\
+providers consulted (the denominator of the coverage ratio):
+  VirusTotal, IPinfo, Shodan, AbuseIPDB, OTX, then Cloudflare Radar for the ASN IPinfo
+  reported. Cloudflare runs in a second wave and is only reachable when IPinfo answered with
+  an ASN -- it stays in the denominator either way, so a failed IPinfo lookup does not
+  quietly improve the coverage ratio.
+
+  Nothing here contacts the address. Every call reads a report the provider already holds."""
+
+_DOMAIN_EPILOG = """\
+providers consulted (the denominator of the coverage ratio):
+  About the name itself: VirusTotal and OTX.
+  Then, for every public address the name resolves to: VirusTotal, IPinfo, Shodan, AbuseIPDB,
+  OTX and Cloudflare Radar -- the full `ip` set, per address.
+
+  Addresses come from two sources and are labelled with which: VirusTotal's passive A/AAAA
+  records, and the system resolver. This command always resolves. That resolver egress is the
+  one documented exception to passivity and an accepted risk, not an oversight -- see
+  docs/OPSEC.md. Private and reserved addresses are refused before any provider sees them and
+  are reported as skipped rather than dropped.
+
+  A domain with eight addresses costs eight times the per-address provider set, plus the two
+  domain-level calls."""
+
+_ASN_EPILOG = """\
+providers consulted (the denominator of the coverage ratio):
+  IPinfo (/AS{n}, paid plan), five RIPEstat endpoints (as-overview, abuse-contact-finder,
+  routing-status, asn-neighbours, announced-prefixes), CAIDA AS-Rank, PeeringDB, Cloudflare
+  Radar ASN metadata and Cloudflare BGP incidents.
+
+  RIPEstat, CAIDA and PeeringDB need no credential, so this command produces a usable report
+  against an empty .env. `--prefixes-out` writes the full announced-prefix list RIPEstat
+  returned; the console panel never prints it in full."""
+
+_URL_EPILOG = """\
+providers consulted (the denominator of the coverage ratio):
+  About the link itself: VirusTotal's URL report. That is the whole URL-scope set today.
+  urlscan.io is implemented and its host is allowlisted, but it is not yet wired into this
+  path -- see docs/PROVIDERS.md.
+
+  `--depth` decides how much further it goes:
+    url    the link's own report only.
+    host   plus the host's reputation (VirusTotal and OTX about the name). Resolves nothing.
+    full   plus every public address the host resolves to, each through the `ip` provider
+           set. This is the default and the only depth that uses the system resolver.
+
+  A 404 from VirusTotal means nobody has ever submitted this URL. For a freshly registered
+  phishing link that is the ordinary state of the world: it is UNKNOWN, not clean. Nothing in
+  this path asks a provider to go and fetch the target."""
+
+_CHECK_EPILOG = """\
+  `check` classifies the string, prints what it read, then routes to `ip`, `domain`, `url` or
+  `asn` -- so the providers consulted are that subcommand's. `--detect-only` stops after the
+  classification and consults nobody.
+
+  An analyst who knows what they are holding should keep saying so: `ip 1.2.3.4` cannot be
+  misrouted and `check 1.2.3.4` theoretically can. `check` is for the string of unknown shape,
+  possibly defanged, pasted under time pressure."""
+
+_BULK_EPILOG = """\
+  Triage is the default and it costs nothing: extraction and classification are pure, so a run
+  without `--investigate` makes no request at all. It is safe to paste an entire phishing
+  email into this command.
+
+  `--investigate` routes each surviving indicator through `check`, so the providers consulted
+  are those of the subcommand each one routes to. `--max-targets` caps how many are looked up.
+
+  Nothing is deleted. Indicators withheld by the RFC1918 guard or the mail-infrastructure
+  heuristic are printed in their own table with the reason."""
+
+
 def _fmt_provider_error(detail: Any) -> str:
     if isinstance(detail, dict):
         parts: list[str] = []
@@ -1115,13 +1302,10 @@ async def _cmd_asn(
     *,
     output: str = "console",
     neighbors: int = 8,
-    enrich: bool = False,
-    enrich_limit: int = 50,
-    monochrome: bool = False,  # retained for flag compat, rich handles this via terminal settings or NO_COLOR
     prefixes_out: str | None = None,
     prefixes: str = "both",
 ) -> int:
-    res = await investigate_asn(asn, resolve_neighbors=neighbors, enrich=enrich, enrich_limit=enrich_limit)
+    res = await investigate_asn(asn, resolve_neighbors=neighbors)
     if not res.ok:
         log["error"]("ASN lookup failed", asn=asn, errors=res.errors)
         if output == "console":
@@ -1142,7 +1326,6 @@ async def _cmd_asn(
             render_asn_header(
                 asn,
                 meta,
-                use_color=not monochrome,
                 coverage=res.data.get("coverage") or res.data.get("provider_status"),
                 warnings=res.warnings or res.data.get("warnings"),
                 run_id=run_id,
@@ -1159,7 +1342,7 @@ async def _cmd_asn(
 
         bgp = res.data.get("bgp", {})
         if bgp:
-            console.print(render_asn_bgp_panels(asn, meta, bgp, use_color=not monochrome))
+            console.print(render_asn_bgp_panels(asn, meta, bgp))
 
         errors = res.data.get("errors") or {}
         if errors:
@@ -1218,7 +1401,12 @@ async def _cmd_asn(
 def main() -> None:
     load_env()
     parser = argparse.ArgumentParser(
-        prog="tripper-recon", description="Passive OSINT investigations of IPs, domains, URLs and ASNs"
+        prog="tripper-recon",
+        description="Passive OSINT investigations of IPs, domains, URLs and ASNs",
+        epilog=_EPILOG,
+        # Raw, because the epilog is hand-wrapped: argparse's default formatter reflows every
+        # paragraph into one blob and the exit-code and environment tables stop being tables.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "-o",
@@ -1248,7 +1436,12 @@ def main() -> None:
     parser.add_argument("-V", "--version", action="version", version=f"tripper-recon {__version__}")
     sub = parser.add_subparsers(dest="cmd")
 
-    p_ip = sub.add_parser("ip", help="Investigate an IP address")
+    p_ip = sub.add_parser(
+        "ip",
+        help="Investigate an IP address",
+        epilog=_IP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_ip.add_argument("ip", type=str)
     # default=SUPPRESS so an omitted subcommand flag leaves the top-level value in place.
     # With a real default, argparse overwrote it and `-o json ip 8.8.8.8` silently emitted console text.
@@ -1258,7 +1451,12 @@ def main() -> None:
     )
     p_ip.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
-    p_domain = sub.add_parser("domain", help="Investigate a domain")
+    p_domain = sub.add_parser(
+        "domain",
+        help="Investigate a domain",
+        epilog=_DOMAIN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_domain.add_argument("domain", type=str)
     p_domain.add_argument(
         "-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format"
@@ -1271,13 +1469,21 @@ def main() -> None:
     )
     p_domain.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
-    p_asn = sub.add_parser("asn", help="Lookup ASN details")
+    p_asn = sub.add_parser(
+        "asn",
+        help="Lookup ASN details",
+        epilog=_ASN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_asn.add_argument("asn", type=str)
     p_asn.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_asn.add_argument("--neighbors", type=int, default=8, help="Resolve first N neighbors to names")
-    p_asn.add_argument("--enrich", action="store_true", help="Enrich prefix info via whois/pWhois (slower)")
-    p_asn.add_argument("--enrich-limit", type=int, default=50, help="Limit inetnum lines during enrichment")
-    p_asn.add_argument("--monochrome", action="store_true", help="Disable ANSI colors in console output")
+    # `--enrich`, `--enrich-limit` and `--monochrome` were removed here (roadmap 9.11). All three
+    # advertised behaviour the code did not have: `--enrich`'s help named a whois/pWhois path that
+    # exists nowhere in the package -- the orchestrator branch it set is self-labelled "placeholder
+    # aggregation" and only re-emitted a truncated copy of the announced-prefix lists that are
+    # already present -- and `--monochrome` fed a `use_color` parameter that neither renderer body
+    # reads. A flag that promises a capability the tool lacks is worse than a missing flag.
     p_asn.add_argument("--prefixes-out", type=str, default=None, help="Write full prefix list to a text file")
     p_asn.add_argument(
         "--prefixes",
@@ -1286,7 +1492,12 @@ def main() -> None:
         help="Which prefixes to include when writing --prefixes-out",
     )
 
-    p_url = sub.add_parser("url", help="Investigate a URL, its host, and the addresses it resolves to")
+    p_url = sub.add_parser(
+        "url",
+        help="Investigate a URL, its host, and the addresses it resolves to",
+        epilog=_URL_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_url.add_argument("url", type=str)
     p_url.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_url.add_argument(
@@ -1301,7 +1512,12 @@ def main() -> None:
     p_url.add_argument("--ports-limit", type=str, default="25", help="Limit ports shown per address")
     p_url.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
-    p_check = sub.add_parser("check", help="Detect what an indicator is and route it to the right lookup")
+    p_check = sub.add_parser(
+        "check",
+        help="Detect what an indicator is and route it to the right lookup",
+        epilog=_CHECK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_check.add_argument("target", type=str)
     p_check.add_argument("-o", "--format", choices=["console", "json"], default=argparse.SUPPRESS, help="Output format")
     p_check.add_argument(
@@ -1313,7 +1529,12 @@ def main() -> None:
     p_check.add_argument("--ports-limit", type=str, default="25", help="Limit ports shown per address")
     p_check.add_argument("--explain", action="store_true", help=_EXPLAIN_HELP)
 
-    p_bulk = sub.add_parser("bulk", help="Extract and triage every indicator in a wall of pasted text")
+    p_bulk = sub.add_parser(
+        "bulk",
+        help="Extract and triage every indicator in a wall of pasted text",
+        epilog=_BULK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p_bulk.add_argument(
         "source",
         type=str,
@@ -1428,9 +1649,6 @@ def main() -> None:
                         asn_int,
                         output=args.format,
                         neighbors=args.neighbors,
-                        enrich=args.enrich,
-                        enrich_limit=args.enrich_limit,
-                        monochrome=args.monochrome,
                         prefixes_out=getattr(args, "prefixes_out", None),
                         prefixes=getattr(args, "prefixes", "both"),
                     )
